@@ -1,0 +1,76 @@
+================================================================================
+    GraspRRT + TRAJECTORY OPTIMIZATION FRAMEWORK
+    项目信息
+================================================================================
+
+项目状态: ✅ COMPLETE (完成)
+完成日期: 2026年4月17日
+编译状态: ✅ SUCCESS
+集成状态: ✅ VERIFIED
+
+================================================================================
+本版本变更 (4-17)
+================================================================================
+
+【核心变更】
+  - 将树扩展策略从 VF-RRT (矢量场引导) 替换为标准 RRT (随机扩展)
+  - 移除 computeVectorField / extendVFRRT，改用 extendRRT
+  - 移除 VF 专有成员: cached_J_T_, hard_obstacle_*, consecutive_failures_
+  - 移除 GraspRrtConfig::vf_activation_distance
+  - 移除 GraspPlanningPerformance::vf_gradient_time_ms
+  - SDF/体素梯度场保留，仅供 TrajOpt 阶段使用 (不在 RRT 中查询)
+
+【保持不变】
+  - 抓取假设策略 (connectRandomGraspPositionJacobian / moveTowardsGoal)
+  - pose_sphere_ 近物体节点注册机制
+  - TrajOpt 阶段 (SdfTrajOptimizer)
+  - SdfCostEvaluator 构建与接口
+
+================================================================================
+交付内容清单
+================================================================================
+
+【核心文件】
+  ✅ grasp_rrt.h              - 规划器头文件 (移除 VF 方法/成员)
+  ✅ grasp_rrt.cpp            - 规划器实现 (extendRRT 替代 extendVFRRT)
+  ✅ types.h                  - 类型定义 (移除 VF 相关字段)
+  ✅ example_grasp_rrt.cpp    - 示例主程序 (移除 setHardObstacle)
+  ✅ sdf_cost_evaluator.h     - SDF 评估器 (供 TrajOpt 使用，不变)
+  ✅ sdf_traj_optimizer.h     - 轨迹优化器 (不变)
+
+================================================================================
+规划流程
+================================================================================
+
+Phase 1: 构建 SDF/体素梯度场 (一次性, 离线)
+  SdfCostEvaluator::buildSdf()
+
+Phase 2: 标准 RRT 建树 + GraspRRT 抓取假设
+  extendRRT()                  — 随机树扩展
+  connectRandomGraspPositionJacobian() — 终端抓取下探 (DiffIK)
+
+Phase 3: TrajOpt 轨迹优化
+  SdfTrajOptimizer::optimize() — 使用 SDF 梯度平滑路径、降低软碰撞代价
+
+================================================================================
+快速开始
+================================================================================
+
+1. 编译项目
+   $ cd grasp_rrt_framework_vf
+   $ rm -rf build && mkdir build && cd build
+   $ cmake ..
+   $ make -j$(nproc)
+
+2. 运行程序
+   $ ./example_grasp_rrt [path_to_panda.urdf]
+
+================================================================================
+依赖
+================================================================================
+
+框架: GraspRRT Framework (C++ 17)
+依赖: Eigen3, Pinocchio, Bullet3
+日期: 2026年4月17日
+
+================================================================================

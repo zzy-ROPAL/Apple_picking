@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -i -E \"\\(pose_sphere|approach.{0,5}sphere|icosphere\\)\" /home/zhongyanzhang/.claude/projects/-home-zhongyanzhang-Zhongyan-Zhang-April-4-21-TO-grasp-rrt-framework-vf/0a2da77f-f8bc-46e9-964a-a4bf37592c38.jsonl)"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+# 编译产物
+build/
+*.o
+*.a
+*.so
+
+# benchmark 输出
+benchmark_results_*/
+grasp_path*.csv
+
+# 编辑器/IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 临时文件
+*.log
+*.tmp
