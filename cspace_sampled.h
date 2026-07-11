@@ -31,7 +31,7 @@ public:
         return std::numeric_limits<float>::max();
     }
 
-    // ---- Anisotropic edge rejection (pre-contact directional filter) ----
+    // ---- Anisotropic edge refuse (pre-contact directional filter) ----
     //
     // For an RRT extension (q_near → q_new), returns a score in [0, 1] that
     // characterizes how axially aligned the engagement-zone sphere motions
@@ -106,7 +106,7 @@ public:
     float getSamplingSize() const { return sampling_size_paths_; }
     float getSamplingSizeDCD() const { return sampling_size_dcd_; }
 
-    // ---- Edge-rejection configuration (anisotropic directional filter) ----
+    // ---- Edge-refuse configuration (anisotropic directional filter) ----
     //
     // When enabled, isPathValid runs a soft probabilistic directional filter
     // on each candidate extension. The CostEvaluator computes an "axial
@@ -124,16 +124,16 @@ public:
     //
     // The soft sigmoid eliminates the "thrashing" near-boundary thrashing
     // that a hard cutoff would produce.
-    void setEdgeRejectionEnabled(bool enabled)  { edge_rejection_enabled_ = enabled; }
-    void setEdgeRejectionEnvelope(float e)      { edge_rejection_envelope_ = e; }
-    void setEdgeRejectionThreshold(float t)     { edge_rejection_threshold_ = t; }
-    void setEdgeRejectionGain(float g)          { edge_rejection_gain_ = g; }
-    void setEdgeRejectionK(int k)               { edge_rejection_k_ = std::max(1, k); }
-    bool  getEdgeRejectionEnabled() const       { return edge_rejection_enabled_; }
-    float getEdgeRejectionEnvelope() const      { return edge_rejection_envelope_; }
-    float getEdgeRejectionThreshold() const     { return edge_rejection_threshold_; }
-    float getEdgeRejectionGain() const          { return edge_rejection_gain_; }
-    int   getEdgeRejectionK() const             { return edge_rejection_k_; }
+    void setEdgeRefuseEnabled(bool enabled)  { edge_refuse_enabled_ = enabled; }
+    void setEdgeRefuseEnvelope(float e)      { edge_refuse_envelope_ = e; }
+    void setEdgeRefuseThreshold(float t)     { edge_refuse_threshold_ = t; }
+    void setEdgeRefuseGain(float g)          { edge_refuse_gain_ = g; }
+    void setEdgeRefuseK(int k)               { edge_refuse_k_ = std::max(1, k); }
+    bool  getEdgeRefuseEnabled() const       { return edge_refuse_enabled_; }
+    float getEdgeRefuseEnvelope() const      { return edge_refuse_envelope_; }
+    float getEdgeRefuseThreshold() const     { return edge_refuse_threshold_; }
+    float getEdgeRefuseGain() const          { return edge_refuse_gain_; }
+    int   getEdgeRefuseK() const             { return edge_refuse_k_; }
 
     // ---- 离散碰撞检测 (覆盖基类) ----
 
@@ -141,7 +141,7 @@ public:
      * 对应 Python CSpaceSampled.isPathValid
      * 递归中点检测: 先检查中点, 若有效则递归检查两半
      *
-     * SPEED OPTIMIZATION: when edge rejection is enabled, we run the cheap
+     * SPEED OPTIMIZATION: when edge refuse is enabled, we run the cheap
      * directional check (~15 μs) BEFORE the expensive geometric collision
      * check (~300-700 μs). Edges rejected by the directional filter never
      * trigger the recursive midpoint check, saving substantial work in
@@ -154,12 +154,12 @@ public:
      */
     bool isPathValid(const Config& q1, const Config& q2) override {
         // Step 1 (cheap, ~15 μs): directional check, if enabled.
-        if (edge_rejection_enabled_ && cost_evaluator_) {
+        if (edge_refuse_enabled_ && cost_evaluator_) {
             float score = cost_evaluator_->computeEdgeAxialScore(
-                q1, q2, edge_rejection_envelope_, edge_rejection_k_);
+                q1, q2, edge_refuse_envelope_, edge_refuse_k_);
             if (score > 0.0f) {
-                float x = edge_rejection_gain_
-                          * (score - edge_rejection_threshold_);
+                float x = edge_refuse_gain_
+                          * (score - edge_refuse_threshold_);
                 // Numerically stable sigmoid
                 float p_reject = (x >= 0.0f)
                     ? 1.0f / (1.0f + std::exp(-x))
@@ -224,14 +224,14 @@ private:
 
     std::shared_ptr<CostEvaluator> cost_evaluator_;
 
-    // Anisotropic edge-rejection (off by default to preserve baseline)
+    // Anisotropic edge-refuse (off by default to preserve baseline)
     // Defaults: 5 cm envelope, threshold cos(25°) ≈ 0.9063, sigmoid gain 20,
     //           K=5 nearest non-rigid branches considered per engagement sphere.
-    bool  edge_rejection_enabled_   = false;
-    float edge_rejection_envelope_  = 0.05f;
-    float edge_rejection_threshold_ = 0.9063f;
-    float edge_rejection_gain_      = 20.0f;
-    int   edge_rejection_k_         = 3;
+    bool  edge_refuse_enabled_   = false;
+    float edge_refuse_envelope_  = 0.05f;
+    float edge_refuse_threshold_ = 0.9063f;
+    float edge_refuse_gain_      = 20.0f;
+    int   edge_refuse_k_         = 3;
 
     // Private RNG for the probabilistic accept/reject decision. Seeded with
     // a fixed value so soft rejection is deterministic per CSpaceSampled

@@ -46,7 +46,7 @@ public:
         Eigen::Vector3f p1;
         float radius;
         // If true, this cylinder is excluded from anisotropy mechanisms
-        // (sampling bias, axial drag K_ax, edge rejection). Use for rigid
+        // (sample steering, axial drag K_ax, edge refuse). Use for rigid
         // obstacles like the trunk where "push aside radially" is not a
         // valid behavior — the robot must avoid them entirely.
         bool exclude_from_aniso = false;
@@ -84,7 +84,7 @@ public:
     }
 
     // Same as addBranchCylinder but flags the cylinder as RIGID — the
-    // anisotropy mechanisms (sampling bias, K_ax, edge rejection) will
+    // anisotropy mechanisms (sample steering, K_ax, edge refuse) will
     // skip it. Use for the trunk and any other rigid obstacle the robot
     // is expected to avoid rather than push through.
     void addRigidCylinder(const Eigen::Vector3f& p0,
@@ -394,7 +394,7 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // computeEdgeAxialScore — Anisotropic edge rejection (BCD, Option A)
+    // computeEdgeAxialScore — Anisotropic edge refuse (edge refuse, Option A)
     //
     // Multi-branch axial-alignment score with K-nearest per-sphere max
     // aggregation:
@@ -543,7 +543,7 @@ public:
     //
     // Used only for instrumentation: walking a solution path and counting how
     // often this winner changes edge-to-edge measures oscillation of the
-    // rejection axis directly (original BCD's de-facto driver). Not used
+    // rejection axis directly (original edge refuse's de-facto driver). Not used
     // during planning.
     // ------------------------------------------------------------------
     int maxWinnerBranchId(const Eigen::VectorXf& q_near,
@@ -612,7 +612,7 @@ public:
     }
 
     // ==================================================================
-    // Sticky-winner selection (shared by sticky-BCD and sticky-F variants)
+    // Sticky-winner selection (shared by sticky-edge-refuse and sticky-sample-steering variants)
     //
     // Given the parent node's stored winner branch id and the current motion
     // direction, this function:
@@ -744,7 +744,7 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // stickyWinnerEdgeScore — thorough rejection score for sticky-BCD
+    // stickyWinnerEdgeScore — thorough rejection score for sticky-edge-refuse
     //
     // Given the committed winner branch (winner_cyl_id from
     // stickyWinnerSelect), measure how axial the edge q_near→q_new is w.r.t.
@@ -756,7 +756,7 @@ public:
     //
     // It is still a "winner score" (single branch — per the sticky-winner
     // philosophy, NOT a MAX over different branches), but measured as
-    // thoroughly as original BCD's isPathValid rejection. This catches edges
+    // thoroughly as original edge refuse's isPathValid rejection. This catches edges
     // that ENTER the winner's envelope partway through, or BECOME axial
     // mid-edge — cases a single q_near Jacobian prediction misses.
     //
@@ -826,7 +826,7 @@ public:
 
     // Bend q_step_dir so that the resulting EE workspace motion sits at
     // exactly cos_cap against `axis` (measured by |Δp̂·â|). Deterministic
-    // F-style action. Uses J_EE^T projection, no pseudoinverse.
+    // sample-steering-style action. Uses J_EE^T projection, no pseudoinverse.
     // No-op if already off-axis (cos ≤ cos_cap).
     void bendAgainstAxis(Eigen::VectorXf& q_step_dir,
                          const Eigen::MatrixXf& J_EE,
@@ -848,7 +848,7 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // applySamplingBias — Method F with K-nearest structure tensor
+    // applySamplingBias — sample steering with K-nearest structure tensor
     //
     // Multi-branch directional bias:
     //   1. (Envelope gate) If EE body is outside envelope of every branch,
@@ -878,7 +878,7 @@ public:
                             int   K              = 5,
                             float min_anisotropy = 0.3f) const {
         // -------------------------------------------------------------
-        // Smooth Method F: structure-tensor multi-branch aggregation +
+        // Smooth sample steering: structure-tensor multi-branch aggregation +
         // Option 1 (smoothstep envelope ramp) + Option 3 (penetration skip).
         //
         //   1. Envelope conceptually built around each branch (radius
@@ -890,7 +890,7 @@ public:
         //   5. Anisotropy gate: skip if geometry too isotropic.
         //   6. Apply angle-range cap against dominant axis.
         //
-        // Smoother than BCD-style max aggregation: the eigenvector of M
+        // Smoother than edge refuse-style max aggregation: the eigenvector of M
         // changes continuously as branch weights change, avoiding the
         // discontinuity that comes from picking a single "winning" branch.
         // -------------------------------------------------------------

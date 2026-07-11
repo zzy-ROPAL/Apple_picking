@@ -198,7 +198,7 @@ struct RunResult {
     //   dangerous branch id (maxWinnerBranchId). Count edges that HAVE a
     //   winner, and how many times the winner CHANGES from the previous edge
     //   that had one. switch_rate = winner_switches / max(1, winner_segments-1).
-    //   High switch_rate = rejection axis chatters (BCD oscillation).
+    //   High switch_rate = rejection axis chatters (edge refuse oscillation).
     int     winner_segments  = 0;   // edges with a valid (in-envelope) winner
     int     winner_switches  = 0;   // # of winner-id changes between such edges
     float   winner_switch_rate = -1.0f;  // switches / (segments-1); -1 = n/a
@@ -405,23 +405,23 @@ int main(int argc, char* argv[]) {
     float branch_rscale     = 1.0f;   // --branch-rscale S: multiply every tree6 branch radius by S (2=double). Apple offset tracks the scaled apple-branch radius.
     bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing sticky-winner. Branch A along x̂ above apple, branch B along ẑ in front of apple.
     bool xgate_scene        = false;  // --xgate: multi-branch scene = V6 rigid A + two CROSSED soft branches (B1 ŷ, B2 x̂) whose 5cm envelopes overlap on the approach corridor. Tests MAX-vs-winner oscillation.
-    bool sticky_bcd_enabled = false;  // --sticky-bcd: enable sticky-winner BCD (hysteresis + probabilistic edge rejection using single MAX-scored winner)
-    bool sticky_f_enabled   = false;  // --sticky-f: enable sticky-winner F (hysteresis + deterministic direction bending using single MAX-scored winner)
+    bool sticky_edge_refuse_enabled = false;  // --sticky-edge-refuse: enable sticky-winner edge refuse (hysteresis + probabilistic edge refuse using single MAX-scored winner)
+    bool sticky_sample_steering_enabled   = false;  // --sticky-sample-steering: enable sticky-winner F (hysteresis + deterministic direction bending using single MAX-scored winner)
     float sticky_hysteresis = 1.25f;  // --sticky-hysteresis M: challenger must beat incumbent by this factor to switch
     int   sticky_k          = 3;      // --sticky-k K: how many nearest non-rigid branches to score at each cycle
-    float sticky_cap_deg    = 30.0f;  // --sticky-cap DEG: sticky-F min angle off branch axis (deg). 30=cos0.866, 45=0.707, 60=0.5
-    bool edge_rejection_enabled = false;   // --edge-reject: enable anisotropic edge rejection (Layer 1)
-    float edge_rejection_envelope  = 0.05f;
-    float edge_rejection_threshold = 0.9063f;  // cos(25°): sigmoid midpoint
-    float edge_rejection_gain      = 20.0f;    // sigmoid steepness
-    int   edge_rejection_k         = 3;        // K nearest non-rigid branches per sphere
+    float sticky_cap_deg    = 30.0f;  // --sticky-cap DEG: sticky-sample-steering min angle off branch axis (deg). 30=cos0.866, 45=0.707, 60=0.5
+    bool edge_refuse_enabled = false;   // --edge-refuse: enable anisotropic edge refuse (Layer 1)
+    float edge_refuse_envelope  = 0.05f;
+    float edge_refuse_threshold = 0.9063f;  // cos(25°): sigmoid midpoint
+    float edge_refuse_gain      = 20.0f;    // sigmoid steepness
+    int   edge_refuse_k         = 3;        // K nearest non-rigid branches per sphere
 
-    // Method F (sampling bias) — angle-range cap on extension direction.
-    bool  sampling_bias_enabled         = false;
-    float sampling_bias_envelope        = 0.05f;
-    float sampling_bias_cos_cap         = 0.866f;   // cos(30°)
-    int   sampling_bias_k               = 5;        // structure tensor: K=5 nearest
-    float sampling_bias_min_anisotropy  = 0.3f;     // skip if too isotropic
+    // sample steering — angle-range cap on extension direction.
+    bool  sample_steering_enabled         = false;
+    float sample_steering_envelope        = 0.05f;
+    float sample_steering_cos_cap         = 0.866f;   // cos(30°)
+    int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
+    float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
 
     // Parse args
     std::vector<std::string> positional;
@@ -473,10 +473,10 @@ int main(int argc, char* argv[]) {
         } else if (a == "--xgate") {
             xgate_scene = true;
             diag_scene  = true;   // reuse diag apple/overhead override + geometry gating
-        } else if (a == "--sticky-bcd") {
-            sticky_bcd_enabled = true;
-        } else if (a == "--sticky-f") {
-            sticky_f_enabled = true;
+        } else if (a == "--sticky-edge-refuse") {
+            sticky_edge_refuse_enabled = true;
+        } else if (a == "--sticky-sample-steering") {
+            sticky_sample_steering_enabled = true;
         } else if (a == "--sticky-hysteresis" && i + 1 < argc) {
             sticky_hysteresis = std::max(1.0f,
                                   static_cast<float>(std::atof(argv[++i])));
@@ -485,30 +485,30 @@ int main(int argc, char* argv[]) {
         } else if (a == "--sticky-cap" && i + 1 < argc) {
             sticky_cap_deg = std::max(0.0f, std::min(89.0f,
                                   static_cast<float>(std::atof(argv[++i]))));
-        } else if (a == "--edge-reject") {
-            edge_rejection_enabled = true;
-        } else if (a == "--edge-reject-envelope" && i + 1 < argc) {
-            edge_rejection_envelope = std::max(0.001f, static_cast<float>(std::atof(argv[++i])));
-        } else if (a == "--edge-reject-threshold" && i + 1 < argc) {
-            edge_rejection_threshold = std::max(0.0f, std::min(1.0f,
+        } else if (a == "--edge-refuse") {
+            edge_refuse_enabled = true;
+        } else if (a == "--edge-refuse-envelope" && i + 1 < argc) {
+            edge_refuse_envelope = std::max(0.001f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--edge-refuse-threshold" && i + 1 < argc) {
+            edge_refuse_threshold = std::max(0.0f, std::min(1.0f,
                                           static_cast<float>(std::atof(argv[++i]))));
-        } else if (a == "--edge-reject-gain" && i + 1 < argc) {
-            edge_rejection_gain = std::max(0.1f,
+        } else if (a == "--edge-refuse-gain" && i + 1 < argc) {
+            edge_refuse_gain = std::max(0.1f,
                                           static_cast<float>(std::atof(argv[++i])));
-        } else if (a == "--edge-reject-k" && i + 1 < argc) {
-            edge_rejection_k = std::max(1, std::atoi(argv[++i]));
-        } else if (a == "--sample-bias") {
-            sampling_bias_enabled = true;
-        } else if (a == "--sample-bias-envelope" && i + 1 < argc) {
-            sampling_bias_envelope = std::max(0.001f,
+        } else if (a == "--edge-refuse-k" && i + 1 < argc) {
+            edge_refuse_k = std::max(1, std::atoi(argv[++i]));
+        } else if (a == "--sample-steering") {
+            sample_steering_enabled = true;
+        } else if (a == "--sample-steering-envelope" && i + 1 < argc) {
+            sample_steering_envelope = std::max(0.001f,
                                               static_cast<float>(std::atof(argv[++i])));
-        } else if (a == "--sample-bias-cap" && i + 1 < argc) {
-            sampling_bias_cos_cap = std::max(0.0f, std::min(1.0f,
+        } else if (a == "--sample-steering-cap" && i + 1 < argc) {
+            sample_steering_cos_cap = std::max(0.0f, std::min(1.0f,
                                               static_cast<float>(std::atof(argv[++i]))));
-        } else if (a == "--sample-bias-k" && i + 1 < argc) {
-            sampling_bias_k = std::max(1, std::atoi(argv[++i]));
-        } else if (a == "--sample-bias-anisotropy" && i + 1 < argc) {
-            sampling_bias_min_anisotropy = std::max(0.0f, std::min(1.0f,
+        } else if (a == "--sample-steering-k" && i + 1 < argc) {
+            sample_steering_k = std::max(1, std::atoi(argv[++i]));
+        } else if (a == "--sample-steering-anisotropy" && i + 1 < argc) {
+            sample_steering_min_anisotropy = std::max(0.0f, std::min(1.0f,
                                               static_cast<float>(std::atof(argv[++i]))));
         } else {
             positional.push_back(a);
@@ -828,7 +828,7 @@ int main(int argc, char* argv[]) {
             // envelopes overlap in a ~10cm blob on the EE approach corridor
             // (Start1 y=+0.19 → apple y=-0.20 must sweep through y≈0). The
             // perpendicular axes make the MAX-winner flip B1↔B2 as the EE
-            // moves — the oscillation sticky-BCD's hysteresis should suppress.
+            // moves — the oscillation sticky-edge-refuse's hysteresis should suppress.
             float b_r = 0.04f;
             // B1: soft shield along ŷ, x = 0.33, y ∈ [-0.25, 0.25], z = 1.00
             Vector3f b1_p0(0.33f, -0.25f, 1.00f);
@@ -1027,20 +1027,20 @@ int main(int argc, char* argv[]) {
 
     cspace->setCostEvaluator(cost_evaluator);
 
-    // ---- Anisotropic edge rejection (Layer 1, pre-contact directional filter) ----
-    if (edge_rejection_enabled) {
-        cspace->setEdgeRejectionEnabled(true);
-        cspace->setEdgeRejectionEnvelope(edge_rejection_envelope);
-        cspace->setEdgeRejectionThreshold(edge_rejection_threshold);
-        cspace->setEdgeRejectionGain(edge_rejection_gain);
-        cspace->setEdgeRejectionK(edge_rejection_k);
-        std::cout << "[Setup] Edge rejection ENABLED (soft sigmoid, multi-branch):\n"
-                  << "        envelope  = " << edge_rejection_envelope << " m\n"
-                  << "        threshold = " << edge_rejection_threshold
+    // ---- Anisotropic edge refuse (Layer 1, pre-contact directional filter) ----
+    if (edge_refuse_enabled) {
+        cspace->setEdgeRefuseEnabled(true);
+        cspace->setEdgeRefuseEnvelope(edge_refuse_envelope);
+        cspace->setEdgeRefuseThreshold(edge_refuse_threshold);
+        cspace->setEdgeRefuseGain(edge_refuse_gain);
+        cspace->setEdgeRefuseK(edge_refuse_k);
+        std::cout << "[Setup] Edge refuse ENABLED (soft sigmoid, multi-branch):\n"
+                  << "        envelope  = " << edge_refuse_envelope << " m\n"
+                  << "        threshold = " << edge_refuse_threshold
                   << " (cos midpoint)\n"
-                  << "        gain      = " << edge_rejection_gain
+                  << "        gain      = " << edge_refuse_gain
                   << " (sigmoid steepness)\n"
-                  << "        K nearest = " << edge_rejection_k
+                  << "        K nearest = " << edge_refuse_k
                   << " (non-rigid branches per sphere)\n"
                   << "        spheres   = panda_hand + panda_link6\n";
     }
@@ -1073,39 +1073,39 @@ int main(int argc, char* argv[]) {
     config.use_shell_attractor = shell_attractor_enabled;
     config.branch_anisotropy_K_ax = branch_aniso_K_ax;   // Option A: axial drag on/off
     config.extension_coin_flip = extension_coin_flip;    // ablation: stochastic switch vs deterministic blend
-    config.sampling_bias_enabled         = sampling_bias_enabled;   // Method F
-    config.sampling_bias_envelope        = sampling_bias_envelope;
-    config.sampling_bias_cos_cap         = sampling_bias_cos_cap;
-    config.sampling_bias_k               = sampling_bias_k;
-    config.sampling_bias_min_anisotropy  = sampling_bias_min_anisotropy;
+    config.sample_steering_enabled         = sample_steering_enabled;   // sample steering
+    config.sample_steering_envelope        = sample_steering_envelope;
+    config.sample_steering_cos_cap         = sample_steering_cos_cap;
+    config.sample_steering_k               = sample_steering_k;
+    config.sample_steering_min_anisotropy  = sample_steering_min_anisotropy;
     // Sticky-winner variants
-    config.sticky_f_enabled              = sticky_f_enabled;
-    config.sticky_bcd_enabled            = sticky_bcd_enabled;
+    config.sticky_sample_steering_enabled              = sticky_sample_steering_enabled;
+    config.sticky_edge_refuse_enabled            = sticky_edge_refuse_enabled;
     config.sticky_hysteresis_margin      = sticky_hysteresis;
     config.sticky_k                      = sticky_k;
     config.sticky_cos_cap                = std::cos(sticky_cap_deg * static_cast<float>(M_PI) / 180.0f);
-    if (sticky_f_enabled) {
+    if (sticky_sample_steering_enabled) {
         std::cout << "[Setup] STICKY-F ENABLED (hysteresis margin=" << sticky_hysteresis
                   << ", K=" << sticky_k << ", cos_cap=" << config.sticky_cos_cap
                   << ", envelope=" << config.sticky_envelope << ")\n";
     }
-    if (sticky_bcd_enabled) {
-        std::cout << "[Setup] STICKY-BCD ENABLED (hysteresis margin=" << sticky_hysteresis
-                  << ", K=" << sticky_k << ", threshold=" << config.sticky_bcd_threshold
-                  << ", gain=" << config.sticky_bcd_gain << ")\n";
+    if (sticky_edge_refuse_enabled) {
+        std::cout << "[Setup] STICKY-edge refuse ENABLED (hysteresis margin=" << sticky_hysteresis
+                  << ", K=" << sticky_k << ", threshold=" << config.sticky_edge_refuse_threshold
+                  << ", gain=" << config.sticky_edge_refuse_gain << ")\n";
     }
-    if (sticky_f_enabled && sticky_bcd_enabled) {
-        std::cerr << "WARN: both --sticky-f and --sticky-bcd set; sticky-F takes precedence.\n";
+    if (sticky_sample_steering_enabled && sticky_edge_refuse_enabled) {
+        std::cerr << "WARN: both --sticky-sample-steering and --sticky-edge-refuse set; sticky-sample-steering takes precedence.\n";
     }
-    if (sampling_bias_enabled) {
-        std::cout << "[Setup] Sampling bias (Method F, structure tensor) ENABLED:\n"
-                  << "        envelope        = " << sampling_bias_envelope << " m\n"
-                  << "        cos_cap         = " << sampling_bias_cos_cap
+    if (sample_steering_enabled) {
+        std::cout << "[Setup] Sample steering (structure tensor) ENABLED:\n"
+                  << "        envelope        = " << sample_steering_envelope << " m\n"
+                  << "        cos_cap         = " << sample_steering_cos_cap
                   << " (min angle ≈ "
-                  << static_cast<int>(std::acos(sampling_bias_cos_cap) * 180.0f / M_PI)
+                  << static_cast<int>(std::acos(sample_steering_cos_cap) * 180.0f / M_PI)
                   << "° off axis)\n"
-                  << "        K nearest       = " << sampling_bias_k << "\n"
-                  << "        min anisotropy  = " << sampling_bias_min_anisotropy
+                  << "        K nearest       = " << sample_steering_k << "\n"
+                  << "        min anisotropy  = " << sample_steering_min_anisotropy
                   << " (skip if (λmax−λmin)/λmax below)\n";
     }
 
@@ -1371,7 +1371,7 @@ int main(int argc, char* argv[]) {
                 // For each path edge, find the MAX-of-K most-dangerous branch.
                 // Count edges with a valid winner and how many times the winner
                 // changes between consecutive in-envelope edges. This is the
-                // de-facto rejection axis for BCD; a high change-rate through
+                // de-facto rejection axis for edge refuse; a high change-rate through
                 // the crossing is the direct signature of oscillation.
                 int prev_winner = -1, segs = 0, switches = 0;
                 for (size_t i = 0; i + 1 < solution.size(); ++i) {

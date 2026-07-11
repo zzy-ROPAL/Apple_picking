@@ -623,7 +623,7 @@ static float computeAdaptiveStep(float dist_to_obstacle, float base_step) {
 }
 
 // ============================================================================
-// getOrComputeEEJacobian — Method F (Optimization 1)
+// getOrComputeEEJacobian — sample steering (Optimization 1)
 // ============================================================================
 // Returns the 3×7 EE Jacobian at the given node configuration, cached by
 // node_id. On cache miss, computes via PandaPinocchioRobot::computeSphere
@@ -696,10 +696,10 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     }
     if (q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
 
-    // ---- Method F: angle-range sampling bias (Optimizations 1-4) ----
+    // ---- sample steering: angle-range cap (Optimizations 1-4) ----
     // Cap the axial-vs-branch-axis component of q_step_dir when the EE is
     // within envelope of a branch. Uses cached J_EE keyed by node id.
-    if (config_.sampling_bias_enabled) {
+    if (config_.sample_steering_enabled) {
         auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
             cspace_->getCostEvaluator());
         if (sdf_eval) {
@@ -708,22 +708,22 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
             robot_->setJointValues(q_near);
             bool applied = sdf_eval->applySamplingBias(
                 q_near, q_step_dir, J_EE,
-                config_.sampling_bias_envelope,
-                config_.sampling_bias_cos_cap,
-                config_.sampling_bias_k,
-                config_.sampling_bias_min_anisotropy);
+                config_.sample_steering_envelope,
+                config_.sample_steering_cos_cap,
+                config_.sample_steering_k,
+                config_.sample_steering_min_anisotropy);
             if (applied && q_step_dir.norm() > 1e-6f) {
                 q_step_dir.normalize();
             }
         }
     }
 
-    // ---- Sticky-winner selection (shared by sticky-F and sticky-BCD) ----
-    // Selection + F bending happen HERE (they shape q_step_dir before the
-    // edge is formed). BCD rejection is deferred until after new_config is
+    // ---- Sticky-winner selection (shared by sticky-sample-steering and sticky-edge-refuse) ----
+    // Selection + sample-steering bending happen HERE (they shape q_step_dir before the
+    // edge is formed). edge refuse rejection is deferred until after new_config is
     // known, so it can sub-sample the real edge (see below).
-    int   sticky_winner_id = -1;   // committed winner branch (for BCD rejection)
-    if (config_.sticky_f_enabled || config_.sticky_bcd_enabled) {
+    int   sticky_winner_id = -1;   // committed winner branch (for edge refuse rejection)
+    if (config_.sticky_sample_steering_enabled || config_.sticky_edge_refuse_enabled) {
         auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
             cspace_->getCostEvaluator());
         if (sdf_eval) {
@@ -739,8 +739,8 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
             cand.chosen_winner_id = sw.chosen_id;
             sticky_winner_id      = sw.chosen_id;
 
-            if (sw.chosen_id >= 0 && config_.sticky_f_enabled) {
-                // F-style deterministic bending (before edge is formed).
+            if (sw.chosen_id >= 0 && config_.sticky_sample_steering_enabled) {
+                // sample-steering-style deterministic bending (before edge is formed).
                 sdf_eval->bendAgainstAxis(
                     q_step_dir, J_EE, sw.chosen_axis,
                     config_.sticky_cos_cap);
@@ -760,12 +760,12 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     }
     Config new_config = q_near + q_step_dir * step_size;
 
-    // ---- Sticky-BCD rejection (deferred): score the REAL edge -----------
+    // ---- Sticky-edge refuse rejection (deferred): score the REAL edge -----------
     // Now that new_config is known, evaluate the winner branch's axial score
     // over the full edge q_near→new_config using both engagement spheres and
     // DCD-granularity sub-sampling (catches envelope-entry / mid-edge-axial
     // that a single q_near Jacobian prediction misses).
-    if (config_.sticky_bcd_enabled && sticky_winner_id >= 0) {
+    if (config_.sticky_edge_refuse_enabled && sticky_winner_id >= 0) {
         auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
             cspace_->getCostEvaluator());
         if (sdf_eval) {
@@ -773,8 +773,8 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
                 q_near, new_config, sticky_winner_id,
                 config_.sticky_envelope,
                 config_.sampling_size_dcd);
-            float x = config_.sticky_bcd_gain *
-                      (score - config_.sticky_bcd_threshold);
+            float x = config_.sticky_edge_refuse_gain *
+                      (score - config_.sticky_edge_refuse_threshold);
             float p_reject = (x >= 0.0f)
                 ? 1.0f / (1.0f + std::exp(-x))
                 : std::exp(x) / (1.0f + std::exp(x));

@@ -160,7 +160,7 @@ private:
     };
     ExtendCandidate extendVFRRTCompute(const Config& target);
 
-    // Method F (Optimization 1): get cached EE Jacobian for a tree node,
+    // sample steering (Optimization 1): get cached EE Jacobian for a tree node,
     // computing it on first use. Assumes robot is currently at the node's
     // configuration when first computing.
     MatrixXf getOrComputeEEJacobian(int node_id, const Config& q);
@@ -318,7 +318,7 @@ private:
     float best_goal_cost_ = 1e9f;
     std::unordered_map<int, Matrix4f> map_config_tcp_;
 
-    // Method F sampling bias: EE Jacobian cache keyed by tree node id.
+    // sample steering: EE Jacobian cache keyed by tree node id.
     // Populated lazily when a node is used as q_near and the EE is in
     // envelope. Cleared at the start of each planning run.
     std::unordered_map<int, MatrixXf> ee_jacobian_cache_;

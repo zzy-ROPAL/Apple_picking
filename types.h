@@ -188,22 +188,22 @@ struct GraspRrtConfig {
     // (≈ 3× the existing radial coefficient K_rad ≈ 200).
     float branch_anisotropy_K_ax        = 0.0f;
 
-    // ---- Sampling bias (Method F: angle-range cap on extension direction) ----
+    // ---- Sample steering ( angle-range cap on extension direction) ----
     // When enabled, the RRT extension primitive applies an axial-cap to
     // q_step_dir whenever the EE (panda_hand reference point) is within
-    // `sampling_bias_envelope` of a branch surface. The cap reduces the
+    // `sample_steering_envelope` of a branch surface. The cap reduces the
     // motion component along the branch axis so the resulting EE motion
     // stays at least `min_angle` away from the axis.
     //
-    // Cheaper than edge rejection: each cycle produces a useful extension
+    // Cheaper than edge refuse: each cycle produces a useful extension
     // (no retries). Combined with a per-node Jacobian cache, per-cycle
     // overhead is ~5-10 μs.
     //
     //   cos_cap = cos(min_angle) — maximum allowed |Δp̂·â|.
     //   Default 0.866 (cos 30°): motion must be ≥ 30° off the branch axis.
-    bool  sampling_bias_enabled       = false;
-    float sampling_bias_envelope      = 0.05f;   // 5 cm pre-contact shell
-    float sampling_bias_cos_cap       = 0.866f;  // cos(30°)
+    bool  sample_steering_enabled       = false;
+    float sample_steering_envelope      = 0.05f;   // 5 cm pre-contact shell
+    float sample_steering_cos_cap       = 0.866f;  // cos(30°)
 
     // Multi-branch handling: aggregate the K nearest branches inside envelope
     // into a structure tensor M = Σ wᵢ âᵢ âᵢᵀ, then bias against M's dominant
@@ -212,22 +212,22 @@ struct GraspRrtConfig {
     //   min_anisotropy ∈ [0, 1]: skip bias when (λmax−λmin)/λmax < this. At
     //     ~0.3 a clearly dominant axis exists; near 0 the geometry is too
     //     isotropic to bias against meaningfully.
-    int   sampling_bias_k              = 5;       // structure tensor: K=5 nearest
-    float sampling_bias_min_anisotropy = 0.3f;    // skip if (λmax−λmin)/λmax below
+    int   sample_steering_k              = 5;       // structure tensor: K=5 nearest
+    float sample_steering_min_anisotropy = 0.3f;    // skip if (λmax−λmin)/λmax below
 
     // ---- Sticky-winner (Upgrades A and B) ----
     // Two variants share the same axis-selection logic:
-    //   * sticky-F   → deterministic F-style bending on the winner's axis
-    //   * sticky-BCD → probabilistic sigmoid rejection on the winner's score
+    //   * sticky-sample-steering   → deterministic sample-steering-style bending on the winner's axis
+    //   * sticky-edge-refuse → probabilistic sigmoid rejection on the winner's score
     // Both read/write CSpaceNode::winner_branch_id_ for hysteresis.
-    bool  sticky_f_enabled          = false;
-    bool  sticky_bcd_enabled        = false;
+    bool  sticky_sample_steering_enabled          = false;
+    bool  sticky_edge_refuse_enabled        = false;
     float sticky_envelope           = 0.05f;   // 5 cm
-    float sticky_cos_cap            = 0.866f;  // cos(30°) for F bending
+    float sticky_cos_cap            = 0.866f;  // cos(30°) for sample-steering bending
     float sticky_hysteresis_margin  = 1.25f;   // challenger must beat incumbent by ×margin
     int   sticky_k                  = 3;       // K nearest branches
-    float sticky_bcd_threshold      = 0.9063f; // sigmoid midpoint (cos 25°)
-    float sticky_bcd_gain           = 20.0f;   // sigmoid steepness
+    float sticky_edge_refuse_threshold      = 0.9063f; // sigmoid midpoint (cos 25°)
+    float sticky_edge_refuse_gain           = 20.0f;   // sigmoid steepness
 };
 
 } // namespace grasp_rrt
