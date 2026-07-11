@@ -17,6 +17,9 @@ find_package(pinocchio REQUIRED)
 # Bullet3 (用于碰撞检测)
 find_package(Bullet REQUIRED)
 
+# OpenMP (用于并行化 SDF 构建等热点)
+find_package(OpenMP REQUIRED)
+
 # ============================================================================
 # 包含目录
 # ============================================================================
@@ -38,6 +41,7 @@ target_link_libraries(grasp_rrt_lib
     Eigen3::Eigen
     pinocchio::pinocchio
     ${BULLET_LIBRARIES}
+    OpenMP::OpenMP_CXX
 )
 
 # ============================================================================
@@ -50,6 +54,7 @@ target_link_libraries(example_grasp_rrt
     Eigen3::Eigen
     pinocchio::pinocchio
     ${BULLET_LIBRARIES}
+    OpenMP::OpenMP_CXX
 )
 
 # ============================================================================
@@ -62,6 +67,7 @@ target_link_libraries(benchmark_grasp_rrt
     Eigen3::Eigen
     pinocchio::pinocchio
     ${BULLET_LIBRARIES}
+    OpenMP::OpenMP_CXX
 )
 
 # ============================================================================

@@ -12,6 +12,7 @@
 #include <memory>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <iostream>
 #include <limits>
 
@@ -96,12 +97,37 @@ public:
                n_grasp_trapped_ + n_grasp_error_;
     }
 
+    /**
+     * 将整棵 RRT 树 dump 到 CSV，用于离线可视化树生长过程
+     * 字段: node_id,parent_id,j0..j6,tcp_x,tcp_y,tcp_z,in_pose_sphere,on_solution_path
+     */
+    void dumpTree(const std::string& filepath);
+
+    /**
+     * 将 pose_sphere 的每个 face 的统计 dump 到 CSV
+     * 字段: face_id,attempts,failures,disabled,node_count,dir_x,dir_y,dir_z
+     */
+    void dumpFaceStats(const std::string& filepath);
+
     // Add an extra setup-time contribution (e.g. SDF voxel build).
     // Will be added to setup_time_ms at the end of init().
     void addExtraSetupTimeMs(float ms) { extra_setup_time_ms_ += ms; }
 
     // Tune Method A (goal-biased sampling). Set p=0.0 to disable.
     void setGoalBiasProb(float p) { goal_bias_prob_ = p; }
+
+    // ---- Batch RRT (parallel extend, serial commit) ----
+    //
+    // 设置每轮规划用多少个线程做扩展. 1 = 退化为串行 (默认).
+    // 调用前提: robot_ / cspace_ 的 collision checker 必须已配置好对应的
+    // per-thread 状态 (PandaPinocchioRobot::setNumThreads, BulletCollisionChecker(num_threads)).
+    void setNumThreads(int n) { num_threads_ = (n > 1) ? n : 1; }
+    int  getNumThreads() const { return num_threads_; }
+
+    // ---- OR-Parallel external stop signal ----
+    // When set, the planning loop polls this flag and exits early when true.
+    // Used by OR-Parallel mode to cancel losing trees once any tree finds a solution.
+    void setExternalStopFlag(std::atomic<bool>* f) { external_stop_flag_ = f; }
 
     // ---- 重置 ----
 
@@ -113,11 +139,41 @@ private:
 
     // ---- 单轮规划循环 (对应 Python doPlanningCycle) ----
     bool doPlanningCycle();
+    bool doPlanningCycleBatch(int K);
 
     // ---- 扩展方法 ----
 
     ExtensionResult extendVFRRT(const Config& target);
-    Config computeVectorField(const Config& q, CSpaceNodePtr nn);
+
+    // Batch-friendly: 只做计算 (NN/VF/collision), 不写 tree/perf 计数.
+    // 返回的 candidate 由主线程串行 commit.
+    struct ExtendCandidate {
+        bool       valid = false;
+        int        nn_id = -1;
+        Config     new_config;
+        float      edge_cost = 0.0f;
+        float      nn_time_ms = 0.0f;
+        float      vf_time_ms = 0.0f;
+        float      collision_time_ms = 0.0f;
+        int        col_check_count_delta = 0;
+        int        chosen_winner_id = -1;  // sticky-winner: id to store on new node
+    };
+    ExtendCandidate extendVFRRTCompute(const Config& target);
+
+    // Method F (Optimization 1): get cached EE Jacobian for a tree node,
+    // computing it on first use. Assumes robot is currently at the node's
+    // configuration when first computing.
+    MatrixXf getOrComputeEEJacobian(int node_id, const Config& q);
+
+    // motion_dir: intended extension direction in joint space (e.g., q_rand−q_near).
+    // Used by Option A branch anisotropy to apply axial drag. Pass an empty Config()
+    // (or omit) to disable the drag and recover the legacy isotropic behavior.
+    Config computeVectorField(const Config& q, CSpaceNodePtr nn,
+                              const Config& motion_dir = Config());
+
+    // Shell attractor: 在主线程根据 shell_resample_counter_/period 判定是否
+    // 重新采样 cached_shell_target_. computeVectorField 仅做只读使用.
+    void maybeResampleShellAttractor();
 
     // ---- 路径验证 (Lazy collision check) ----
     bool validateSolutionPath(CSpaceNodePtr goal_node);
@@ -262,6 +318,12 @@ private:
     float best_goal_cost_ = 1e9f;
     std::unordered_map<int, Matrix4f> map_config_tcp_;
 
+    // Method F sampling bias: EE Jacobian cache keyed by tree node id.
+    // Populated lazily when a node is used as q_near and the EE is in
+    // envelope. Cleared at the start of each planning run.
+    std::unordered_map<int, MatrixXf> ee_jacobian_cache_;
+    std::mutex ee_jacobian_cache_mutex_;
+
     // 目标物体位置缓存
     Vector3f target_object_position_;
 
@@ -282,12 +344,21 @@ private:
     int n_grasp_trapped_ = 0;
     int n_grasp_error_ = 0;
 
+    // Shell attractor (vector field): cache + resample counter
+    Vector3f cached_shell_target_      = Vector3f::Zero();
+    int      shell_resample_counter_   = 0;
+
     // Goal-biased sampling (Method A): track best below-equator node
     int   closest_below_node_id_ = -1;
     float closest_below_dist2_   = std::numeric_limits<float>::max();
     float goal_bias_prob_        = 0.15f;   // 15% of cycles use goal-biased target
     float goal_bias_jitter_      = 0.25f;   // joint-space jitter scale (rad)
 
+    // Batch RRT
+    int num_threads_ = 1;
+
+    // OR-Parallel external stop flag (nullable, owned by caller)
+    std::atomic<bool>* external_stop_flag_ = nullptr;
 };
 
 } // namespace grasp_rrt

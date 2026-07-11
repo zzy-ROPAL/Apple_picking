@@ -4,8 +4,10 @@ import numpy as np
 import time
 import os
 import math
+import sys
 
 def main():
+    add_apple_branch = "--apple-branch" in sys.argv
     # 1. 连接 PyBullet
     p.connect(p.GUI)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -57,6 +59,32 @@ def main():
         b_col = p.createCollisionShape(p.GEOM_CYLINDER, radius=branch_radius, height=branch_length)
         b_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=branch_radius, length=branch_length, rgbaColor=[0.2, 0.6, 0.2, 0.6])
         p.createMultiBody(baseMass=0, baseCollisionShapeIndex=b_col, baseVisualShapeIndex=b_vis, basePosition=pos, baseOrientation=orn)
+
+    # --apple-branch: thick horizontal cylinder grown from the trunk through
+    # the apple (r=0.12, length=0.40, axis = trunk→apple).
+    if add_apple_branch:
+        apple_xyz = [0.45, 0.0, 0.80]
+        dir_vec = [apple_xyz[0] - trunk_pos[0], apple_xyz[1] - trunk_pos[1], 0.0]
+        dnorm = math.sqrt(dir_vec[0]**2 + dir_vec[1]**2)
+        dir_vec = [dir_vec[0]/dnorm, dir_vec[1]/dnorm, 0.0]
+        ab_r = 0.12
+        ab_len = 0.40
+        p0 = [trunk_pos[0] + trunk_radius * dir_vec[0],
+              trunk_pos[1] + trunk_radius * dir_vec[1],
+              apple_xyz[2]]
+        ab_center = [p0[0] + 0.5 * ab_len * dir_vec[0],
+                     p0[1] + 0.5 * ab_len * dir_vec[1],
+                     apple_xyz[2]]
+        ang = math.atan2(dir_vec[1], dir_vec[0])
+        q_y = p.getQuaternionFromEuler([0, math.pi/2, 0])
+        q_z = p.getQuaternionFromEuler([0, 0, ang])
+        _, ab_orn = p.multiplyTransforms([0,0,0], q_z, [0,0,0], q_y)
+        ab_col = p.createCollisionShape(p.GEOM_CYLINDER, radius=ab_r, height=ab_len)
+        ab_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=ab_r, length=ab_len,
+                                      rgbaColor=[0.2, 0.6, 0.2, 0.35])
+        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=ab_col,
+                          baseVisualShapeIndex=ab_vis,
+                          basePosition=ab_center, baseOrientation=ab_orn)
 
     # 苹果正上方的硬质障碍物
     # 与 C++ 保持一致：addObstacleSphere(radius=0.08, center=(0.45,0,0.91))

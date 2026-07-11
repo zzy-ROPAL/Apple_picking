@@ -16,22 +16,27 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// SdfCostEvaluator
-// 用预计算的 3D 有符号距离场 (SDF) 替代 TreeCanopyCostEvaluator 中的
-// 逐次球-圆柱距离计算，将 evaluateCost() 从 O(k×m) 降至 O(k)。
+// SdfCostEvaluator — owner of the precomputed signed-distance field (SDF)
+// over the semi-rigid foliage and rigid trunk/canopy.
 //
-// 使用方法:
-//   1. addBranchCylinder(p0, p1, radius)  — 添加所有树枝圆柱 (与原接口相同)
-//   2. addRobotSphere(link, radius, offset) — 添加所有机器人碰撞球 (与原接口相同)
-//   3. buildSdf()  — 规划开始前调用一次，耗时 << 1s，之后查询 O(1)
-//   4. cspace->setCostEvaluator(cost_evaluator)
+// Role in the paper:
+//   - Implements the workspace force field of Sec. 3.3 via
+//     evaluateAnisotropicForce(q, v_joint, K_ax), which returns the joint-
+//     space force (radial repulsion + non-conservative axial drag, both
+//     gated by per-sphere penetration > 0).
+//   - Exposes queryDistance(p) for the planner's adaptive step size.
+//   - Provides measureWaypointAnisotropy() as a post-hoc evaluation metric.
 //
-// 原理:
-//   - 根据所有圆柱几何自动计算世界坐标包围盒，再扩展 padding
-//   - 将包围盒划分为分辨率为 voxel_size 的体素网格
-//   - 每个体素存储到最近圆柱表面的有符号距离 (内部为负)
-//   - evaluateCost() 对每个机器人球通过三线性插值 O(1) 查询 SDF，
-//     计算穿透深度并累加二次代价，与原始公式完全一致
+// Note: the legacy scalar-penalty methods evaluateCost() and evaluateGradient()
+// were removed when the planner moved from RRT* to VF-RRT (paper Sec. 3.2);
+// they had no remaining functional role beyond the conservative component of
+// the force field, which evaluateAnisotropicForce computes directly.
+//
+// Usage:
+//   1. addBranchCylinder(p0, p1, radius)
+//   2. addRobotSphere(link, radius, offset)
+//   3. buildSdf()          — call once before planning, O(1) queries afterwards
+//   4. cspace->setCostEvaluator(...)
 // ============================================================================
 
 class SdfCostEvaluator : public CostEvaluator {
@@ -40,6 +45,15 @@ public:
         Eigen::Vector3f p0;
         Eigen::Vector3f p1;
         float radius;
+        // If true, this cylinder is excluded from anisotropy mechanisms
+        // (sampling bias, axial drag K_ax, edge rejection). Use for rigid
+        // obstacles like the trunk where "push aside radially" is not a
+        // valid behavior — the robot must avoid them entirely.
+        bool exclude_from_aniso = false;
+        // Pre-normalized axis (p1 − p0)/|p1 − p0|. Cached at build time
+        // (Optimization B) so per-cycle anisotropy checks skip the
+        // normalize() call. Zero for degenerate cylinders (p0 == p1).
+        Eigen::Vector3f axis_unit = Eigen::Vector3f::Zero();
     };
 
     struct RobotSphere {
@@ -60,7 +74,28 @@ public:
     void addBranchCylinder(const Eigen::Vector3f& p0,
                            const Eigen::Vector3f& p1,
                            float radius) {
-        cylinders_.push_back({p0, p1, radius});
+        Eigen::Vector3f a = p1 - p0;
+        float len = a.norm();
+        Eigen::Vector3f a_unit = (len > 1e-6f)
+            ? Eigen::Vector3f(a / len)
+            : Eigen::Vector3f::Zero();
+        cylinders_.push_back({p0, p1, radius, /*exclude_from_aniso=*/false, a_unit});
+        sdf_built_ = false;
+    }
+
+    // Same as addBranchCylinder but flags the cylinder as RIGID — the
+    // anisotropy mechanisms (sampling bias, K_ax, edge rejection) will
+    // skip it. Use for the trunk and any other rigid obstacle the robot
+    // is expected to avoid rather than push through.
+    void addRigidCylinder(const Eigen::Vector3f& p0,
+                          const Eigen::Vector3f& p1,
+                          float radius) {
+        Eigen::Vector3f a = p1 - p0;
+        float len = a.norm();
+        Eigen::Vector3f a_unit = (len > 1e-6f)
+            ? Eigen::Vector3f(a / len)
+            : Eigen::Vector3f::Zero();
+        cylinders_.push_back({p0, p1, radius, /*exclude_from_aniso=*/true, a_unit});
         sdf_built_ = false;
     }
 
@@ -110,10 +145,11 @@ public:
                   << total * sizeof(float) / 1024.0f / 1024.0f << " MB)\n"
                   << "[SDF] Building...  (cylinders=" << cylinders_.size() << ")\n";
 
-        // 3. 逐体素填充最小有符号距离（计时）
+        // 3. 逐体素填充最小有符号距离 (OpenMP 并行化, embarrassingly parallel)
         sdf_grid_.resize(total);
         auto t_start = std::chrono::steady_clock::now();
 
+        #pragma omp parallel for collapse(3) schedule(static)
         for (int iz = 0; iz < nz_; ++iz) {
             for (int iy = 0; iy < ny_; ++iy) {
                 for (int ix = 0; ix < nx_; ++ix) {
@@ -135,101 +171,833 @@ public:
                   << "O(1) distance queries ready.\n";
     }
 
-    // ---- CostEvaluator 接口 ----
-
-    // 代价计算：与 TreeCanopyCostEvaluator 完全相同的公式，
-    // 但用 SDF 查询替代逐圆柱循环，速度提升 ~m 倍 (m = 圆柱数)。
-    float evaluateCost(const Config& q) override {
+    // ------------------------------------------------------------------
+    //
+    // NOTE — Removed APIs:
+    //   evaluateCost(q) and evaluateGradient(q) were the legacy scalar-
+    //   penalty interfaces inherited from the abandoned RRT*-style design
+    //   (paper Sec. 3.2). All force-field queries now go through
+    //   evaluateAnisotropicForce() below, which directly returns the joint-
+    //   space force (radial + axial drag). Setting K_ax = 0 recovers the
+    //   pure radial component without computing any scalar potential.
+    // ------------------------------------------------------------------
+    // evaluateAnisotropicForce — Option A: radial repulsion + axial drag
+    //
+    // Returns the joint-space FORCE (already negated; caller adds directly
+    // to the VF without further negation).
+    //
+    //   F_radial(ws) = +200 · penetration · grad_sdf   (existing, isotropic)
+    //   F_drag  (ws) = −K_ax · penetration · (v_sphere_ws · â) â   (new)
+    //   total joint force = Σ_spheres  J_sphere^T · (F_radial + F_drag)
+    //
+    // â is the unit axis of the nearest cylinder (branch or trunk segment)
+    // to the sphere center. v_sphere_ws = J_sphere · v_joint is the workspace
+    // velocity induced by the intended extension direction v_joint.
+    //
+    // F_drag is non-conservative and velocity-dependent — it cannot be
+    // expressed as the gradient of any scalar potential. This is the
+    // structural property that lets the field encode motion-direction
+    // anisotropy (axial vs radial), unlike a conservative cost gradient.
+    //
+    // When K_ax = 0 (or v_joint = 0) this reduces EXACTLY to
+    // -evaluateGradient(q), preserving legacy behavior bit-for-bit.
+    // ------------------------------------------------------------------
+    grasp_rrt::Config evaluateAnisotropicForce(const grasp_rrt::Config& q,
+                                               const grasp_rrt::Config& v_joint,
+                                               float K_ax) const {
         if (!sdf_built_) {
             throw std::runtime_error(
                 "[SdfCostEvaluator] buildSdf() must be called before planning!");
         }
-
         robot_->setJointValues(q);
-        float total_cost = 0.0f;
+        grasp_rrt::Config total_force = grasp_rrt::Config::Zero(q.size());
+        float delta = voxel_size_ * 2.0f;
+        float inv_2d = 1.0f / (2.0f * delta);
+
+        const bool use_drag = (K_ax > 0.0f)
+                           && (v_joint.size() == q.size())
+                           && (v_joint.norm() > 1e-9f);
 
         for (const auto& rs : spheres_) {
-            // 正运动学：球心世界坐标 (O(1) 访问)
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
             Eigen::Vector3f p = pose.block<3,1>(0,3)
                               + pose.block<3,3>(0,0) * rs.offset;
 
-            // SDF 查询：球心到最近圆柱表面的有符号距离
             float sdf_val = sampleSdf(p);
-
-            // 穿透深度 = 球半径 - 表面距离（球心进入圆柱时 sdf_val < 0）
             float penetration = rs.radius - sdf_val;
+            if (penetration <= 0.0f) continue;
 
-            if (penetration > 0.0f) {
-                // 与原始公式一致：二次代价
-                total_cost += penetration * penetration * 100.0f;
+            // Workspace SDF gradient (~ unit, points radially out of obstacle)
+            Eigen::Vector3f grad_sdf;
+            grad_sdf.x() = (sampleSdf(p + Eigen::Vector3f(delta, 0, 0))
+                          - sampleSdf(p - Eigen::Vector3f(delta, 0, 0))) * inv_2d;
+            grad_sdf.y() = (sampleSdf(p + Eigen::Vector3f(0, delta, 0))
+                          - sampleSdf(p - Eigen::Vector3f(0, delta, 0))) * inv_2d;
+            grad_sdf.z() = (sampleSdf(p + Eigen::Vector3f(0, 0, delta))
+                          - sampleSdf(p - Eigen::Vector3f(0, 0, delta))) * inv_2d;
+
+            // Existing radial repulsion: F = +200·pen·∇sdf  (anti-gradient of U)
+            Eigen::Vector3f F_total_ws = 200.0f * penetration * grad_sdf;
+
+            // Per-sphere Jacobian (3xN) — needed regardless of drag for J^T mapping.
+            auto panda = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
+            grasp_rrt::MatrixXf J_sphere;
+            if (panda) {
+                J_sphere = panda->computeSphereJacobianDirect(rs.frame_id, rs.offset);
+            } else {
+                robot_->prepareJacobians();
+                J_sphere = robot_->computeSphereJacobianById(rs.frame_id, rs.offset);
             }
-        }
 
-        return total_cost;
+            // Axial drag: only when K_ax > 0, v_joint nonzero, and nearest
+            // cylinder has a non-degenerate axis (skips overhead-sphere case).
+            if (use_drag) {
+                Eigen::Vector3f a_hat = findNearestCylinderAxis(p);
+                if (a_hat.squaredNorm() > 0.25f) {   // valid unit axis
+                    Eigen::Vector3f v_sphere_ws = J_sphere * v_joint;
+                    float v_ax_scalar = v_sphere_ws.dot(a_hat);
+                    F_total_ws.noalias() +=
+                        (-K_ax * penetration * v_ax_scalar) * a_hat;
+                }
+            }
+
+            total_force.noalias() += J_sphere.transpose() * F_total_ws;
+        }
+        return total_force;
     }
 
-    // ---- 梯度计算 (解析雅可比法) ----
-    Config evaluateGradient(const Config& q) override {
-        if (!sdf_built_) {
-            throw std::runtime_error("[SdfCostEvaluator] buildSdf() must be called!");
-        }
+    // ------------------------------------------------------------------
+    // measureWaypointAnisotropy — path-quality instrumentation
+    //
+    // Post-hoc measurement (NOT used during planning). For one waypoint q
+    // with intended motion v_joint, returns (axial_weighted, total_weighted)
+    // accumulated over all robot collision spheres that are CURRENTLY in
+    // branch contact (penetration > 0):
+    //
+    //   axial += penetration · |v_sphere · â|     ← motion projected on branch axis
+    //   total += penetration · |v_sphere|         ← full motion magnitude
+    //
+    // Caller accumulates across all waypoints and computes the fraction
+    //   f = Σ axial / Σ total ∈ [0, 1]
+    // Lower f means more perpendicular crossings (Option A's intended effect).
+    //
+    // Cost ≈ ~50 spheres · cheap ops per waypoint; <1ms per solution path.
+    // Degenerate axis (overhead-sphere) and free-space (penetration ≤ 0) are
+    // silently skipped (contribute nothing).
+    // ------------------------------------------------------------------
+    std::pair<double, double> measureWaypointAnisotropy(
+        const grasp_rrt::Config& q,
+        const grasp_rrt::Config& v_joint) const {
+        if (!sdf_built_) return {0.0, 0.0};
+        if (v_joint.size() != q.size() || v_joint.norm() < 1e-9f) return {0.0, 0.0};
 
-        auto t0 = std::chrono::high_resolution_clock::now();
         robot_->setJointValues(q);
-        auto t1 = std::chrono::high_resolution_clock::now();
-
-        Config total_gradient = Eigen::VectorXf::Zero(q.size());
-        float delta = voxel_size_ * 2.0f;
-        float inv_2d = 1.0f / (2.0f * delta);
-        bool jacobians_prepared = false;
-        int active_spheres = 0;
+        double axial_acc = 0.0, total_acc = 0.0;
 
         for (const auto& rs : spheres_) {
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
-            Eigen::Vector3f p = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
+            Eigen::Vector3f p = pose.block<3,1>(0,3)
+                              + pose.block<3,3>(0,0) * rs.offset;
 
             float sdf_val = sampleSdf(p);
             float penetration = rs.radius - sdf_val;
+            if (penetration <= 0.0f) continue;
 
-            if (penetration > 0.0f) {
-                active_spheres++;
-                jacobians_prepared = true;  // track that at least one sphere needed Jacobian
+            Eigen::Vector3f a_hat = findNearestCylinderAxis(p);
+            if (a_hat.squaredNorm() < 0.25f) continue;  // degenerate axis (skip)
 
-                Eigen::Vector3f grad_sdf;
-                grad_sdf.x() = (sampleSdf(p + Eigen::Vector3f(delta, 0, 0)) - sampleSdf(p - Eigen::Vector3f(delta, 0, 0))) * inv_2d;
-                grad_sdf.y() = (sampleSdf(p + Eigen::Vector3f(0, delta, 0)) - sampleSdf(p - Eigen::Vector3f(0, delta, 0))) * inv_2d;
-                grad_sdf.z() = (sampleSdf(p + Eigen::Vector3f(0, 0, delta)) - sampleSdf(p - Eigen::Vector3f(0, 0, delta))) * inv_2d;
+            // Per-sphere workspace velocity
+            auto panda = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
+            grasp_rrt::MatrixXf J_sphere;
+            if (panda) {
+                J_sphere = panda->computeSphereJacobianDirect(rs.frame_id, rs.offset);
+            } else {
+                robot_->prepareJacobians();
+                J_sphere = robot_->computeSphereJacobianById(rs.frame_id, rs.offset);
+            }
+            Eigen::Vector3f v_sphere_ws = J_sphere * v_joint;
+            float v_norm = v_sphere_ws.norm();
+            if (v_norm < 1e-9f) continue;
 
-                Eigen::Vector3f grad_x_cost = -200.0f * penetration * grad_sdf;
-                // Direct per-frame Jacobian: avoids computeJointJacobians (full-body, all joints)
-                // Uses computeFrameJacobian internally (only traverses from frame to root)
-                auto panda = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
-                if (panda) {
-                    sphere_jac_cache_[&rs - spheres_.data()] = panda->computeSphereJacobianDirect(rs.frame_id, rs.offset);
-                } else {
-                    robot_->prepareJacobians();
-                    sphere_jac_cache_[&rs - spheres_.data()] = robot_->computeSphereJacobianById(rs.frame_id, rs.offset);
+            float v_ax_abs = std::abs(v_sphere_ws.dot(a_hat));
+            axial_acc += static_cast<double>(penetration) * v_ax_abs;
+            total_acc += static_cast<double>(penetration) * v_norm;
+        }
+        return {axial_acc, total_acc};
+    }
+
+    // ------------------------------------------------------------------
+    // measureWaypointAnisotropyDisplacement — depth-based (not velocity)
+    //
+    // For a path segment q_prev → q_curr, accumulates penetration-weighted
+    // path-length contributions, decomposed into radial and axial directions
+    // (L1 decomposition: radial + axial = 1).
+    //
+    //   For each sphere s with penetration > 0 at q_curr:
+    //       Δp_s   = sphere_position(q_curr) − sphere_position(q_prev)
+    //       Δp_ax  = |Δp_s · â|                       (axial component)
+    //       Δp_rad = ‖Δp_s − (Δp_s · â)â‖             (radial component)
+    //
+    //       axial_acc  += penetration · Δp_ax
+    //       radial_acc += penetration · Δp_rad
+    //
+    // Caller divides:
+    //       radial_fraction_L1 = Σ radial_acc / Σ (radial_acc + axial_acc)
+    //
+    // Interpretation: "of the total penetration-weighted path inside the
+    // obstacle, what fraction was traveled in the radial direction?"
+    //   1.0 → robot pushed straight through the wall (pure radial)
+    //   0.0 → robot slid along the cylinder axis (pure axial)
+    //
+    // No velocity, no Jacobian — pure position differences.
+    // ------------------------------------------------------------------
+    std::pair<double, double> measureWaypointAnisotropyDisplacement(
+        const grasp_rrt::Config& q_prev,
+        const grasp_rrt::Config& q_curr) const {
+        if (!sdf_built_) return {0.0, 0.0};
+        if (q_prev.size() != q_curr.size()) return {0.0, 0.0};
+
+        // Cache sphere positions at q_prev
+        robot_->setJointValues(q_prev);
+        std::vector<Eigen::Vector3f> p_prev(spheres_.size());
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+            p_prev[k] = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
+        }
+
+        // Evaluate at q_curr: penetration + Δp + axis decomposition
+        robot_->setJointValues(q_curr);
+        double radial_acc = 0.0, axial_acc = 0.0;
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+            Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
+                                   + pose.block<3,3>(0,0) * rs.offset;
+
+            float sdf_val = sampleSdf(p_curr);
+            float penetration = rs.radius - sdf_val;
+            if (penetration <= 0.0f) continue;
+
+            Eigen::Vector3f a_hat = findNearestCylinderAxis(p_curr);
+            if (a_hat.squaredNorm() < 0.25f) continue;  // degenerate axis (skip)
+
+            Eigen::Vector3f dp = p_curr - p_prev[k];
+            float dp_axial = std::abs(dp.dot(a_hat));
+            Eigen::Vector3f dp_radial_vec = dp - dp.dot(a_hat) * a_hat;
+            float dp_radial = dp_radial_vec.norm();
+
+            axial_acc  += static_cast<double>(penetration) * dp_axial;
+            radial_acc += static_cast<double>(penetration) * dp_radial;
+        }
+        return {axial_acc, radial_acc};
+    }
+
+    // ------------------------------------------------------------------
+    // computeEdgeAxialScore — Anisotropic edge rejection (BCD, Option A)
+    //
+    // Multi-branch axial-alignment score with K-nearest per-sphere max
+    // aggregation:
+    //
+    //   For each engagement-zone sphere s (panda_hand, panda_link6):
+    //       p_s     = sphere position at q_new
+    //       Δp_s    = p_s − sphere_pos(q_near, s)
+    //       For each non-rigid cylinder b within envelope of s, keep the
+    //       K nearest:
+    //           weight_sb = max(0, 1 − dist_sb / envelope)
+    //           cos_sb    = |Δp̂_s · â_b|
+    //           score_sb  = weight_sb · cos_sb
+    //   max_score = max over all (sphere s, branch b) pairs
+    //
+    // Rigid cylinders (exclude_from_aniso = true, e.g., trunk) are skipped
+    // entirely — anisotropy is a property of semi-rigid foliage.
+    //
+    // Sphere selection (D change): panda_hand (1st link from EE) and
+    // panda_link6 (3rd from EE). Skips panda_link7 (2nd, kinematically
+    // slaved to the hand) and panda_link5 (4th, slaved to link6).
+    //
+    // K = 5 default (controlled by caller). Bounded compute regardless
+    // of foliage density: per call O(N + K) for N total cylinders.
+    // ------------------------------------------------------------------
+    float computeEdgeAxialScore(const Eigen::VectorXf& q_near,
+                                 const Eigen::VectorXf& q_new,
+                                 float envelope,
+                                 int   K = 3) const override {
+        if (!sdf_built_) return 0.0f;
+        if (q_near.size() != q_new.size()) return 0.0f;
+        if (envelope <= 0.0f) return 0.0f;
+        if (cylinders_.empty()) return 0.0f;
+        if (K < 1) K = 1;
+
+        // ---- Optimization A: thread-local cache of q_near sphere positions
+        // Each thread keeps the most-recent q_near it computed FK for. RRT
+        // often re-uses the same q_near across consecutive cycles (nearest-
+        // neighbor returns the same node), so this saves a setJointValues
+        // call (~10-15 μs) on cache hits.
+        struct ThreadFKCache {
+            Eigen::VectorXf  q_cached;
+            // We store positions for ALL spheres; only engagement ones are
+            // read, but extra cost is negligible (~12 vec3).
+            std::vector<Eigen::Vector3f> p_prev;
+            bool valid = false;
+        };
+        static thread_local ThreadFKCache cache;
+
+        const std::vector<Eigen::Vector3f>* p_prev_ptr = nullptr;
+
+        bool reuse = cache.valid
+                  && cache.q_cached.size() == q_near.size()
+                  && (cache.q_cached - q_near).cwiseAbs().maxCoeff() < 1e-7f
+                  && cache.p_prev.size() == spheres_.size();
+
+        if (reuse) {
+            p_prev_ptr = &cache.p_prev;
+        } else {
+            robot_->setJointValues(q_near);
+            cache.p_prev.assign(spheres_.size(), Eigen::Vector3f::Zero());
+            for (size_t k = 0; k < spheres_.size(); ++k) {
+                const auto& rs = spheres_[k];
+                if (rs.link_name != "panda_hand" &&
+                    rs.link_name != "panda_link6") {
+                    continue;
                 }
-                total_gradient.noalias() += sphere_jac_cache_[&rs - spheres_.data()].transpose() * grad_x_cost;
+                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+                cache.p_prev[k] = pose.block<3,1>(0,3)
+                                + pose.block<3,3>(0,0) * rs.offset;
+            }
+            cache.q_cached = q_near;
+            cache.valid    = true;
+            p_prev_ptr     = &cache.p_prev;
+        }
+        const auto& p_prev = *p_prev_ptr;
+
+        // ---- Evaluate at q_new -----------------------------------------
+        robot_->setJointValues(q_new);
+        float max_score = 0.0f;
+        struct BranchHit { float dist; Eigen::Vector3f axis; };
+        std::vector<BranchHit> nearby;
+        nearby.reserve(cylinders_.size());
+
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            if (rs.link_name != "panda_hand" &&
+                rs.link_name != "panda_link6") {
+                continue;
+            }
+
+            Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+            Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
+                                   + pose.block<3,3>(0,0) * rs.offset;
+
+            // ---- Optimization C: fast SDF early-exit
+            // Single trilinear SDF lookup; if even the closest obstacle is
+            // further than envelope, no cylinder can match. Skips the
+            // O(N_cyl) loop for spheres in clear free space.
+            float sdf_val = sampleSdf(p_curr);
+            if (sdf_val - rs.radius > envelope) continue;
+
+            // Displacement of this sphere
+            Eigen::Vector3f dp = p_curr - p_prev[k];
+            float dp_norm = dp.norm();
+            if (dp_norm < 1e-4f) continue;
+            Eigen::Vector3f dp_hat = dp / dp_norm;
+
+            // Collect non-rigid branches with body-to-surface dist < envelope.
+            // Uses cached axis_unit (Optimization B) — no normalize() inside.
+            nearby.clear();
+            for (const auto& cyl : cylinders_) {
+                if (cyl.exclude_from_aniso) continue;
+                if (cyl.axis_unit.squaredNorm() < 0.25f) continue;  // degenerate
+                float d = distToCylinder(p_curr, cyl) - rs.radius;
+                if (d > envelope) continue;
+                nearby.push_back({d, cyl.axis_unit});
+            }
+            if (nearby.empty()) continue;
+
+            if (static_cast<int>(nearby.size()) > K) {
+                std::partial_sort(
+                    nearby.begin(), nearby.begin() + K, nearby.end(),
+                    [](const BranchHit& a, const BranchHit& b) {
+                        return a.dist < b.dist;
+                    });
+                nearby.resize(K);
+            }
+
+            for (const auto& br : nearby) {
+                float weight = std::max(0.0f, 1.0f - br.dist / envelope);
+                float cos_ax = std::abs(dp_hat.dot(br.axis));
+                float score  = weight * cos_ax;
+                if (score > max_score) max_score = score;
             }
         }
-        auto t2 = std::chrono::high_resolution_clock::now();
+        return max_score;
+    }
 
-        static int n = 0, n_active = 0;
-        static double acc_fk = 0, acc_jac = 0, acc_loop = 0;
-        acc_fk   += std::chrono::duration<double, std::micro>(t1 - t0).count();
-        acc_loop += std::chrono::duration<double, std::micro>(t2 - t1).count();
-        if (jacobians_prepared) { acc_jac += std::chrono::duration<double, std::micro>(t2 - t1).count(); n_active++; }
-        n++;
-        if (n % 500 == 0) {
-            std::cout << "[GRAD @" << n << "] FK=" << acc_fk/n << "us  "
-                      << "SphereLoop=" << acc_loop/n << "us  "
-                      << "Jac-calls=" << n_active << "/" << n
-                      << " (jac-avg=" << (n_active ? acc_jac/n_active : 0) << "us)\n";
+    // ------------------------------------------------------------------
+    // maxWinnerBranchId — post-hoc "which branch is most dangerous here"
+    //
+    // Same MAX-of-K over both engagement spheres as computeEdgeAxialScore,
+    // but returns the cylinder INDEX achieving the maximum score (weight·cos)
+    // instead of the score value. Returns -1 if no non-rigid branch is within
+    // envelope of either sphere along this edge.
+    //
+    // Used only for instrumentation: walking a solution path and counting how
+    // often this winner changes edge-to-edge measures oscillation of the
+    // rejection axis directly (original BCD's de-facto driver). Not used
+    // during planning.
+    // ------------------------------------------------------------------
+    int maxWinnerBranchId(const Eigen::VectorXf& q_near,
+                          const Eigen::VectorXf& q_new,
+                          float envelope,
+                          int   K = 3) const {
+        if (!sdf_built_ || cylinders_.empty()) return -1;
+        if (q_near.size() != q_new.size()) return -1;
+        if (envelope <= 0.0f) return -1;
+        if (K < 1) K = 1;
+
+        // Cache q_near sphere positions for the engagement spheres.
+        robot_->setJointValues(q_near);
+        std::vector<Eigen::Vector3f> p_prev(spheres_.size(), Eigen::Vector3f::Zero());
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
+                continue;
+            Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+            p_prev[k] = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
         }
 
-        return total_gradient;
+        robot_->setJointValues(q_new);
+        float max_score = 0.0f;
+        int   best_id   = -1;
+        struct BranchHit { int idx; float dist; Eigen::Vector3f axis; };
+        std::vector<BranchHit> nearby;
+        nearby.reserve(cylinders_.size());
+
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
+                continue;
+            Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+            Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
+                                   + pose.block<3,3>(0,0) * rs.offset;
+
+            Eigen::Vector3f dp = p_curr - p_prev[k];
+            float dp_norm = dp.norm();
+            if (dp_norm < 1e-5f) continue;
+            Eigen::Vector3f dp_hat = dp / dp_norm;
+
+            nearby.clear();
+            for (size_t i = 0; i < cylinders_.size(); ++i) {
+                const auto& cyl = cylinders_[i];
+                if (cyl.exclude_from_aniso) continue;
+                if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+                float d = distToCylinder(p_curr, cyl) - rs.radius;
+                if (d > envelope) continue;
+                nearby.push_back({static_cast<int>(i), d, cyl.axis_unit});
+            }
+            if (nearby.empty()) continue;
+            if (static_cast<int>(nearby.size()) > K) {
+                std::partial_sort(nearby.begin(), nearby.begin() + K, nearby.end(),
+                    [](const BranchHit& a, const BranchHit& b){ return a.dist < b.dist; });
+                nearby.resize(K);
+            }
+            for (const auto& br : nearby) {
+                float weight = std::max(0.0f, 1.0f - br.dist / envelope);
+                float cos_ax = std::abs(dp_hat.dot(br.axis));
+                float score  = weight * cos_ax;
+                if (score > max_score) { max_score = score; best_id = br.idx; }
+            }
+        }
+        return best_id;
+    }
+
+    // ==================================================================
+    // Sticky-winner selection (shared by sticky-BCD and sticky-F variants)
+    //
+    // Given the parent node's stored winner branch id and the current motion
+    // direction, this function:
+    //   1. Scores the K nearest non-rigid branches for the current edge.
+    //   2. Reads the parent's winner id.
+    //   3. Applies hysteresis: switch only if new-MAX exceeds prev-winner
+    //      current score by hysteresis_margin (e.g., 1.25).
+    //   4. Returns the chosen winner's cylinder index, its current score,
+    //      and its axis.
+    //
+    // If prev_winner_id is out of scope (not in current envelope) or -1,
+    // fresh MAX is used.
+    //
+    // Cost: ~10-15 μs (no eigendecomposition, no tensor).
+    // ------------------------------------------------------------------
+    struct StickyResult {
+        int  chosen_id     = -1;   // cylinder index; -1 = no branch in scope
+        int  new_max_id    = -1;   // fresh MAX (for diagnostics)
+        float chosen_score = 0.0f; // weight · |Δp̂ · â| for chosen winner
+        Eigen::Vector3f chosen_axis = Eigen::Vector3f::Zero();
+        bool  switched     = false; // true if we picked new_max over prev
+    };
+
+    StickyResult stickyWinnerSelect(const Eigen::VectorXf& q_near,
+                                     const Eigen::VectorXf& q_step_dir,
+                                     const Eigen::MatrixXf& J_EE,
+                                     int   prev_winner_id,
+                                     float envelope,
+                                     int   K,
+                                     float hysteresis_margin) const {
+        StickyResult result;
+        if (!sdf_built_ || cylinders_.empty()) return result;
+        if (envelope <= 0.0f) return result;
+        if (K < 1) K = 1;
+
+        // ---- Engagement spheres (panda_hand AND panda_link6) ----
+        // The winner-selection gate fires when EITHER sphere is within
+        // envelope of a branch (Fix A). Using only panda_hand missed cases
+        // where link6 engages a branch the hand has already passed.
+        struct EngSphere { Eigen::Vector3f p; float radius; };
+        std::vector<EngSphere> eng;
+        eng.reserve(2);
+        for (const auto& rs : spheres_) {
+            if ((rs.link_name == "panda_hand" || rs.link_name == "panda_link6")
+                && rs.offset.norm() < 1e-4f) {
+                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+                eng.push_back({pose.block<3,1>(0,3)
+                             + pose.block<3,3>(0,0) * rs.offset, rs.radius});
+            }
+        }
+        if (eng.empty()) return result;
+
+        // ---- Predicted workspace motion direction (hand Jacobian) ----
+        // Used only for the axial-alignment term of the selection score
+        // (identity/hysteresis). The actual rejection strength is measured
+        // separately by stickyWinnerEdgeScore over the real edge.
+        Eigen::Vector3f dp = J_EE * q_step_dir;
+        float dp_norm = dp.norm();
+        if (dp_norm < 1e-6f) return result;
+        Eigen::Vector3f dp_hat = dp / dp_norm;
+
+        // ---- Collect K nearest non-rigid branches within envelope --------
+        // Distance to each branch = MIN over both engagement spheres.
+        // Penetration (d < 0) is KEPT (clamped weight) — a branch the sphere
+        // has entered is maximally relevant, not to be discarded.
+        struct Cand { int idx; float weight; float score; Eigen::Vector3f axis; };
+        std::vector<Cand> nearby;
+        nearby.reserve(cylinders_.size());
+        for (size_t i = 0; i < cylinders_.size(); ++i) {
+            const auto& cyl = cylinders_[i];
+            if (cyl.exclude_from_aniso) continue;
+            if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+            float d = std::numeric_limits<float>::max();
+            for (const auto& s : eng) {
+                d = std::min(d, distToCylinder(s.p, cyl) - s.radius);
+            }
+            if (d > envelope) continue;
+            float w = std::min(1.0f, std::max(0.0f, 1.0f - d / envelope));
+            float cos_val = std::abs(dp_hat.dot(cyl.axis_unit));
+            float score = w * cos_val;
+            nearby.push_back({static_cast<int>(i), w, score, cyl.axis_unit});
+        }
+        if (nearby.empty()) return result;
+
+        // Keep K nearest by inverse-weight (highest weight = closest)
+        if (static_cast<int>(nearby.size()) > K) {
+            std::partial_sort(nearby.begin(), nearby.begin() + K, nearby.end(),
+                [](const Cand& a, const Cand& b) { return a.weight > b.weight; });
+            nearby.resize(K);
+        }
+
+        // ---- Find new MAX and score of previous winner (if in scope) ----
+        int max_i = 0;
+        for (int i = 1; i < (int)nearby.size(); ++i) {
+            if (nearby[i].score > nearby[max_i].score) max_i = i;
+        }
+        result.new_max_id = nearby[max_i].idx;
+
+        int prev_idx = -1;
+        if (prev_winner_id >= 0) {
+            for (int i = 0; i < (int)nearby.size(); ++i) {
+                if (nearby[i].idx == prev_winner_id) { prev_idx = i; break; }
+            }
+        }
+
+        // ---- Hysteresis decision ----
+        if (prev_idx < 0) {
+            // No prev winner OR prev fell out of scope → pick new MAX
+            result.chosen_id    = nearby[max_i].idx;
+            result.chosen_score = nearby[max_i].score;
+            result.chosen_axis  = nearby[max_i].axis;
+            result.switched     = (prev_winner_id != result.chosen_id);
+        } else {
+            float prev_score = nearby[prev_idx].score;
+            float new_score  = nearby[max_i].score;
+            if (new_score > hysteresis_margin * prev_score) {
+                result.chosen_id    = nearby[max_i].idx;
+                result.chosen_score = new_score;
+                result.chosen_axis  = nearby[max_i].axis;
+                result.switched     = true;
+            } else {
+                result.chosen_id    = nearby[prev_idx].idx;
+                result.chosen_score = prev_score;
+                result.chosen_axis  = nearby[prev_idx].axis;
+                result.switched     = false;
+            }
+        }
+        return result;
+    }
+
+    // ------------------------------------------------------------------
+    // stickyWinnerEdgeScore — thorough rejection score for sticky-BCD
+    //
+    // Given the committed winner branch (winner_cyl_id from
+    // stickyWinnerSelect), measure how axial the edge q_near→q_new is w.r.t.
+    // THAT branch's axis. Unlike the single Jacobian-prediction score returned
+    // by stickyWinnerSelect, this:
+    //   * uses BOTH engagement spheres (panda_hand AND panda_link6), and
+    //   * sub-samples along the edge at DCD granularity, taking the MAX over
+    //     sub-segments and spheres.
+    //
+    // It is still a "winner score" (single branch — per the sticky-winner
+    // philosophy, NOT a MAX over different branches), but measured as
+    // thoroughly as original BCD's isPathValid rejection. This catches edges
+    // that ENTER the winner's envelope partway through, or BECOME axial
+    // mid-edge — cases a single q_near Jacobian prediction misses.
+    //
+    // Returns max weight·|Δp̂·â|; 0 if the winner is never within envelope
+    // along the edge. dcd_step controls sub-sample count (edge_len/dcd_step).
+    // ------------------------------------------------------------------
+    float stickyWinnerEdgeScore(const Eigen::VectorXf& q_near,
+                                const Eigen::VectorXf& q_new,
+                                int   winner_cyl_id,
+                                float envelope,
+                                float dcd_step) const {
+        if (!sdf_built_) return 0.0f;
+        if (winner_cyl_id < 0 || winner_cyl_id >= (int)cylinders_.size())
+            return 0.0f;
+        const auto& wcyl = cylinders_[winner_cyl_id];
+        if (wcyl.exclude_from_aniso) return 0.0f;
+        if (wcyl.axis_unit.squaredNorm() < 0.25f) return 0.0f;
+        if (envelope <= 0.0f) return 0.0f;
+
+        // Sub-sample count matched to DCD granularity, capped for safety.
+        float edge_len = (q_new - q_near).norm();
+        int num_sub = 1;
+        if (dcd_step > 1e-6f) {
+            num_sub = std::max(1, (int)std::ceil(edge_len / dcd_step));
+        }
+        num_sub = std::min(num_sub, 8);
+
+        const Eigen::Vector3f axis = wcyl.axis_unit;
+        float max_score = 0.0f;
+
+        for (const auto& rs : spheres_) {
+            if (rs.link_name != "panda_hand" &&
+                rs.link_name != "panda_link6") {
+                continue;
+            }
+
+            robot_->setJointValues(q_near);
+            Eigen::Matrix4f pose_prev = robot_->getFramePoseById(rs.frame_id);
+            Eigen::Vector3f p_prev = pose_prev.block<3,1>(0,3)
+                                   + pose_prev.block<3,3>(0,0) * rs.offset;
+
+            for (int s = 1; s <= num_sub; ++s) {
+                float t = (float)s / (float)num_sub;
+                Eigen::VectorXf q_sub = q_near + t * (q_new - q_near);
+                robot_->setJointValues(q_sub);
+                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+                Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
+                                       + pose.block<3,3>(0,0) * rs.offset;
+
+                Eigen::Vector3f dp = p_curr - p_prev;
+                float dp_norm = dp.norm();
+                if (dp_norm >= 1e-5f) {
+                    // Envelope gate against the winner branch (incl. penetration)
+                    float d = distToCylinder(p_curr, wcyl) - rs.radius;
+                    if (d <= envelope) {
+                        float w = std::max(0.0f, 1.0f - d / envelope);
+                        float cos_ax = std::abs((dp / dp_norm).dot(axis));
+                        float score = w * cos_ax;
+                        if (score > max_score) max_score = score;
+                    }
+                }
+                p_prev = p_curr;   // next sub-segment starts here
+            }
+        }
+        return max_score;
+    }
+
+    // Bend q_step_dir so that the resulting EE workspace motion sits at
+    // exactly cos_cap against `axis` (measured by |Δp̂·â|). Deterministic
+    // F-style action. Uses J_EE^T projection, no pseudoinverse.
+    // No-op if already off-axis (cos ≤ cos_cap).
+    void bendAgainstAxis(Eigen::VectorXf& q_step_dir,
+                         const Eigen::MatrixXf& J_EE,
+                         const Eigen::Vector3f& axis,
+                         float cos_cap) const {
+        Eigen::Vector3f dp = J_EE * q_step_dir;
+        float dp_norm = dp.norm();
+        if (dp_norm < 1e-6f) return;
+        float cos_now = std::abs(dp.dot(axis)) / dp_norm;
+        if (cos_now <= cos_cap) return;
+
+        Eigen::VectorXf c = J_EE.transpose() * axis;
+        float c_norm2 = c.squaredNorm();
+        if (c_norm2 < 1e-9f) return;
+
+        float coef  = q_step_dir.dot(c) / c_norm2;
+        float alpha = (cos_now - cos_cap) / cos_now;
+        q_step_dir -= alpha * coef * c;
+    }
+
+    // ------------------------------------------------------------------
+    // applySamplingBias — Method F with K-nearest structure tensor
+    //
+    // Multi-branch directional bias:
+    //   1. (Envelope gate) If EE body is outside envelope of every branch,
+    //      do nothing. The bias only operates inside the envelope.
+    //   2. Collect all branches with surface-to-EE distance < envelope.
+    //   3. Keep only the K nearest (default K = 5). Bounds compute and
+    //      gives cleaner directional signal in dense foliage.
+    //   4. Assemble the weighted structure tensor
+    //          M = Σ wᵢ · âᵢ · âᵢᵀ,    wᵢ = max(0, 1 − distᵢ/envelope)
+    //      This is axis-sign-invariant (â âᵀ = (−â)(−â)ᵀ).
+    //   5. Eigendecompose M.  Largest eigenvector = dominant axial direction.
+    //      Anisotropy ratio (λmax − λmin)/λmax  ∈ [0, 1].
+    //      If < min_anisotropy: branches point too randomly, skip bias.
+    //   6. Apply the angle-range cap against the dominant axis (Op 3,
+    //      same as single-axis version).  Uses J_EE^T projection — no
+    //      pseudoinverse.
+    //
+    // Modifies q_step_dir IN PLACE; caller renormalizes.
+    // Returns true iff the bias was actually applied.
+    // Per-call cost ≈ 18-25 μs.
+    // ------------------------------------------------------------------
+    bool applySamplingBias(const Eigen::VectorXf& q_near,
+                            Eigen::VectorXf& q_step_dir,
+                            const Eigen::MatrixXf& J_EE,
+                            float envelope,
+                            float cos_cap,
+                            int   K              = 5,
+                            float min_anisotropy = 0.3f) const {
+        // -------------------------------------------------------------
+        // Smooth Method F: structure-tensor multi-branch aggregation +
+        // Option 1 (smoothstep envelope ramp) + Option 3 (penetration skip).
+        //
+        //   1. Envelope conceptually built around each branch (radius
+        //      r_cyl + ee_radius + ramp_envelope around cylinder axis).
+        //   2. Collect K=5 nearest non-rigid branches in ramp envelope.
+        //   3. Build structure tensor M = Σ wᵢ · âᵢ · âᵢᵀ
+        //      with smoothstep weights (Option 1).
+        //   4. Eigendecompose M; dominant eigenvector = effective axis.
+        //   5. Anisotropy gate: skip if geometry too isotropic.
+        //   6. Apply angle-range cap against dominant axis.
+        //
+        // Smoother than BCD-style max aggregation: the eigenvector of M
+        // changes continuously as branch weights change, avoiding the
+        // discontinuity that comes from picking a single "winning" branch.
+        // -------------------------------------------------------------
+        if (!sdf_built_) return false;
+        if (q_near.size() != q_step_dir.size()) return false;
+        if (J_EE.rows() != 3 || J_EE.cols() != q_near.size()) return false;
+        if (envelope <= 0.0f) return false;
+        if (cylinders_.empty()) return false;
+        if (K < 1) K = 1;
+
+        // ---- EE reference: panda_hand sphere at offset (0,0,0) ----
+        Eigen::Vector3f p_ee = Eigen::Vector3f::Zero();
+        float ee_radius = 0.06f;
+        bool found_ee = false;
+        for (const auto& rs : spheres_) {
+            if (rs.link_name == "panda_hand" && rs.offset.norm() < 1e-4f) {
+                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+                p_ee = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
+                ee_radius = rs.radius;
+                found_ee = true;
+                break;
+            }
+        }
+        if (!found_ee) return false;
+
+        // ---- Option 3: skip when EE is penetrating any cylinder body ----
+        {
+            float sdf_at_ee = sampleSdf(p_ee);
+            if (sdf_at_ee - ee_radius < 0.0f) return false;
+        }
+
+        // ---- Option 1: smoothstep envelope ramp ----
+        const float ramp_envelope = 1.5f * envelope;
+
+        // ---- Collect candidate branches (envelope as tube around branch) ----
+        struct BranchInfo { float body_dist; Eigen::Vector3f axis; };
+        std::vector<BranchInfo> nearby;
+        nearby.reserve(cylinders_.size());
+        for (const auto& cyl : cylinders_) {
+            if (cyl.exclude_from_aniso) continue;
+            if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+            float d = distToCylinder(p_ee, cyl) - ee_radius;
+            if (d > ramp_envelope) continue;
+            if (d < 0.0f) continue;               // EE inside cylinder (Option 3)
+            nearby.push_back({d, cyl.axis_unit});
+        }
+        if (nearby.empty()) return false;
+
+        // ---- Keep K nearest ----
+        if (static_cast<int>(nearby.size()) > K) {
+            std::partial_sort(
+                nearby.begin(), nearby.begin() + K, nearby.end(),
+                [](const BranchInfo& a, const BranchInfo& b) {
+                    return a.body_dist < b.body_dist;
+                });
+            nearby.resize(K);
+        }
+
+        bool any_bias_applied = false;
+
+        // ============================================================
+        // Smooth structure-tensor bias (single-stage)
+        //   - Builds M = Σ wᵢ · âᵢ · âᵢᵀ from K nearest with smoothstep
+        //     weights, eigendecomposes to find dominant axial direction,
+        //     applies cap against it.
+        //   - Skips if anisotropy < min_anisotropy (no clear axis).
+        // ============================================================
+        Eigen::Matrix3f M = Eigen::Matrix3f::Zero();
+        float total_w = 0.0f;
+        for (const auto& b : nearby) {
+            float t = std::max(0.0f, std::min(1.0f, b.body_dist / ramp_envelope));
+            float w = 1.0f - (t * t * (3.0f - 2.0f * t));
+            if (w <= 1e-6f) continue;
+            M += w * (b.axis * b.axis.transpose());
+            total_w += w;
+        }
+        if (total_w <= 1e-6f) return false;
+
+        M /= total_w;
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M);
+        if (es.info() != Eigen::Success) return false;
+
+        float lambda_max = es.eigenvalues()(2);
+        float lambda_min = es.eigenvalues()(0);
+        if (lambda_max <= 1e-6f) return false;
+
+        float anisotropy = (lambda_max - lambda_min) / lambda_max;
+        if (anisotropy < min_anisotropy) return false;
+
+        Eigen::Vector3f a_dom = es.eigenvectors().col(2);
+        Eigen::Vector3f dp = J_EE * q_step_dir;
+        float dp_norm = dp.norm();
+        if (dp_norm < 1e-6f) return false;
+
+        float cos_now = std::abs(dp.dot(a_dom)) / dp_norm;
+        if (cos_now <= cos_cap) return false;
+
+        Eigen::VectorXf c = J_EE.transpose() * a_dom;
+        float c_norm2 = c.squaredNorm();
+        if (c_norm2 < 1e-9f) return false;
+
+        float coef  = q_step_dir.dot(c) / c_norm2;
+        float alpha = (cos_now - cos_cap) / cos_now;
+        q_step_dir -= alpha * coef * c;
+        any_bias_applied = true;
+
+        return any_bias_applied;
     }
 
     // 查询某世界坐标点的原始 SDF 值（用于可视化/调试）
@@ -257,6 +1025,31 @@ private:
     int             nx_, ny_, nz_;
     std::vector<float> sdf_grid_;
     bool            sdf_built_;
+
+    // ------------------------------------------------------------------
+    // 几何辅助：找到离 p 最近的圆柱的轴向单位向量
+    //   - 用于 Option A 的轴向 drag：需要每个 sphere 知道"最近树枝沿哪条轴"
+    //   - 退化情况（p0 == p1，例如 overhead 球被当 cylinder 加进来）返回 0
+    //   - 当 cylinders_ 为空时返回 0
+    // ------------------------------------------------------------------
+    Eigen::Vector3f findNearestCylinderAxis(const Eigen::Vector3f& p) const {
+        if (cylinders_.empty()) return Eigen::Vector3f::Zero();
+        int best_idx = -1;
+        float best_dist = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < cylinders_.size(); ++i) {
+            float d = distToCylinder(p, cylinders_[i]);
+            if (d < best_dist) {
+                best_dist = d;
+                best_idx = static_cast<int>(i);
+            }
+        }
+        if (best_idx < 0) return Eigen::Vector3f::Zero();
+        const auto& cyl = cylinders_[best_idx];
+        Eigen::Vector3f axis = cyl.p1 - cyl.p0;
+        float len = axis.norm();
+        if (len < 1e-6f) return Eigen::Vector3f::Zero();   // degenerate (e.g., sphere-as-cylinder)
+        return axis / len;
+    }
 
     // ------------------------------------------------------------------
     // 几何辅助：点到圆柱的有符号距离（在圆柱内为负）

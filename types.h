@@ -100,10 +100,18 @@ struct GraspPlanningPerformance {
     float score_grasp_time_ms                    = 0.0f;
     int   number_of_grasp_scorings               = 0;
     float rrt_time_ms                            = 0.0f;
-    
-    float collision_check_time_ms                = 0.0f;
+
+    float collision_check_time_ms                = 0.0f;  // 总和 (extend + move + validate)
     float vf_gradient_time_ms                    = 0.0f;
     float nearest_neighbor_time_ms               = 0.0f;
+
+    // 细分: collision check 按来源
+    float collision_in_extend_ms                 = 0.0f;  // 从 extendVFRRT
+    float collision_in_move_ms                   = 0.0f;  // 从 moveTowardsGoal
+    float collision_in_validate_ms               = 0.0f;  // 从 validateSolutionPath
+
+    // 细分: grasp hypothesis 内部
+    float pose_calc_ms                           = 0.0f;  // calculateGlobalGraspPose
 
     void reset() {
         setup_time_ms = planning_time_ms = 0.0f;
@@ -115,6 +123,10 @@ struct GraspPlanningPerformance {
         collision_check_time_ms = 0.0f;
         vf_gradient_time_ms = 0.0f;
         nearest_neighbor_time_ms = 0.0f;
+        collision_in_extend_ms = 0.0f;
+        collision_in_move_ms = 0.0f;
+        collision_in_validate_ms = 0.0f;
+        pose_calc_ms = 0.0f;
     }
 };
 
@@ -145,9 +157,77 @@ struct GraspRrtConfig {
 
     // Approach face disable mechanism
     bool  face_disable_enabled         = true;  // 一键开关，方便对照实验
-    int   face_disable_failure_threshold = 15;  // 失败 N 次触发禁用
-    int   face_disable_min_active      = 5;     // 永远保留至少 N 个 active 面
+    int   face_disable_failure_threshold = 200; // 失败 N 次触发禁用
+    int   face_disable_min_active      = 2;     // 永远保留至少 N 个 active 面 (放宽到 2)
     int   face_disable_min_tree_size   = 500;   // 树长到 N 节点后才允许禁用
+
+    // Vector field shell attractor (替代固定单点引力)
+    // 引力源是一个球冠 (苹果下方某角度锥), 每 N 个 cycle 在球冠上随机重新采一个点
+    bool  use_shell_attractor           = true;  // false → 退回固定单点 (苹果下方 8cm)
+    float shell_attractor_target_radius = 0.04f; // 苹果半径 (球壳中心)
+    float shell_attractor_offset        = 0.01f; // 球壳距苹果表面距离 (= shell_radius - target_radius)
+    float shell_attractor_cap_height    = 0.015f;// 球冠高度 (从南极向上多高, 默认 1.5cm)
+    int   shell_attractor_resample_period = 1000;// 每 N 个 cycle 重新采样一次
+
+    // ---- Extension primitive mode (ablation) ----
+    // false (default) : deterministic 50/50 weighted blend
+    //                   q_step_dir = normalize(0.5*q_rand_dir + 0.5*vf_dir)
+    // true            : stochastic coin flip
+    //                   50% probability q_step_dir = q_rand_dir (pure random)
+    //                   50% probability q_step_dir = vf_dir     (pure VF)
+    bool extension_coin_flip = false;
+
+    // ---- Branch anisotropy (Option A) ----
+    // Adds an axial drag in addition to the existing radial push-out.
+    // Active only when a robot collision sphere is in branch contact (penetration > 0).
+    //   F_drag = −K_ax · penetration · (v · â) â   (workspace, mapped via J^T)
+    // where â is the unit axis of the nearest branch and v is the intended
+    // extension direction. The drag is non-conservative + velocity-dependent —
+    // the only construction able to express motion-direction anisotropy.
+    // 0.0 = isotropic legacy behavior (back-compat). Recommended: K_ax ≈ 600
+    // (≈ 3× the existing radial coefficient K_rad ≈ 200).
+    float branch_anisotropy_K_ax        = 0.0f;
+
+    // ---- Sampling bias (Method F: angle-range cap on extension direction) ----
+    // When enabled, the RRT extension primitive applies an axial-cap to
+    // q_step_dir whenever the EE (panda_hand reference point) is within
+    // `sampling_bias_envelope` of a branch surface. The cap reduces the
+    // motion component along the branch axis so the resulting EE motion
+    // stays at least `min_angle` away from the axis.
+    //
+    // Cheaper than edge rejection: each cycle produces a useful extension
+    // (no retries). Combined with a per-node Jacobian cache, per-cycle
+    // overhead is ~5-10 μs.
+    //
+    //   cos_cap = cos(min_angle) — maximum allowed |Δp̂·â|.
+    //   Default 0.866 (cos 30°): motion must be ≥ 30° off the branch axis.
+    bool  sampling_bias_enabled       = false;
+    float sampling_bias_envelope      = 0.05f;   // 5 cm pre-contact shell
+    float sampling_bias_cos_cap       = 0.866f;  // cos(30°)
+
+    // Multi-branch handling: aggregate the K nearest branches inside envelope
+    // into a structure tensor M = Σ wᵢ âᵢ âᵢᵀ, then bias against M's dominant
+    // eigenvector. Falls back gracefully when fewer than K branches present.
+    //   K = 5: balances coverage and noise resistance in dense foliage.
+    //   min_anisotropy ∈ [0, 1]: skip bias when (λmax−λmin)/λmax < this. At
+    //     ~0.3 a clearly dominant axis exists; near 0 the geometry is too
+    //     isotropic to bias against meaningfully.
+    int   sampling_bias_k              = 5;       // structure tensor: K=5 nearest
+    float sampling_bias_min_anisotropy = 0.3f;    // skip if (λmax−λmin)/λmax below
+
+    // ---- Sticky-winner (Upgrades A and B) ----
+    // Two variants share the same axis-selection logic:
+    //   * sticky-F   → deterministic F-style bending on the winner's axis
+    //   * sticky-BCD → probabilistic sigmoid rejection on the winner's score
+    // Both read/write CSpaceNode::winner_branch_id_ for hysteresis.
+    bool  sticky_f_enabled          = false;
+    bool  sticky_bcd_enabled        = false;
+    float sticky_envelope           = 0.05f;   // 5 cm
+    float sticky_cos_cap            = 0.866f;  // cos(30°) for F bending
+    float sticky_hysteresis_margin  = 1.25f;   // challenger must beat incumbent by ×margin
+    int   sticky_k                  = 3;       // K nearest branches
+    float sticky_bcd_threshold      = 0.9063f; // sigmoid midpoint (cos 25°)
+    float sticky_bcd_gain           = 20.0f;   // sigmoid steepness
 };
 
 } // namespace grasp_rrt

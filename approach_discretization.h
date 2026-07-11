@@ -7,6 +7,7 @@
 #include <cmath>
 #include <map>
 #include <random>
+#include "rng_util.h"
 #include <algorithm>
 
 namespace grasp_rrt {
@@ -112,9 +113,9 @@ public:
         }
         if (candidates.empty()) return nullptr;
 
-        // 均匀随机选一个
+        // 均匀随机选一个 (用 thread-local rng, 多线程安全)
         std::uniform_int_distribution<int> dist(0, static_cast<int>(candidates.size()) - 1);
-        int chosen_face = candidates[dist(rng_)];
+        int chosen_face = candidates[dist(threadRng())];
         last_selected_face_ = chosen_face;
 
         auto it = face_to_nodes_.find(chosen_face);
@@ -202,6 +203,28 @@ public:
 
     /** 总三角面数（icosphere subdivision 后的总数） */
     int getTotalFaceCount() const { return static_cast<int>(faces_.size()); }
+
+    /** 该面的中心方向（单位向量，从球心指向面中心） */
+    Vector3f getFaceDirection(int face_id) const {
+        if (face_id < 0 || face_id >= static_cast<int>(faces_.size())) return Vector3f::Zero();
+        Vector3f center = (vertices_[faces_[face_id][0]] +
+                           vertices_[faces_[face_id][1]] +
+                           vertices_[faces_[face_id][2]]) / 3.0f;
+        float n = center.norm();
+        return (n > 1e-10f) ? Vector3f(center / n) : Vector3f::Zero();
+    }
+
+    /** 该面累计尝试 grasp 次数 */
+    int getAttemptCount(int face_id) const {
+        auto it = face_stats_.find(face_id);
+        return (it != face_stats_.end()) ? it->second.attempts : 0;
+    }
+
+    /** 该面 bucket 里还有多少未消耗节点 */
+    int getNodeCount(int face_id) const {
+        auto it = face_to_nodes_.find(face_id);
+        return (it != face_to_nodes_.end()) ? it->second.count : 0;
+    }
 
     void clearCSpaceNodeMapping() {
         face_to_nodes_.clear();

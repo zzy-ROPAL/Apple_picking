@@ -6,6 +6,8 @@
 #include <vector>
 #include <memory>
 #include <random>
+#include <atomic>
+#include "rng_util.h"
 #include <functional>
 
 namespace grasp_rrt {
@@ -57,9 +59,10 @@ public:
 
     Config getRandomConfig() {
         Config config(dimension_);
+        auto& rng = threadRng();
         for (int i = 0; i < dimension_; ++i) {
             std::uniform_real_distribution<float> dist(boundary_min_(i), boundary_max_(i));
-            config(i) = dist(rng_);
+            config(i) = dist(rng);
         }
         return config;
     }
@@ -180,9 +183,9 @@ protected:
     Eigen::VectorXf boundary_max_;
     Eigen::VectorXf metric_weights_;
     bool use_metric_weights_;
-    int performance_collision_checks_;
-    int performance_distance_checks_;
-    std::mt19937 rng_;
+    std::atomic<int> performance_collision_checks_;
+    std::atomic<int> performance_distance_checks_;
+    std::mt19937 rng_;  // 保留: 单线程使用 (e.g. 串行 doPlanningCycle); 并行采样用 threadRng()
     std::vector<std::function<bool(const Config&)>> constraints_;
 };
 

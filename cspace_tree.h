@@ -6,22 +6,45 @@
 #include <vector>
 #include <unordered_map>
 #include <algorithm>
+#include <memory>
+#include <nanoflann.hpp>
 
 namespace grasp_rrt {
 
 // ============================================================================
 // CSpaceTree — 对应 Python CSpaceTree
 // RRT 树结构: 管理节点的添加、最近邻搜索、路径追溯
+//
+// NN 搜索使用 nanoflann KD-tree (O(log N))，配置在插入时按 sqrt(metric weights)
+// 预缩放，KD-tree 内部用普通 L2 距离即等价于原始加权距离。
 // ============================================================================
 
 class CSpaceTree {
 public:
+    // ---- nanoflann 适配器 ----
+    struct CloudAdaptor {
+        const std::vector<float>* points = nullptr;   // 扁平存储的预缩放配置 (row-major)
+        int dim = 7;
+
+        size_t kdtree_get_point_count() const {
+            return points ? points->size() / dim : 0;
+        }
+        float kdtree_get_pt(size_t idx, size_t d) const {
+            return (*points)[idx * dim + d];
+        }
+        template <class BBOX>
+        bool kdtree_get_bbox(BBOX&) const { return false; }
+    };
+
+    using KDTreeT = nanoflann::KDTreeSingleIndexDynamicAdaptor<
+        nanoflann::L2_Simple_Adaptor<float, CloudAdaptor>,
+        CloudAdaptor>;
+
+    // -------------------------------------------------------------------------
+
     explicit CSpaceTree(CSpaceSampled* cspace)
         : cspace_(cspace), dimension_(cspace->getDimension()), next_id_(0),
           update_children_(false) {
-        // 预分配配置矩阵 (用于向量化最近邻搜索)
-        configs_matrix_.resize(512, dimension_);
-        n_configs_ = 0;
     }
 
     CSpaceSampled* getCSpace() const { return cspace_; }
@@ -47,8 +70,9 @@ public:
         nodes_.clear();
         id_node_map_.clear();
         next_id_ = 0;
-        configs_matrix_.resize(512, dimension_);
-        n_configs_ = 0;
+        scaled_points_.clear();
+        kdtree_.reset();
+        weights_initialized_ = false;
     }
 
     // ---- 添加节点 (对应 Python appendNode) ----
@@ -60,13 +84,13 @@ public:
         nodes_.push_back(node);
         id_node_map_[node->getId()] = node;
 
-        // 写入预分配矩阵
-        if (n_configs_ >= configs_matrix_.rows()) {
-            int new_cap = configs_matrix_.rows() * 2;
-            configs_matrix_.conservativeResize(new_cap, dimension_);
+        // 写入 KD-tree
+        ensureKDTreeInitialized();
+        size_t idx = scaled_points_.size() / dimension_;
+        for (int d = 0; d < dimension_; ++d) {
+            scaled_points_.push_back(config(d) * sqrt_weights_(d));
         }
-        configs_matrix_.row(n_configs_) = config.transpose();
-        n_configs_++;
+        kdtree_->addPoints(idx, idx);
 
         // 更新父节点的 children 列表
         if (update_children_ && parent_id >= 0) {
@@ -77,52 +101,41 @@ public:
         return node;
     }
 
-    // ---- 最近邻搜索 (对应 Python getNearestNeighbor) ----
-    // 使用预分配 Eigen 矩阵做向量化距离计算
+    // ---- 最近邻搜索 (KD-tree O(log N)) ----
 
     CSpaceNodePtr getNearestNeighbor(const Config& config) const {
-        if (nodes_.empty()) return nullptr;
+        if (nodes_.empty() || !kdtree_) return nullptr;
 
-        // 向量化距离计算
-        Eigen::MatrixXf data = configs_matrix_.topRows(n_configs_);
-        Eigen::MatrixXf diff = data.rowwise() - config.transpose();
-
-        Eigen::VectorXf sq_dists;
-        if (cspace_->getUseMetricWeights()) {
-            // 加权距离
-            Eigen::VectorXf w = cspace_->getMetricWeights();
-            sq_dists = (diff.array().colwise() * w.array().transpose().matrix().row(0).transpose().array())
-                        .square().rowwise().sum();
-        } else {
-            sq_dists = diff.rowwise().squaredNorm();
+        std::vector<float> query(dimension_);
+        for (int d = 0; d < dimension_; ++d) {
+            query[d] = config(d) * sqrt_weights_(d);
         }
 
-        int best_idx;
-        sq_dists.minCoeff(&best_idx);
-        return nodes_[best_idx];
+        size_t out_idx = 0;
+        float out_dist_sq = 0;
+        nanoflann::KNNResultSet<float> result(1);
+        result.init(&out_idx, &out_dist_sq);
+        kdtree_->findNeighbors(result, query.data(), nanoflann::SearchParams());
+
+        return nodes_[out_idx];
     }
 
+    // 半径搜索目前未被规划主循环调用，保留 Eigen 暴力实现作为回退 (nanoflann 1.4
+    // 的 dynamic adaptor 不直接支持 radiusSearch)。
     std::vector<CSpaceNodePtr> getNeighborsWithinRadius(const Config& config, float radius) const {
         std::vector<CSpaceNodePtr> neighbors;
         if (nodes_.empty()) return neighbors;
 
-        Eigen::MatrixXf data = configs_matrix_.topRows(n_configs_);
-        Eigen::MatrixXf diff = data.rowwise() - config.transpose();
-
-        Eigen::VectorXf sq_dists;
-        if (cspace_->getUseMetricWeights()) {
-            Eigen::VectorXf w = cspace_->getMetricWeights();
-            sq_dists = (diff.array().colwise() * w.array().transpose().matrix().row(0).transpose().array())
-                        .square().rowwise().sum();
-        } else {
-            sq_dists = diff.rowwise().squaredNorm();
-        }
-
         float sq_radius = radius * radius;
-        for (int i = 0; i < n_configs_; ++i) {
-            if (sq_dists(i) <= sq_radius) {
-                neighbors.push_back(nodes_[i]);
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            Config diff = nodes_[i]->getConfiguration() - config;
+            float d2;
+            if (cspace_->getUseMetricWeights()) {
+                d2 = diff.cwiseProduct(cspace_->getMetricWeights()).squaredNorm();
+            } else {
+                d2 = diff.squaredNorm();
             }
+            if (d2 <= sq_radius) neighbors.push_back(nodes_[i]);
         }
         return neighbors;
     }
@@ -144,7 +157,7 @@ public:
 
         for (size_t i = 1; i < path_points.size(); ++i) {
             auto new_node = appendNode(path_points[i], last_id);
-            
+
             // RRT*: 更新 cost
             auto parent_node = getNode(last_id);
             if (parent_node) {
@@ -152,7 +165,7 @@ public:
                 new_node->setEdgeCostToParent(ec);
                 new_node->setCostFromRoot(parent_node->getCostFromRoot() + ec);
             }
-            
+
             last_id = new_node->getId();
         }
         return {true, last_id};
@@ -170,7 +183,7 @@ public:
         int last_id = startNode->getId();
         for (size_t i = 1; i < path_points.size(); ++i) {
             auto new_node = appendNode(path_points[i], last_id);
-            
+
             // RRT*: 更新 cost
             auto parent_node = getNode(last_id);
             if (parent_node) {
@@ -208,9 +221,30 @@ private:
     std::vector<CSpaceNodePtr> nodes_;
     std::unordered_map<int, CSpaceNodePtr> id_node_map_;
 
-    // 预分配矩阵用于向量化最近邻
-    Eigen::MatrixXf configs_matrix_;
-    int n_configs_;
+    // ---- KD-tree 后端 ----
+    mutable std::vector<float>           scaled_points_;     // 行主序: idx*dim + d
+    mutable Eigen::VectorXf              sqrt_weights_;
+    mutable bool                         weights_initialized_ = false;
+    mutable CloudAdaptor                 cloud_adaptor_;
+    mutable std::unique_ptr<KDTreeT>     kdtree_;
+
+    void ensureKDTreeInitialized() {
+        if (kdtree_) return;
+        // 初始化 sqrt(weights) — 仅在第一次插入时
+        if (cspace_->getUseMetricWeights()) {
+            sqrt_weights_ = cspace_->getMetricWeights().cwiseSqrt();
+        } else {
+            sqrt_weights_ = Eigen::VectorXf::Ones(dimension_);
+        }
+        weights_initialized_ = true;
+
+        cloud_adaptor_.points = &scaled_points_;
+        cloud_adaptor_.dim    = dimension_;
+        kdtree_ = std::make_unique<KDTreeT>(
+            dimension_,
+            cloud_adaptor_,
+            nanoflann::KDTreeSingleIndexAdaptorParams(10));
+    }
 };
 
 } // namespace grasp_rrt

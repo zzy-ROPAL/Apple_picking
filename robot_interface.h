@@ -87,6 +87,14 @@ public:
     virtual MatrixXf computeSphereJacobianById(int frame_id, const Eigen::Vector3f& local_offset) const {
         return MatrixXf::Zero(3, getDimension());
     }
+
+    // ---- 并行 (Batch RRT) ----
+    //
+    // 设置内部 per-thread 状态的大小. 默认 no-op (单线程).
+    // 实现类需要保证: 调用 setNumThreads(N) 后, 来自最多 N 个线程的
+    // 并发 FK / Jacobian 调用是线程安全的 (每线程有独立的 mutable 状态).
+    // Model / URDF 等只读数据继续共享.
+    virtual void setNumThreads(int /*N*/) {}
 };
 
 // ============================================================================

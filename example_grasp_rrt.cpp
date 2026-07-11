@@ -36,7 +36,6 @@
 #include "simple_end_effector.h"
 #include "simple_grasp_quality.h"
 #include "simple_target_object.h"
-#include "soft_cost_evaluator.h"
 #include "sdf_cost_evaluator.h"
 #include "sdf_traj_optimizer.h"
 #include <chrono>
@@ -221,8 +220,9 @@ int main(int argc, char* argv[]) {
         {"panda_link2", 0.07f, 0.00f,  0.02f},
         {"panda_link3", 0.06f, 0.15f,  0.12f},
         {"panda_link4", 0.06f, 0.05f,  0.03f},
-        // Link5 在 5cm 设定下受到 3cm 穿透，说明电机外壳的真实等效半径约为 8cm
-        {"panda_link5", 0.08f, 0.15f,  0.13f},
+        // Link5 在 8cm 半径下仍观察到 ~5.7cm 穿透 (vs overhead sphere)，
+        // 真实电机外壳更宽，扩大到 13cm 保证安全余量
+        {"panda_link5", 0.13f, 0.15f,  0.13f},
         {"panda_link6", 0.06f, 0.00f,  0.02f},
         // panda_link7 单独建模（见下方锥台体）
         // panda_hand 单独建模（由于夹爪有手指且很宽，用包围盒建模）

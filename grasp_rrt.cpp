@@ -1,9 +1,13 @@
 #include "grasp_rrt.h"
 #include "panda_pinocchio.h"
+#include "sdf_cost_evaluator.h"
+#include "rng_util.h"
 #include <chrono>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <fstream>
+#include <unordered_set>
 
 namespace grasp_rrt {
 
@@ -76,6 +80,10 @@ void GraspRrt::reset() {
     col_checks_overall_ = 0;
     map_config_tcp_.clear();
     grasps_.clear();
+    {
+        std::lock_guard<std::mutex> lk(ee_jacobian_cache_mutex_);
+        ee_jacobian_cache_.clear();
+    }
     if (tree_) tree_->reset();
 }
 
@@ -110,6 +118,10 @@ bool GraspRrt::init() {
     n_grasp_trapped_      = 0;
     n_grasp_error_        = 0;
 
+    // Reset shell attractor cache
+    cached_shell_target_     = Vector3f::Zero();
+    shell_resample_counter_  = 0;
+
     // 初始化接近方向离散球面
     pose_sphere_ = std::make_unique<ApproachDiscretization>();
     pose_sphere_->setGlobalPose(target_object_->getGlobalPose());
@@ -137,11 +149,15 @@ bool GraspRrt::plan(bool quiet) {
     bool stop_loop = false;
 
     while (!stop_loop) {
-        doPlanningCycle();
+        if (num_threads_ > 1) doPlanningCycleBatch(num_threads_);
+        else                  doPlanningCycle();
 
         if (stop_search_)  stop_loop = true;
         if (found_solution_) stop_loop = true;
         if (cycles_ > config_.max_cycles) stop_loop = true;
+        if (external_stop_flag_ && external_stop_flag_->load(std::memory_order_relaxed)) {
+            stop_loop = true;
+        }
 
         // 超时检查
         auto t_now = std::chrono::high_resolution_clock::now();
@@ -186,7 +202,9 @@ bool GraspRrt::doPlanningCycle() {
     int col_checks_start = cspace_->getCollisionCheckCount();
     bool do_normal_connect = true;
 
-    float r = static_cast<float>(rand()) / RAND_MAX;
+    maybeResampleShellAttractor();
+
+    float r = randFloat01();
 
     if (r <= config_.probab_grasp_hypothesis) {
         // ===== 策略 A: 概率触发终端抓取下探 (Terminal Grasp) =====
@@ -222,7 +240,7 @@ bool GraspRrt::doPlanningCycle() {
     if (do_normal_connect) {
         // ===== 阶段一：VF-RRT 树扩展（含 goal-biased sampling） =====
         Config rand_config;
-        float r2 = static_cast<float>(rand()) / RAND_MAX;
+        float r2 = randFloat01();
         if (r2 < goal_bias_prob_) {
             rand_config = sampleGoalBiased();   // Method A
         } else {
@@ -245,20 +263,162 @@ bool GraspRrt::doPlanningCycle() {
     return true;
 }
 
+// ============================================================================
+// maybeResampleShellAttractor — 主线程串行调用
+// ============================================================================
+void GraspRrt::maybeResampleShellAttractor() {
+    if (!config_.use_shell_attractor) return;
 
+    const float shell_radius = config_.shell_attractor_target_radius
+                              + config_.shell_attractor_offset;
+    const float cap_height   = config_.shell_attractor_cap_height;
+    const float u_min = std::max(0.0f, (shell_radius - cap_height) / shell_radius);
+
+    bool need_resample = (shell_resample_counter_ % config_.shell_attractor_resample_period == 0)
+                       || cached_shell_target_.norm() < 1e-9f;
+    if (need_resample) {
+        Vector3f candidate = Vector3f::Zero();
+        const int MAX_RETRIES = 10;
+        for (int retry = 0; retry < MAX_RETRIES; ++retry) {
+            float u   = u_min + (1.0f - u_min) * randFloat01();
+            float phi = 2.0f * static_cast<float>(M_PI) * randFloat01();
+            float sin_theta = std::sqrt(1.0f - u * u);
+            candidate = target_object_position_ + Vector3f(
+                shell_radius * sin_theta * std::cos(phi),
+                shell_radius * sin_theta * std::sin(phi),
+                -shell_radius * u
+            );
+            if (pose_sphere_) {
+                int fid = pose_sphere_->getNearestFaceId(candidate);
+                if (!pose_sphere_->isFaceDisabled(fid)) break;
+            } else break;
+        }
+        cached_shell_target_ = candidate;
+    }
+    shell_resample_counter_++;
+}
+
+// ============================================================================
+// doPlanningCycleBatch — Batch RRT 主循环
+// 主线程预采 K 个 q_rand → K 路并行做 extend compute → 主线程串行 commit.
+// Grasp hypothesis 分支沿用串行路径 (不在并行段内).
+// ============================================================================
+bool GraspRrt::doPlanningCycleBatch(int K) {
+    if (!planner_initialized_) return false;
+    if (K <= 1) return doPlanningCycle();
+
+    int col_checks_start = cspace_->getCollisionCheckCount();
+    maybeResampleShellAttractor();
+
+    // 1) Grasp hypothesis 分支 (串行) - 与 doPlanningCycle 保持一致.
+    //    用主线程 RNG 决定是否触发, 触发则单独走一次抓取尝试, 不做 batch extend.
+    float r = randFloat01();
+    if (r <= config_.probab_grasp_hypothesis) {
+        MoveArmResult grasp_status = connectRandomGraspPositionJacobian();
+        if (grasp_status == MoveArmResult::FATAL_ERROR) {
+            stop_search_ = true;
+        } else if (grasp_status == MoveArmResult::GRASPABLE_POSE_REACHED) {
+            std::cout << "[GraspRrt] -- FOUND GRASPABLE POSITION (score not high enough) --\n";
+            if (!grasps_.empty()) printGraspInfo(grasps_.back());
+        } else if (grasp_status == MoveArmResult::GOAL_REACHED) {
+            if (grasps_.empty()) {
+                std::cerr << "[GraspRrt] ERROR: no grasp results stored\n";
+                stop_search_ = true;
+            } else {
+                const auto& grasp_info = grasps_.back();
+                auto gn = tree_->getNode(grasp_info.rrt_node_id);
+                if (gn) {
+                    float current_cost = gn->getCostFromRoot();
+                    if (!found_solution_ || current_cost < best_goal_cost_) {
+                        best_goal_cost_ = current_cost;
+                        goal_node_ = gn;
+                        found_solution_ = true;
+                        std::cout << "[GraspRRT] New Best Path Found! Cost: " << current_cost << "\n";
+                        printGraspInfo(grasp_info);
+                    }
+                }
+            }
+        }
+        cycles_++;
+        col_checks_overall_ += (cspace_->getCollisionCheckCount() - col_checks_start);
+        return true;
+    }
+
+    // 2) Pre-sample K targets on main thread (serial, deterministic order).
+    std::vector<Config> targets(K);
+    for (int k = 0; k < K; ++k) {
+        float r2 = randFloat01();
+        if (r2 < goal_bias_prob_) targets[k] = sampleGoalBiased();
+        else                      targets[k] = cspace_->getRandomConfig();
+    }
+
+    // 3) Parallel extend compute.
+    std::vector<ExtendCandidate> cands(K);
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(K) schedule(static)
+#endif
+    for (int k = 0; k < K; ++k) {
+        cands[k] = extendVFRRTCompute(targets[k]);
+    }
+
+    // 4) Serial commit + perf accumulation.
+    for (int k = 0; k < K; ++k) {
+        const auto& c = cands[k];
+        performance_.nearest_neighbor_time_ms += c.nn_time_ms;
+        performance_.vf_gradient_time_ms      += c.vf_time_ms;
+        performance_.collision_check_time_ms  += c.collision_time_ms;
+        performance_.collision_in_extend_ms   += c.collision_time_ms;
+
+        if (!c.valid || c.nn_id < 0) continue;
+
+        // nn_id was looked up against tree pre-batch; the tree only grew since, so
+        // the node is still valid (ids are stable).
+        auto nn = tree_->getNode(c.nn_id);
+        if (!nn) continue;
+        float cost = nn->getCostFromRoot() + c.edge_cost;
+        auto new_node = tree_->appendNode(c.new_config, nn->getId());
+        new_node->setCostFromRoot(cost);
+        new_node->setEdgeCostToParent(c.edge_cost);
+        // Sticky-winner: propagate chosen winner branch id (batch RRT path).
+        new_node->setWinnerBranchId(c.chosen_winner_id);
+        last_added_id_ = new_node->getId();
+        processNode(new_node);
+    }
+
+    cycles_ += K;  // K parallel extend attempts count as K cycles
+    col_checks_overall_ += (cspace_->getCollisionCheckCount() - col_checks_start);
+
+    if ((cycles_ / K) % (50 / K + 1) == 0) {
+        std::cout << "[GraspRrt] Cycle " << cycles_ << "/" << config_.max_cycles
+                  << " (batch K=" << K << "), Nodes: " << tree_->getNrOfNodes()
+                  << ", Grasps: " << grasps_.size() << "\n";
+    }
+    return true;
+}
 
 // ============================================================================
 // VF-RRT 核心: 计算矢量力场 (斥力 + 引力)
 // ============================================================================
-Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn) {
+Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
+                                     const Config& motion_dir) {
     Config vf = Eigen::VectorXf::Zero(dimension_);
 
-    // 1. 软惩罚斥力场 (叶子穿透): SDF 梯度
+    // 1. Semi-rigid foliage as a workspace force field (paper Sec. 3.3.1).
+    //    For each robot collision sphere with penetration > 0 the field is
+    //        F_i = +K_rad · pen · ∇φ_SDF                       (radial)
+    //              − K_ax  · pen · (v_i · â_i) â_i             (axial drag,
+    //                                                            non-conservative)
+    //    mapped to joint space by J_i^T and summed over spheres. Setting
+    //    K_ax = 0 (or v_joint = 0) yields the pure radial component.
     Config rep_vector = Eigen::VectorXf::Zero(dimension_);
     auto evaluator = cspace_->getCostEvaluator();
     if (evaluator) {
         auto tg0 = std::chrono::high_resolution_clock::now();
-        rep_vector = -evaluator->evaluateGradient(q);
+        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(evaluator);
+        if (sdf_eval) {
+            rep_vector = sdf_eval->evaluateAnisotropicForce(
+                q, motion_dir, config_.branch_anisotropy_K_ax);
+        }
         auto tg1 = std::chrono::high_resolution_clock::now();
         static int vf_call_count = 0;
         static double vf_acc_us = 0;
@@ -266,22 +426,20 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn) {
         vf_call_count++;
         if (vf_call_count % 500 == 0) {
             std::cerr << "[VF-PROFILE @" << vf_call_count << "] "
-                      << "evaluateGradient avg=" << (vf_acc_us / vf_call_count) << " us/call\n";
+                      << "field-force avg=" << (vf_acc_us / vf_call_count) << " us/call\n";
         }
     }
     if (rep_vector.norm() > 1e-6f) rep_vector.normalize();
 
     // 2. 硬质障碍物斥力 + 旋涡 (树干 + 额外障碍物)
+    // 注: 在 batch RRT 下, 跨线程共享 cached_J_T_ 会产生 race; 改为 per-call 局部变量.
     auto panda_robot = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
-    if (panda_robot && panda_robot->isJacobiansReady()) {
-        cached_J_T_ = robot_->computeJacobian().transpose();
-        cached_J_T_valid_ = true;
-    } else if (!cached_J_T_valid_) {
+    if (panda_robot && !panda_robot->isJacobiansReady()) {
         robot_->prepareJacobians();
-        cached_J_T_ = robot_->computeJacobian().transpose();
-        cached_J_T_valid_ = true;
+    } else if (!panda_robot) {
+        robot_->prepareJacobians();
     }
-    const MatrixXf& J_T = cached_J_T_;
+    MatrixXf J_T = robot_->computeJacobian().transpose();
 
     Matrix4f tcp_pose = robot_->getGCPGlobalPose();
     Vector3f tcp_pos = tcp_pose.block<3,1>(0,3);
@@ -382,9 +540,31 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn) {
         }
     }
 
-    // 3. 引力场 (朝向苹果) — applied to wrist region (link6, link7, hand) + TCP
-    Vector3f virtual_target = target_object_position_;
-    virtual_target.z() -= 0.08f;
+    // 3. 引力场 — applied to wrist region (link6, link7, hand) + TCP
+    //
+    // 两种模式 (由 config_.use_shell_attractor 切换):
+    //   A. 球冠随机采样 (use_shell_attractor=true):
+    //      球壳半径 = target_radius + offset, 球冠高度 = cap_height
+    //      每 shell_attractor_resample_period 个 cycle 在球冠上均匀重新采样
+    //   B. 固定单点 (use_shell_attractor=false):
+    //      引力源固定在苹果下方 8cm
+    Vector3f virtual_target;
+    if (config_.use_shell_attractor) {
+        // 注: shell 重采样逻辑已移出. 主线程在每个 cycle/batch 入口处通过
+        // maybeResampleShellAttractor() 决定是否更新 cached_shell_target_.
+        // 这里只做只读使用 (并行安全).
+        if (cached_shell_target_.norm() < 1e-9f) {
+            // Fallback: 第一次调用且 main 还没采过, 退到固定单点
+            virtual_target = target_object_position_;
+            virtual_target.z() -= 0.08f;
+        } else {
+            virtual_target = cached_shell_target_;
+        }
+    } else {
+        // 固定单点 (原始设计): 苹果下方 8cm
+        virtual_target = target_object_position_;
+        virtual_target.z() -= 0.08f;
+    }
 
     Config att_vector = Eigen::VectorXf::Zero(dimension_);
     {
@@ -443,30 +623,132 @@ static float computeAdaptiveStep(float dist_to_obstacle, float base_step) {
 }
 
 // ============================================================================
+// getOrComputeEEJacobian — Method F (Optimization 1)
+// ============================================================================
+// Returns the 3×7 EE Jacobian at the given node configuration, cached by
+// node_id. On cache miss, computes via PandaPinocchioRobot::computeSphere
+// JacobianDirect (or fallback). Robot state assumed already at q on first
+// computation (caller guarantees this).
+MatrixXf GraspRrt::getOrComputeEEJacobian(int node_id, const Config& q) {
+    {
+        std::lock_guard<std::mutex> lk(ee_jacobian_cache_mutex_);
+        auto it = ee_jacobian_cache_.find(node_id);
+        if (it != ee_jacobian_cache_.end()) return it->second;
+    }
+
+    // Cache miss: compute. Robot must be at q for FK-derived Jacobian.
+    robot_->setJointValues(q);
+    MatrixXf J;
+    auto panda = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
+    Eigen::Vector3f zero_off = Eigen::Vector3f::Zero();
+    if (panda) {
+        int frame_id = robot_->getFrameId("panda_hand");
+        J = panda->computeSphereJacobianDirect(frame_id, zero_off);
+    } else {
+        robot_->prepareJacobians();
+        J = robot_->computeSphereJacobian("panda_hand", zero_off);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(ee_jacobian_cache_mutex_);
+        ee_jacobian_cache_[node_id] = J;
+    }
+    return J;
+}
+
+// ============================================================================
 // extendVFRRT — Lazy VF-RRT: 无碰撞检测扩展，路径验证延迟到找到抓取后
 // ============================================================================
-ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
+// Pure-compute part of extendVFRRT.
+// 只读 tree_/cspace_/robot_, 不写 tree_/performance_/last_added_id_.
+// 可在多线程并行调用 (前提: Phase 1+2 已就绪).
+GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
+    ExtendCandidate cand;
+
     auto t_start_nn = std::chrono::high_resolution_clock::now();
     auto nn = tree_->getNearestNeighbor(target);
     auto t_end_nn = std::chrono::high_resolution_clock::now();
-    performance_.nearest_neighbor_time_ms += std::chrono::duration<float, std::milli>(t_end_nn - t_start_nn).count();
+    cand.nn_time_ms = std::chrono::duration<float, std::milli>(t_end_nn - t_start_nn).count();
 
-    if (!nn) return ExtensionResult::ERROR;
+    if (!nn) return cand;  // valid stays false
 
     Config q_near = nn->getConfiguration();
+    cand.nn_id = nn->getId();
+
     Config q_rand_dir = target - q_near;
     if (q_rand_dir.norm() > 1e-6f) q_rand_dir.normalize();
 
     auto t_start_vf = std::chrono::high_resolution_clock::now();
-    Config vf_dir = computeVectorField(q_near, nn);
+    // q_rand_dir 是已经 normalize 过的扩展方向, 作为 motion_dir 传给 VF
+    // (Option A 的轴向 drag 需要它; K_ax=0 时此参数被忽略).
+    Config vf_dir = computeVectorField(q_near, nn, q_rand_dir);
     auto t_end_vf = std::chrono::high_resolution_clock::now();
-    performance_.vf_gradient_time_ms += std::chrono::duration<float, std::milli>(t_end_vf - t_start_vf).count();
+    cand.vf_time_ms = std::chrono::duration<float, std::milli>(t_end_vf - t_start_vf).count();
 
-    Config q_step_dir = 0.50f * q_rand_dir + 0.50f * vf_dir;
+    // Extension primitive: deterministic blend (default) or coin-flip ablation.
+    Config q_step_dir;
+    if (config_.extension_coin_flip) {
+        // 50% pure q_rand_dir, 50% pure vf_dir — discrete switch
+        q_step_dir = (randFloat01() < 0.5f) ? q_rand_dir : vf_dir;
+    } else {
+        // Standard VF-RRT: 50/50 deterministic weighted blend
+        q_step_dir = 0.50f * q_rand_dir + 0.50f * vf_dir;
+    }
     if (q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
 
-    // 自适应步长：用 q_near 的 TCP 到最近障碍距离来缩放
-    // computeVectorField 已经把 robot 的 joint 设为 q_near，所以可以直接读 TCP
+    // ---- Method F: angle-range sampling bias (Optimizations 1-4) ----
+    // Cap the axial-vs-branch-axis component of q_step_dir when the EE is
+    // within envelope of a branch. Uses cached J_EE keyed by node id.
+    if (config_.sampling_bias_enabled) {
+        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval) {
+            const MatrixXf& J_EE = getOrComputeEEJacobian(nn->getId(), q_near);
+            // Ensure robot is at q_near so SDF / axis lookup matches.
+            robot_->setJointValues(q_near);
+            bool applied = sdf_eval->applySamplingBias(
+                q_near, q_step_dir, J_EE,
+                config_.sampling_bias_envelope,
+                config_.sampling_bias_cos_cap,
+                config_.sampling_bias_k,
+                config_.sampling_bias_min_anisotropy);
+            if (applied && q_step_dir.norm() > 1e-6f) {
+                q_step_dir.normalize();
+            }
+        }
+    }
+
+    // ---- Sticky-winner selection (shared by sticky-F and sticky-BCD) ----
+    // Selection + F bending happen HERE (they shape q_step_dir before the
+    // edge is formed). BCD rejection is deferred until after new_config is
+    // known, so it can sub-sample the real edge (see below).
+    int   sticky_winner_id = -1;   // committed winner branch (for BCD rejection)
+    if (config_.sticky_f_enabled || config_.sticky_bcd_enabled) {
+        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval) {
+            const MatrixXf& J_EE = getOrComputeEEJacobian(nn->getId(), q_near);
+            robot_->setJointValues(q_near);
+            int prev_winner = nn->getWinnerBranchId();
+            auto sw = sdf_eval->stickyWinnerSelect(
+                q_near, q_step_dir, J_EE,
+                prev_winner,
+                config_.sticky_envelope,
+                config_.sticky_k,
+                config_.sticky_hysteresis_margin);
+            cand.chosen_winner_id = sw.chosen_id;
+            sticky_winner_id      = sw.chosen_id;
+
+            if (sw.chosen_id >= 0 && config_.sticky_f_enabled) {
+                // F-style deterministic bending (before edge is formed).
+                sdf_eval->bendAgainstAxis(
+                    q_step_dir, J_EE, sw.chosen_axis,
+                    config_.sticky_cos_cap);
+                if (q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
+            }
+        }
+    }
+
     float step_size = config_.extend_step_size;
     auto evaluator = cspace_->getCostEvaluator();
     if (evaluator) {
@@ -478,21 +760,68 @@ ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
     }
     Config new_config = q_near + q_step_dir * step_size;
 
-    // Full edge validity check (recursive DCD)
+    // ---- Sticky-BCD rejection (deferred): score the REAL edge -----------
+    // Now that new_config is known, evaluate the winner branch's axial score
+    // over the full edge q_near→new_config using both engagement spheres and
+    // DCD-granularity sub-sampling (catches envelope-entry / mid-edge-axial
+    // that a single q_near Jacobian prediction misses).
+    if (config_.sticky_bcd_enabled && sticky_winner_id >= 0) {
+        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval) {
+            float score = sdf_eval->stickyWinnerEdgeScore(
+                q_near, new_config, sticky_winner_id,
+                config_.sticky_envelope,
+                config_.sampling_size_dcd);
+            float x = config_.sticky_bcd_gain *
+                      (score - config_.sticky_bcd_threshold);
+            float p_reject = (x >= 0.0f)
+                ? 1.0f / (1.0f + std::exp(-x))
+                : std::exp(x) / (1.0f + std::exp(x));
+            if (randFloat01() < p_reject) {
+                // Rejected — return invalid candidate, do not extend.
+                return cand;
+            }
+        }
+    }
+
+    int col_before = cspace_->getCollisionCheckCount();
     auto t_start_col = std::chrono::high_resolution_clock::now();
     bool is_valid = cspace_->isPathValid(q_near, new_config);
     auto t_end_col = std::chrono::high_resolution_clock::now();
-    performance_.collision_check_time_ms += std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
+    cand.collision_time_ms = std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
+    cand.col_check_count_delta = cspace_->getCollisionCheckCount() - col_before;
 
-    if (!is_valid) {
-        return ExtensionResult::FAILED;
-    }
+    if (!is_valid) return cand;
 
-    float edge_cost = cspace_->calcDist(q_near, new_config);
-    float cost = nn->getCostFromRoot() + edge_cost;
-    auto new_node = tree_->appendNode(new_config, nn->getId());
+    cand.new_config = new_config;
+    cand.edge_cost  = cspace_->calcDist(q_near, new_config);
+    cand.valid      = true;
+    return cand;
+}
+
+// Serial entry point — same semantics as before.
+ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
+    ExtendCandidate c = extendVFRRTCompute(target);
+
+    performance_.nearest_neighbor_time_ms += c.nn_time_ms;
+    performance_.vf_gradient_time_ms      += c.vf_time_ms;
+    performance_.collision_check_time_ms  += c.collision_time_ms;
+    performance_.collision_in_extend_ms   += c.collision_time_ms;
+
+    if (c.nn_id < 0) return ExtensionResult::ERROR;
+    if (!c.valid)   return ExtensionResult::FAILED;
+
+    auto nn = tree_->getNode(c.nn_id);
+    if (!nn) return ExtensionResult::ERROR;
+
+    float cost = nn->getCostFromRoot() + c.edge_cost;
+    auto new_node = tree_->appendNode(c.new_config, nn->getId());
     new_node->setCostFromRoot(cost);
-    new_node->setEdgeCostToParent(edge_cost);
+    new_node->setEdgeCostToParent(c.edge_cost);
+    // Sticky-winner: propagate the chosen winner branch id onto the new node.
+    // If sticky mode was off, chosen_winner_id is -1 (harmless default).
+    new_node->setWinnerBranchId(c.chosen_winner_id);
     last_added_id_ = new_node->getId();
 
     processNode(new_node);
@@ -517,7 +846,9 @@ bool GraspRrt::validateSolutionPath(CSpaceNodePtr goal_node) {
         auto t_start_col = std::chrono::high_resolution_clock::now();
         bool valid = cspace_->isPathValid(path[i], path[i + 1]);
         auto t_end_col = std::chrono::high_resolution_clock::now();
-        performance_.collision_check_time_ms += std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
+        float dt = std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
+        performance_.collision_check_time_ms   += dt;
+        performance_.collision_in_validate_ms  += dt;
         if (!valid) return false;
     }
     return true;
@@ -542,8 +873,11 @@ MoveArmResult GraspRrt::connectRandomGraspPositionJacobian() {
     int face_id = pose_sphere_->getLastSelectedFace();
 
     // 2. 在物体表面计算抓取目标位姿
+    auto t_pose_start = std::chrono::high_resolution_clock::now();
     bool pose_ok = false;
     Matrix4f goal_pose = calculateGlobalGraspPose(nn_node->getConfiguration(), pose_ok);
+    auto t_pose_end = std::chrono::high_resolution_clock::now();
+    performance_.pose_calc_ms += std::chrono::duration<float, std::milli>(t_pose_end - t_pose_start).count();
     if (!pose_ok) {
         // 把 pose 计算失败也算作该面的一次失败
         pose_sphere_->recordGraspAttempt(face_id, /*success=*/false);
@@ -581,6 +915,72 @@ MoveArmResult GraspRrt::connectRandomGraspPositionJacobian() {
         std::cout << "[GraspRrt] Connect to grasp: " << move_time_ms << " ms\n";
     }
     return res;
+}
+
+void GraspRrt::dumpTree(const std::string& filepath) {
+    if (!tree_) return;
+
+    // 收集解路径上的节点 id (沿 parent 走到根)
+    std::unordered_set<int> path_ids;
+    if (goal_node_) {
+        auto cur = goal_node_;
+        while (cur) {
+            path_ids.insert(cur->getId());
+            int pid = cur->getParentId();
+            if (pid < 0) break;
+            cur = tree_->getNode(pid);
+        }
+    }
+
+    std::ofstream f(filepath);
+    if (!f.is_open()) {
+        std::cerr << "[GraspRrt] WARNING: cannot open tree dump file: " << filepath << "\n";
+        return;
+    }
+
+    f << "node_id,parent_id,j0,j1,j2,j3,j4,j5,j6,tcp_x,tcp_y,tcp_z,in_pose_sphere,on_solution_path\n";
+
+    const auto& all_nodes = tree_->getNodes();
+    for (const auto& node : all_nodes) {
+        const Config& cfg = node->getConfiguration();
+        robot_->setJointValues(cfg);
+        Matrix4f tcp_pose = robot_->getGCPGlobalPose();
+        Vector3f tcp = tcp_pose.block<3,1>(0, 3);
+
+        Vector3f diff = tcp - target_object_position_;
+        bool in_ps   = diff.squaredNorm() < config_.try_grasps_distance2;
+        bool on_path = path_ids.count(node->getId()) > 0;
+
+        f << node->getId() << "," << node->getParentId();
+        for (int d = 0; d < 7; ++d) f << "," << cfg[d];
+        f << "," << tcp.x() << "," << tcp.y() << "," << tcp.z();
+        f << "," << (in_ps ? 1 : 0)
+          << "," << (on_path ? 1 : 0) << "\n";
+    }
+}
+
+void GraspRrt::dumpFaceStats(const std::string& filepath) {
+    if (!pose_sphere_) return;
+
+    std::ofstream f(filepath);
+    if (!f.is_open()) {
+        std::cerr << "[GraspRrt] WARNING: cannot open face stats file: " << filepath << "\n";
+        return;
+    }
+
+    f << "face_id,attempts,failures,disabled,node_count,dir_x,dir_y,dir_z\n";
+    int n = pose_sphere_->getTotalFaceCount();
+    for (int fid = 0; fid < n; ++fid) {
+        int attempts  = pose_sphere_->getAttemptCount(fid);
+        int failures  = pose_sphere_->getFailureCount(fid);
+        bool disabled = pose_sphere_->isFaceDisabled(fid);
+        int n_nodes   = pose_sphere_->getNodeCount(fid);
+        Vector3f dir  = pose_sphere_->getFaceDirection(fid);
+
+        f << fid << "," << attempts << "," << failures << ","
+          << (disabled ? 1 : 0) << "," << n_nodes << ","
+          << dir.x() << "," << dir.y() << "," << dir.z() << "\n";
+    }
 }
 
 void GraspRrt::tryDisableFace(int face_id) {
@@ -712,7 +1112,9 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
             auto t_start_col = std::chrono::high_resolution_clock::now();
             bool is_valid = cspace_->isPathValid(last_extend_node->getConfiguration(), tmp_config);
             auto t_end_col = std::chrono::high_resolution_clock::now();
-            performance_.collision_check_time_ms += std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
+            float dt_mv = std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
+            performance_.collision_check_time_ms += dt_mv;
+            performance_.collision_in_move_ms    += dt_mv;
             
             if (!is_valid) {
                 if (verbose_) std::cout << "[GraspRrt] Path check failed after IK step\n";
@@ -835,8 +1237,10 @@ std::pair<MoveArmResult, Config> GraspRrt::moveArmDiffKin(const Matrix4f& delta_
     auto t_start_col = std::chrono::high_resolution_clock::now();
     bool is_free = cspace_->isCollisionFree(new_config);
     auto t_end_col = std::chrono::high_resolution_clock::now();
-    performance_.collision_check_time_ms += std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
-    
+    float dt_step = std::chrono::duration<float, std::milli>(t_end_col - t_start_col).count();
+    performance_.collision_check_time_ms += dt_step;
+    performance_.collision_in_move_ms    += dt_step;
+
     if (!is_free) {
         return {MoveArmResult::COLLISION_ENVIRONMENT, new_config};
     }
@@ -1006,7 +1410,7 @@ Config GraspRrt::sampleGoalBiased() {
     // Add c-space jitter (uniform in each dimension)
     Config jitter(dimension_);
     for (int i = 0; i < dimension_; i++) {
-        float r = 2.0f * (static_cast<float>(rand()) / RAND_MAX) - 1.0f;  // [-1, 1]
+        float r = 2.0f * randFloat01() - 1.0f;  // [-1, 1]
         jitter[i] = r * goal_bias_jitter_;
     }
     return base + jitter;

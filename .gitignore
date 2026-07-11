@@ -17,3 +17,12 @@ grasp_path*.csv
 # 临时文件
 *.log
 *.tmp
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 大体积可视化产物 (可由脚本重新生成；不入库以免撑爆仓库)
+*.gif
+viz_out/
+horiz_sweep_results/
