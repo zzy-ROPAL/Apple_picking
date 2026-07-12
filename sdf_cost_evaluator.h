@@ -1031,12 +1031,19 @@ private:
     //   - 用于 Option A 的轴向 drag：需要每个 sphere 知道"最近树枝沿哪条轴"
     //   - 退化情况（p0 == p1，例如 overhead 球被当 cylinder 加进来）返回 0
     //   - 当 cylinders_ 为空时返回 0
+    //
+    // 刚性圆柱（exclude_from_aniso = true，即树干）被跳过：各向异性是柔性
+    // 枝叶的属性，"径向拨开"对刚性树干无意义。所有方法（edge refuse /
+    // sample steering / sticky）本就跳过树干；此处的跳过让 Option A 的
+    // 轴向 drag 与两个 anisotropy 指标与之保持一致 —— 否则树干的竖直轴会
+    // 被当成 â，把与树枝无关的运动混入 axial/radial 统计。
     // ------------------------------------------------------------------
     Eigen::Vector3f findNearestCylinderAxis(const Eigen::Vector3f& p) const {
         if (cylinders_.empty()) return Eigen::Vector3f::Zero();
         int best_idx = -1;
         float best_dist = std::numeric_limits<float>::max();
         for (size_t i = 0; i < cylinders_.size(); ++i) {
+            if (cylinders_[i].exclude_from_aniso) continue;   // 树干等刚性障碍
             float d = distToCylinder(p, cylinders_[i]);
             if (d < best_dist) {
                 best_dist = d;
