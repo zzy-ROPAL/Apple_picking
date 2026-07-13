@@ -285,9 +285,14 @@ public:
     // Degenerate axis (overhead-sphere) and free-space (penetration ≤ 0) are
     // silently skipped (contribute nothing).
     // ------------------------------------------------------------------
+    // engagement_only = true restricts the sum to the two engagement-zone
+    // spheres (panda_hand, panda_link6) — the links the anisotropy methods
+    // actually control. Secondary diagnostic; the primary (all-sphere)
+    // definition is unchanged and stays comparable with all past results.
     std::pair<double, double> measureWaypointAnisotropy(
         const grasp_rrt::Config& q,
-        const grasp_rrt::Config& v_joint) const {
+        const grasp_rrt::Config& v_joint,
+        bool engagement_only = false) const {
         if (!sdf_built_) return {0.0, 0.0};
         if (v_joint.size() != q.size() || v_joint.norm() < 1e-9f) return {0.0, 0.0};
 
@@ -295,6 +300,9 @@ public:
         double axial_acc = 0.0, total_acc = 0.0;
 
         for (const auto& rs : spheres_) {
+            if (engagement_only &&
+                rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
+                continue;
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
             Eigen::Vector3f p = pose.block<3,1>(0,3)
                               + pose.block<3,3>(0,0) * rs.offset;

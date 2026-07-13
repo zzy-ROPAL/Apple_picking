@@ -180,6 +180,9 @@ struct RunResult {
     //   Range [0, 1]. Lower = more perpendicular crossings (preferred by Option A).
     //   -1.0 = no contact along the path (clean path, fraction undefined).
     float   axial_contact_fraction = -1.0f;
+    // Engagement-only variant: same definition, restricted to the two
+    // spheres the methods control (panda_hand + panda_link6). -1 = no contact.
+    float   axial_contact_fraction_ee = -1.0f;
     float   total_contact_weight   = 0.0f;  // = Σ pen · |v|  (denominator; 0 = no contact)
 
     // Group E2: depth-based decomposition (L1, position-only, no velocity)
@@ -314,6 +317,7 @@ void writeCsvHeader(std::ofstream& f) {
       << "pose_calc_ms,rrt_other_ms,grasp_hyp_total_ms,move_other_ms,"
       // Group E: path anisotropy
       << "axial_contact_fraction,total_contact_weight,"
+      << "axial_contact_fraction_ee,"
       // Group E2: depth-based decomposition
       << "radial_depth_fraction,axial_depth_sum,radial_depth_sum,"
       // Group E3: winner-switch oscillation counter
@@ -364,6 +368,7 @@ void writeCsvRow(std::ofstream& f, const RunResult& r) {
       << fmt(r.move_other_ms) << ",";
     // Group E: path anisotropy
     f << fmt(r.axial_contact_fraction) << "," << fmt(r.total_contact_weight) << ",";
+    f << fmt(r.axial_contact_fraction_ee) << ",";
     // Group E2
     f << fmt(r.radial_depth_fraction) << "," << fmt(r.axial_depth_sum) << ","
       << fmt(r.radial_depth_sum) << ",";
@@ -1407,16 +1412,25 @@ int main(int argc, char* argv[]) {
             // solution path. Lower = more perpendicular crossings (Option A goal).
             if (auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(cost_evaluator)) {
                 double axial_sum = 0.0, total_sum = 0.0;
+                double axial_ee  = 0.0, total_ee  = 0.0;
                 for (size_t i = 1; i + 1 < solution.size(); ++i) {
                     Config v_joint = solution[i+1] - solution[i-1];
                     auto contrib = sdf_eval->measureWaypointAnisotropy(solution[i], v_joint);
                     axial_sum += contrib.first;
                     total_sum += contrib.second;
+                    auto ce = sdf_eval->measureWaypointAnisotropy(
+                        solution[i], v_joint, /*engagement_only=*/true);
+                    axial_ee += ce.first;
+                    total_ee += ce.second;
                 }
                 result.total_contact_weight = static_cast<float>(total_sum);
                 if (total_sum > 1e-9) {
                     result.axial_contact_fraction =
                         static_cast<float>(axial_sum / total_sum);
+                }
+                if (total_ee > 1e-9) {
+                    result.axial_contact_fraction_ee =
+                        static_cast<float>(axial_ee / total_ee);
                 }
                 // else: path has no branch contact → axial_contact_fraction = -1 (default)
 
