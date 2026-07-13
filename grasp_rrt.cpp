@@ -718,6 +718,16 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
         }
     }
 
+#if 0  // ================== STICKY WINNER — DISABLED ======================
+    // Superseded by the structure-tensor edge refuse (--edge-refuse-tensor).
+    // Sticky winner applies hysteresis to the argmax branch selection; it
+    // DELAYS the winner flip but cannot remove it (the axis function stays
+    // piecewise-constant), which is why oscillation persisted in the
+    // 10-branch scene. The tensor removes the selection step entirely, so
+    // there is nothing left to be "sticky" about. Kept in-tree (not
+    // deleted) as the Gen-2 ablation record: argmax → argmax+hysteresis →
+    // tensor.
+    // ====================================================================
     // ---- Sticky-winner selection (shared by sticky-sample-steering and sticky-edge-refuse) ----
     // Selection + sample-steering bending happen HERE (they shape q_step_dir before the
     // edge is formed). edge refuse rejection is deferred until after new_config is
@@ -748,6 +758,7 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
             }
         }
     }
+#endif  // ================ END STICKY WINNER (selection) ==================
 
     float step_size = config_.extend_step_size;
     auto evaluator = cspace_->getCostEvaluator();
@@ -760,6 +771,11 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     }
     Config new_config = q_near + q_step_dir * step_size;
 
+#if 0  // ============ STICKY WINNER (deferred rejection) — DISABLED =======
+    // See the note at the selection block above. Tensor-mode edge refuse
+    // performs its rejection inside CSpaceSampled::isPathValid via
+    // computeEdgeAxialScoreTensor — no committed winner exists.
+    // ====================================================================
     // ---- Sticky-edge refuse rejection (deferred): score the REAL edge -----------
     // Now that new_config is known, evaluate the winner branch's axial score
     // over the full edge q_near→new_config using both engagement spheres and
@@ -784,6 +800,7 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
             }
         }
     }
+#endif  // ============= END STICKY WINNER (deferred rejection) ============
 
     int col_before = cspace_->getCollisionCheckCount();
     auto t_start_col = std::chrono::high_resolution_clock::now();

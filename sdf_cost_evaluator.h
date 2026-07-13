@@ -533,6 +533,142 @@ public:
         return max_score;
     }
 
+    // ==================================================================
+    // STRUCTURE TENSOR — the shared anisotropy primitive
+    //
+    // buildLocalAxisTensor(p, body_radius, envelope) returns
+    //
+    //     M(p) = sum over non-rigid branches i of  w_i(p) * a_i * a_i^T
+    //
+    // where a_i is branch i's unit axis and w_i is a smoothstep weight on
+    // the body-to-surface distance d_i = distToCylinder(p) − body_radius:
+    //
+    //     w_i = 1                              if d_i <= 0   (contact)
+    //     w_i = smoothstep(1 − d_i/envelope)   if 0 < d_i < envelope
+    //     w_i = 0                              if d_i >= envelope
+    //
+    // Properties that make M the right object (vs a single winner axis):
+    //   * SMOOTH: w_i are C1 in p and each a_i*a_i^T is constant, so M(p)
+    //     is C1. There is NO selection step — nothing that can flip when
+    //     the dominant branch changes. This removes the argmax/argmin
+    //     discontinuity (the oscillation source) at the root.
+    //   * SIGN-INVARIANT: a*a^T == (−a)*(−a)^T, so branches stored with
+    //     opposite axis signs (e.g. opposite sides of the trunk) ADD
+    //     instead of cancelling — a weighted vector average would give 0.
+    //   * FULL CAPACITY: a symmetric 3x3 carries every branch's
+    //     constraint at once. axial_penalty(d) = d^T M d
+    //     = sum_i w_i (d . a_i)^2 — sliding along ANY nearby branch is
+    //     penalized; a single blended vector can encode only one.
+    //
+    // trace(M) = sum_i w_i (since trace(a a^T) = |a|^2 = 1), so
+    // M / trace(M) is a weighted mean of cos^2 terms, bounded in [0, 1].
+    //
+    // The trunk and other rigid obstacles (exclude_from_aniso) contribute
+    // nothing, consistent with every other anisotropy mechanism.
+    // Cost: O(N_cyl) with no allocation; a few μs for N ~ 12.
+    // ==================================================================
+    Eigen::Matrix3f buildLocalAxisTensor(const Eigen::Vector3f& p,
+                                         float body_radius,
+                                         float envelope,
+                                         float* weight_sum_out = nullptr) const {
+        Eigen::Matrix3f M = Eigen::Matrix3f::Zero();
+        float w_sum = 0.0f;
+        for (const auto& cyl : cylinders_) {
+            if (cyl.exclude_from_aniso) continue;               // trunk etc.
+            if (cyl.axis_unit.squaredNorm() < 0.25f) continue;  // degenerate
+            float d = distToCylinder(p, cyl) - body_radius;
+            if (d >= envelope) continue;
+            float t = 1.0f - std::max(d, 0.0f) / envelope;      // (0, 1]
+            float w = t * t * (3.0f - 2.0f * t);                // smoothstep
+            M.noalias() += w * (cyl.axis_unit * cyl.axis_unit.transpose());
+            w_sum += w;
+        }
+        if (weight_sum_out) *weight_sum_out = w_sum;
+        return M;
+    }
+
+    // ------------------------------------------------------------------
+    // computeEdgeAxialScoreTensor — edge-refuse score, tensor aggregation
+    //
+    // Drop-in replacement for computeEdgeAxialScore: same engagement
+    // spheres (panda_hand, panda_link6), same displacement dp per sphere,
+    // same [0, 1] score contract feeding the same sigmoid. The only
+    // change is HOW branches are aggregated:
+    //
+    //   legacy:  score = MAX over (sphere, branch) of  w_b * |dp_hat . a_b|
+    //            → the max SELECTS a winner; near a tie between branches
+    //              the selection flips → rejection-axis oscillation.
+    //
+    //   tensor:  per sphere s at position p:
+    //              M, w_sum = buildLocalAxisTensor(p, r_s, envelope)
+    //              raw   = sqrt( dp_hat^T M dp_hat / w_sum )   in [0, 1]
+    //              gate  = min(1, w_sum)          (envelope proximity ramp)
+    //              s_score = gate * raw
+    //            score = max over the two engagement spheres of s_score
+    //            (max over the FIXED sphere set is continuous; the
+    //             discontinuity was in the per-branch selection).
+    //
+    // Backward compatibility: with a single branch at weight w,
+    //   raw = |dp_hat . a|, gate = w  →  score = w * |dp_hat . a|,
+    // identical to the legacy formula (modulo smoothstep vs linear ramp).
+    // With multiple branches the quadratic form accumulates axiality
+    // against ALL of them — the case the MAX handled discontinuously.
+    // ------------------------------------------------------------------
+    float computeEdgeAxialScoreTensor(const Eigen::VectorXf& q_near,
+                                      const Eigen::VectorXf& q_new,
+                                      float envelope) const override {
+        if (!sdf_built_ || cylinders_.empty()) return 0.0f;
+        if (q_near.size() != q_new.size()) return 0.0f;
+        if (envelope <= 0.0f) return 0.0f;
+
+        // Sphere positions at q_near (engagement spheres only).
+        robot_->setJointValues(q_near);
+        std::vector<Eigen::Vector3f> p_prev(spheres_.size(),
+                                            Eigen::Vector3f::Zero());
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
+                continue;
+            Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+            p_prev[k] = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
+        }
+
+        // Evaluate at q_new.
+        robot_->setJointValues(q_new);
+        float best = 0.0f;
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
+                continue;
+
+            Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+            Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
+                                   + pose.block<3,3>(0,0) * rs.offset;
+
+            // Fast SDF early-exit (same as legacy): if even the nearest
+            // obstacle is beyond the envelope, skip the cylinder loop.
+            float sdf_val = sampleSdf(p_curr);
+            if (sdf_val - rs.radius > envelope) continue;
+
+            Eigen::Vector3f dp = p_curr - p_prev[k];
+            float dp_norm = dp.norm();
+            if (dp_norm < 1e-4f) continue;
+            Eigen::Vector3f dp_hat = dp / dp_norm;
+
+            float w_sum = 0.0f;
+            Eigen::Matrix3f M = buildLocalAxisTensor(
+                p_curr, rs.radius, envelope, &w_sum);
+            if (w_sum < 1e-6f) continue;
+
+            float quad = dp_hat.dot(M * dp_hat) / w_sum;   // mean cos^2
+            float raw  = std::sqrt(std::max(0.0f, quad));  // in [0, 1]
+            float gate = std::min(1.0f, w_sum);
+            float s    = gate * raw;
+            if (s > best) best = s;
+        }
+        return best;
+    }
+
     // ------------------------------------------------------------------
     // maxWinnerBranchId — post-hoc "which branch is most dangerous here"
     //

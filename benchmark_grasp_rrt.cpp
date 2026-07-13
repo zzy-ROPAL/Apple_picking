@@ -411,10 +411,11 @@ int main(int argc, char* argv[]) {
     int   sticky_k          = 3;      // --sticky-k K: how many nearest non-rigid branches to score at each cycle
     float sticky_cap_deg    = 30.0f;  // --sticky-cap DEG: sticky-sample-steering min angle off branch axis (deg). 30=cos0.866, 45=0.707, 60=0.5
     bool edge_refuse_enabled = false;   // --edge-refuse: enable anisotropic edge refuse (Layer 1)
+    bool edge_refuse_tensor  = false;   // --edge-refuse-tensor: structure-tensor aggregation instead of MAX (implies --edge-refuse)
     float edge_refuse_envelope  = 0.05f;
     float edge_refuse_threshold = 0.9063f;  // cos(25°): sigmoid midpoint
     float edge_refuse_gain      = 20.0f;    // sigmoid steepness
-    int   edge_refuse_k         = 3;        // K nearest non-rigid branches per sphere
+    int   edge_refuse_k         = 3;        // K nearest non-rigid branches per sphere (MAX mode only)
 
     // sample steering — angle-range cap on extension direction.
     bool  sample_steering_enabled         = false;
@@ -473,10 +474,14 @@ int main(int argc, char* argv[]) {
         } else if (a == "--xgate") {
             xgate_scene = true;
             diag_scene  = true;   // reuse diag apple/overhead override + geometry gating
-        } else if (a == "--sticky-edge-refuse") {
-            sticky_edge_refuse_enabled = true;
-        } else if (a == "--sticky-sample-steering") {
-            sticky_sample_steering_enabled = true;
+        } else if (a == "--sticky-edge-refuse" || a == "--sticky-sample-steering") {
+            // Sticky winner is disabled: hysteresis only delays the argmax
+            // winner flip, it cannot remove the discontinuity (oscillation
+            // persisted in the 10-branch scene). Superseded by the smooth
+            // structure-tensor aggregation, which has no winner at all.
+            std::cerr << "ERROR: " << a << " is DISABLED (superseded).\n"
+                      << "       Use --edge-refuse-tensor instead.\n";
+            return 1;
         } else if (a == "--sticky-hysteresis" && i + 1 < argc) {
             sticky_hysteresis = std::max(1.0f,
                                   static_cast<float>(std::atof(argv[++i])));
@@ -487,6 +492,9 @@ int main(int argc, char* argv[]) {
                                   static_cast<float>(std::atof(argv[++i]))));
         } else if (a == "--edge-refuse") {
             edge_refuse_enabled = true;
+        } else if (a == "--edge-refuse-tensor") {
+            edge_refuse_enabled = true;
+            edge_refuse_tensor  = true;
         } else if (a == "--edge-refuse-envelope" && i + 1 < argc) {
             edge_refuse_envelope = std::max(0.001f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--edge-refuse-threshold" && i + 1 < argc) {
@@ -1034,15 +1042,22 @@ int main(int argc, char* argv[]) {
         cspace->setEdgeRefuseThreshold(edge_refuse_threshold);
         cspace->setEdgeRefuseGain(edge_refuse_gain);
         cspace->setEdgeRefuseK(edge_refuse_k);
-        std::cout << "[Setup] Edge refuse ENABLED (soft sigmoid, multi-branch):\n"
+        cspace->setEdgeRefuseTensorMode(edge_refuse_tensor);
+        std::cout << "[Setup] Edge refuse ENABLED ("
+                  << (edge_refuse_tensor
+                        ? "STRUCTURE-TENSOR aggregation, no winner selection"
+                        : "legacy MAX aggregation")
+                  << "):\n"
                   << "        envelope  = " << edge_refuse_envelope << " m\n"
                   << "        threshold = " << edge_refuse_threshold
                   << " (cos midpoint)\n"
                   << "        gain      = " << edge_refuse_gain
-                  << " (sigmoid steepness)\n"
-                  << "        K nearest = " << edge_refuse_k
-                  << " (non-rigid branches per sphere)\n"
-                  << "        spheres   = panda_hand + panda_link6\n";
+                  << " (sigmoid steepness)\n";
+        if (!edge_refuse_tensor) {
+            std::cout << "        K nearest = " << edge_refuse_k
+                      << " (non-rigid branches per sphere)\n";
+        }
+        std::cout << "        spheres   = panda_hand + panda_link6\n";
     }
 
     // ---- 7. Target object (apple) ----

@@ -58,6 +58,27 @@ public:
         int /*K*/ = 3) const {
         return 0.0f;
     }
+
+    // ---- Tensor variant of the edge-refuse score ----
+    //
+    // Same contract as computeEdgeAxialScore (score in [0, 1], 0 = never
+    // reject), but the branch aggregation is a smooth structure-tensor
+    // quadratic form instead of a discrete MAX over (sphere, branch) pairs:
+    //
+    //   M(p)     = sum_i w_i(p) * a_i * a_i^T     (all non-rigid branches)
+    //   score(d) = gate * sqrt( d^T M d / trace(M) )
+    //
+    // No branch is ever *selected*, so the score cannot jump when the
+    // dominant branch changes — the argmax discontinuity (the oscillation
+    // source) is removed at the root rather than damped (sticky winner).
+    // Reduces to the single-branch score w * |d . a| when one branch
+    // dominates. Default returns 0 for evaluators without branch axes.
+    virtual float computeEdgeAxialScoreTensor(
+        const Eigen::VectorXf& /*q_near*/,
+        const Eigen::VectorXf& /*q_new*/,
+        float /*envelope*/) const {
+        return 0.0f;
+    }
 };
 
 // ============================================================================
@@ -129,11 +150,17 @@ public:
     void setEdgeRefuseThreshold(float t)     { edge_refuse_threshold_ = t; }
     void setEdgeRefuseGain(float g)          { edge_refuse_gain_ = g; }
     void setEdgeRefuseK(int k)               { edge_refuse_k_ = std::max(1, k); }
+    // Tensor mode: replace the discrete MAX branch aggregation with the
+    // smooth structure-tensor quadratic form (see CostEvaluator::
+    // computeEdgeAxialScoreTensor). Same sigmoid, same threshold/gain —
+    // only the score function changes.
+    void setEdgeRefuseTensorMode(bool on)    { edge_refuse_tensor_mode_ = on; }
     bool  getEdgeRefuseEnabled() const       { return edge_refuse_enabled_; }
     float getEdgeRefuseEnvelope() const      { return edge_refuse_envelope_; }
     float getEdgeRefuseThreshold() const     { return edge_refuse_threshold_; }
     float getEdgeRefuseGain() const          { return edge_refuse_gain_; }
     int   getEdgeRefuseK() const             { return edge_refuse_k_; }
+    bool  getEdgeRefuseTensorMode() const    { return edge_refuse_tensor_mode_; }
 
     // ---- 离散碰撞检测 (覆盖基类) ----
 
@@ -155,8 +182,11 @@ public:
     bool isPathValid(const Config& q1, const Config& q2) override {
         // Step 1 (cheap, ~15 μs): directional check, if enabled.
         if (edge_refuse_enabled_ && cost_evaluator_) {
-            float score = cost_evaluator_->computeEdgeAxialScore(
-                q1, q2, edge_refuse_envelope_, edge_refuse_k_);
+            float score = edge_refuse_tensor_mode_
+                ? cost_evaluator_->computeEdgeAxialScoreTensor(
+                      q1, q2, edge_refuse_envelope_)
+                : cost_evaluator_->computeEdgeAxialScore(
+                      q1, q2, edge_refuse_envelope_, edge_refuse_k_);
             if (score > 0.0f) {
                 float x = edge_refuse_gain_
                           * (score - edge_refuse_threshold_);
@@ -232,6 +262,8 @@ private:
     float edge_refuse_threshold_ = 0.9063f;
     float edge_refuse_gain_      = 20.0f;
     int   edge_refuse_k_         = 3;
+    // false = legacy MAX aggregation; true = structure-tensor quadratic form
+    bool  edge_refuse_tensor_mode_ = false;
 
     // Private RNG for the probabilistic accept/reject decision. Seeded with
     // a fixed value so soft rejection is deterministic per CSpaceSampled
