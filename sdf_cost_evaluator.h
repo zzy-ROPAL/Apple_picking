@@ -599,20 +599,39 @@ public:
     //            → the max SELECTS a winner; near a tie between branches
     //              the selection flips → rejection-axis oscillation.
     //
-    //   tensor:  per sphere s at position p:
-    //              M, w_sum = buildLocalAxisTensor(p, r_s, envelope)
-    //              raw   = sqrt( dp_hat^T M dp_hat / w_sum )   in [0, 1]
-    //              gate  = min(1, w_sum)          (envelope proximity ramp)
+    //   tensor:  per sphere s at position p, over in-envelope branches i
+    //            with smoothstep weights w_i and c_i = |dp_hat . a_i|:
+    //              raw   = ( sum_i w_i c_i^8 / sum_i w_i )^(1/8)
+    //              gate  = min(1, sum_i w_i)      (envelope proximity ramp)
     //              s_score = gate * raw
     //            score = max over the two engagement spheres of s_score
     //            (max over the FIXED sphere set is continuous; the
     //             discontinuity was in the per-branch selection).
     //
-    // Backward compatibility: with a single branch at weight w,
-    //   raw = |dp_hat . a|, gate = w  →  score = w * |dp_hat . a|,
-    // identical to the legacy formula (modulo smoothstep vs linear ramp).
-    // With multiple branches the quadratic form accumulates axiality
-    // against ALL of them — the case the MAX handled discontinuously.
+    // DESIGN HISTORY (two failed variants, measured on V6, start1, n=10):
+    //
+    //  v1: trace-normalized quadratic form sqrt(dp^T M dp / tr M), weights
+    //      clamped at contact. axial 0.682 vs legacy MAX 0.428. Two
+    //      defects: (a) the MEAN dilutes in envelope overlaps (motion
+    //      axial to B but radial to A scores 0.707 < threshold);
+    //      (b) see v2.
+    //  v2: order-8 normalized soft-max, weights still clamped. axial
+    //      0.699 — no better. Telemetry exposed the real defect: the
+    //      legacy weight W = 1 − d/envelope is UNCLAMPED — when the
+    //      sphere penetrates (d < 0), W grows past 1 (mean legacy score
+    //      1.48, reject rate 91%!). Penetration depth AMPLIFIES legacy
+    //      rejection, tightening the allowed cone the deeper the contact:
+    //      at W = 2 only motions with |cos| < 0.45 (> 63 deg off axis)
+    //      survive. Clamping W at contact neutered exactly that engine.
+    //
+    //  v3 (this code): unnormalized order-8 soft-max over per-
+    //      (sphere, branch) scores with the legacy unclamped weight:
+    //          W_i   = 1 − d_i/envelope        (> 1 when penetrating)
+    //          score = ( sum_i (W_i c_i)^8 )^(1/8)
+    //      Single branch: score = W c — EXACTLY the legacy formula,
+    //      amplification included. Multi-branch: smooth soft-max ≥ max
+    //      (1.09x for two equal contributors) — conservative, and
+    //      selection-free: no argmax, nothing flips at branch handoff.
     // ------------------------------------------------------------------
     float computeEdgeAxialScoreTensor(const Eigen::VectorXf& q_near,
                                       const Eigen::VectorXf& q_new,
@@ -655,15 +674,24 @@ public:
             if (dp_norm < 1e-4f) continue;
             Eigen::Vector3f dp_hat = dp / dp_norm;
 
-            float w_sum = 0.0f;
-            Eigen::Matrix3f M = buildLocalAxisTensor(
-                p_curr, rs.radius, envelope, &w_sum);
-            if (w_sum < 1e-6f) continue;
+            // Unnormalized order-8 soft-max with legacy unclamped weight.
+            float acc = 0.0f;
+            bool  any = false;
+            for (const auto& cyl : cylinders_) {
+                if (cyl.exclude_from_aniso) continue;
+                if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+                float d = distToCylinder(p_curr, cyl) - rs.radius;
+                if (d >= envelope) continue;
+                float W = 1.0f - d / envelope;   // UNCLAMPED: > 1 inside
+                float c = std::abs(dp_hat.dot(cyl.axis_unit));
+                float s1 = W * c;
+                float s2 = s1 * s1, s4 = s2 * s2;
+                acc += s4 * s4;                  // (W c)^8
+                any = true;
+            }
+            if (!any) continue;
 
-            float quad = dp_hat.dot(M * dp_hat) / w_sum;   // mean cos^2
-            float raw  = std::sqrt(std::max(0.0f, quad));  // in [0, 1]
-            float gate = std::min(1.0f, w_sum);
-            float s    = gate * raw;
+            float s = std::sqrt(std::sqrt(std::sqrt(acc)));   // ^(1/8)
             if (s > best) best = s;
         }
         return best;
@@ -1198,12 +1226,26 @@ public:
         }
         if (!found_ee) return false;
 
-        // Local axis tensor. NO penetration skip: contact means w = 1.
+        // In-envelope branch list at p_ee. NO penetration skip; the legacy
+        // UNCLAMPED weight W = 1 − d/envelope grows past 1 inside contact,
+        // so depth tightens the allowed cone (same convention as tensor
+        // edge refuse — see computeEdgeAxialScoreTensor design history).
+        struct WAxis { float w; Eigen::Vector3f a; };
+        std::vector<WAxis> axes;
+        axes.reserve(cylinders_.size());
         float w_sum = 0.0f;
-        Eigen::Matrix3f M = buildLocalAxisTensor(p_ee, ee_radius, envelope,
-                                                 &w_sum);
+        Eigen::Matrix3f M = Eigen::Matrix3f::Zero();
+        for (const auto& cyl : cylinders_) {
+            if (cyl.exclude_from_aniso) continue;
+            if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+            float d = distToCylinder(p_ee, cyl) - ee_radius;
+            if (d >= envelope) continue;
+            float W = 1.0f - d / envelope;   // UNCLAMPED: > 1 inside
+            axes.push_back({W, cyl.axis_unit});
+            M.noalias() += W * (cyl.axis_unit * cyl.axis_unit.transpose());
+            w_sum += W;
+        }
         if (w_sum < 1e-6f) return false;
-        Eigen::Matrix3f M_hat = M / w_sum;
 
         // Workspace direction of the proposed step.
         Eigen::Vector3f v = J_EE * q_step_dir;
@@ -1211,14 +1253,22 @@ public:
         if (v_norm < 1e-6f) return false;
         Eigen::Vector3f v_hat = v / v_norm;
 
-        const float g = std::min(1.0f, w_sum);   // proximity gate
+        // Unnormalized order-8 soft-max, identical to tensor edge refuse.
         auto s_eff = [&](const Eigen::Vector3f& u) {
-            return g * std::sqrt(std::max(0.0f, u.dot(M_hat * u)));
+            float acc = 0.0f;
+            for (const auto& wa : axes) {
+                float s1 = wa.w * std::abs(u.dot(wa.a));
+                float s2 = s1 * s1, s4 = s2 * s2;
+                acc += s4 * s4;                  // (W c)^8
+            }
+            return std::sqrt(std::sqrt(std::sqrt(acc)));
         };
         if (s_eff(v_hat) <= cos_cap) return false;   // already radial enough
 
-        // Escape direction: minimum eigenvector (Eigen sorts ascending).
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M_hat);
+        // Escape direction: minimum eigenvector of the ORDER-2 tensor —
+        // the mean IS the right semantics for picking a best direction
+        // (least axial to all branches on weighted average).
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M / w_sum);
         if (es.info() != Eigen::Success) return false;
         Eigen::Vector3f e_min = es.eigenvectors().col(0);
         if (v_hat.dot(e_min) < 0.0f) e_min = -e_min;   // stay on v's side

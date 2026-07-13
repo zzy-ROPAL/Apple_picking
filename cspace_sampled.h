@@ -187,6 +187,9 @@ public:
                       q1, q2, edge_refuse_envelope_)
                 : cost_evaluator_->computeEdgeAxialScore(
                       q1, q2, edge_refuse_envelope_, edge_refuse_k_);
+            er_checks_++;
+            er_score_sum_ += score;
+            if (score > 0.85f) er_hi_++;
             if (score > 0.0f) {
                 float x = edge_refuse_gain_
                           * (score - edge_refuse_threshold_);
@@ -195,12 +198,21 @@ public:
                     ? 1.0f / (1.0f + std::exp(-x))
                     : std::exp(x) / (1.0f + std::exp(x));
                 std::uniform_real_distribution<float> u(0.0f, 1.0f);
-                if (u(edge_rng_) < p_reject) return false;
+                if (u(edge_rng_) < p_reject) {
+                    er_rejects_++;
+                    return false;
+                }
             }
         }
         // Step 2 (expensive, ~300-700 μs): geometric collision check.
         return recursivePathCheck(q1, q2, 0);
     }
+
+    // ---- Edge-refuse telemetry (cumulative; caller diffs across runs) ----
+    unsigned long long getEdgeRefuseChecks()  const { return er_checks_; }
+    unsigned long long getEdgeRefuseRejects() const { return er_rejects_; }
+    unsigned long long getEdgeRefuseHiScores() const { return er_hi_; }
+    double getEdgeRefuseScoreSum() const { return er_score_sum_; }
 
     // ---- 路径创建 (对应 Python createPath) ----
 
@@ -264,6 +276,12 @@ private:
     int   edge_refuse_k_         = 3;
     // false = legacy MAX aggregation; true = structure-tensor quadratic form
     bool  edge_refuse_tensor_mode_ = false;
+
+    // Edge-refuse telemetry
+    mutable unsigned long long er_checks_  = 0;
+    mutable unsigned long long er_rejects_ = 0;
+    mutable unsigned long long er_hi_      = 0;
+    mutable double er_score_sum_ = 0.0;
 
     // Private RNG for the probabilistic accept/reject decision. Seeded with
     // a fixed value so soft rejection is deterministic per CSpaceSampled

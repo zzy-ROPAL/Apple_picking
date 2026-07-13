@@ -1557,6 +1557,20 @@ int main(int argc, char* argv[]) {
 
     csv_file.close();
 
+    // ---- Edge-refuse telemetry (whole benchmark, all runs pooled) ----
+    if (edge_refuse_enabled) {
+        unsigned long long chk = cspace->getEdgeRefuseChecks();
+        unsigned long long rej = cspace->getEdgeRefuseRejects();
+        unsigned long long hi  = cspace->getEdgeRefuseHiScores();
+        double ssum = cspace->getEdgeRefuseScoreSum();
+        std::cout << "\n[EdgeRefuse telemetry] checks=" << chk
+                  << "  rejects=" << rej
+                  << " (" << (chk ? 100.0*rej/chk : 0.0) << "%)"
+                  << "  mean_score=" << (chk ? ssum/chk : 0.0)
+                  << "  score>0.85: " << hi
+                  << " (" << (chk ? 100.0*hi/chk : 0.0) << "%)\n";
+    }
+
     // ---- 12. Final summary ----
     std::cout << "\n┌─────────────────────────────────────────────────────────────────────────┐\n"
               << "│  Benchmark complete                                                      │\n"
