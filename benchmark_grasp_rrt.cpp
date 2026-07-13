@@ -421,6 +421,7 @@ int main(int argc, char* argv[]) {
     // sample steering — angle-range cap on extension direction.
     bool  sample_steering_enabled         = false;
     bool  sample_steering_tensor          = false;  // --sample-steering-tensor: min-eigvec escape, no penetration skip
+    float sample_steering_overshoot       = 0.7f;   // --sample-steering-overshoot F: bend target = cos_cap*F (C)
     float sample_steering_envelope        = 0.05f;
     float sample_steering_cos_cap         = 0.866f;   // cos(30°)
     int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
@@ -524,6 +525,9 @@ int main(int argc, char* argv[]) {
         } else if (a == "--sample-steering-tensor") {
             sample_steering_enabled = true;
             sample_steering_tensor  = true;
+        } else if (a == "--sample-steering-overshoot" && i + 1 < argc) {
+            sample_steering_overshoot = std::max(0.05f, std::min(1.0f,
+                                  static_cast<float>(std::atof(argv[++i]))));
         } else if (a == "--sample-steering-envelope" && i + 1 < argc) {
             sample_steering_envelope = std::max(0.001f,
                                               static_cast<float>(std::atof(argv[++i])));
@@ -1125,6 +1129,7 @@ int main(int argc, char* argv[]) {
     config.extension_coin_flip = extension_coin_flip;    // ablation: stochastic switch vs deterministic blend
     config.sample_steering_enabled         = sample_steering_enabled;   // sample steering
     config.sample_steering_tensor          = sample_steering_tensor;
+    config.sample_steering_overshoot       = sample_steering_overshoot;
     config.sample_steering_envelope        = sample_steering_envelope;
     config.sample_steering_cos_cap         = sample_steering_cos_cap;
     config.sample_steering_k               = sample_steering_k;
@@ -1151,7 +1156,7 @@ int main(int argc, char* argv[]) {
     if (sample_steering_enabled) {
         std::cout << "[Setup] Sample steering ENABLED ("
                   << (sample_steering_tensor
-                        ? "TENSOR: min-eigvec escape, active during contact"
+                        ? "TENSOR: A+B+C — descent steering, hand+link6, overshoot"
                         : "legacy: dominant-eigvec cap, off at contact")
                   << "):\n"
                   << "        envelope        = " << sample_steering_envelope << " m\n"

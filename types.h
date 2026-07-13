@@ -208,12 +208,19 @@ struct GraspRrtConfig {
     bool  sample_steering_enabled       = false;
     float sample_steering_envelope      = 0.05f;   // 5 cm pre-contact shell
     float sample_steering_cos_cap       = 0.866f;  // cos(30°)
-    // Tensor variant (recommended): cap the full quadratic form
-    // s = sqrt(v^T M_hat v) and escape toward the MINIMUM eigenvector,
-    // with no penetration skip. Fixes the legacy dominant-eigenvector
-    // degeneracy and the switch-off-at-contact defect. When true,
-    // sample_steering_k / sample_steering_min_anisotropy are unused.
+    // Tensor variant (recommended): order-8 soft-max axial score with the
+    // unclamped depth-amplified weight, escape toward the MINIMUM
+    // eigenvector, no penetration skip. Fixes the legacy dominant-
+    // eigenvector degeneracy and the switch-off-at-contact defect. Also
+    // enables improvements A (grasp-descent steering) and B (link6 as a
+    // second steered sphere). When true, sample_steering_k /
+    // sample_steering_min_anisotropy are unused.
     bool  sample_steering_tensor        = false;
+    // Improvement C: bend target = cos_cap * overshoot. 1.0 = land exactly
+    // on the allowed-cone boundary (old behavior, systematically the
+    // least-radial acceptable motion); 0.7 = land inside the cone,
+    // mimicking the interior-average that rejection resampling achieves.
+    float sample_steering_overshoot     = 0.7f;
 
     // Multi-branch handling: aggregate the K nearest branches inside envelope
     // into a structure tensor M = Σ wᵢ âᵢ âᵢᵀ, then bias against M's dominant

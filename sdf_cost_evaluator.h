@@ -1187,119 +1187,221 @@ public:
     //      measure). Here contact simply saturates the smoothstep weight
     //      at 1, same convention as buildLocalAxisTensor / edge refuse.
     //
-    // Cap semantics: with proximity gate g = min(1, sum_w),
-    //     s_eff(v) = g * sqrt(v_hat^T M_hat v_hat)
-    // and the bend enforces s_eff <= cos_cap by blending v_hat toward the
-    // minimum eigenvector (sign-aligned with v_hat), with the minimal
-    // blend found by bisection. Single dominant branch reduces to the
-    // legacy behavior: s_eff -> w * |cos theta|, and any perpendicular
-    // direction is an eigenvector with eigenvalue 0.
+    // Cap semantics (v3): s_eff(v) = order-8 soft-max of (W_i * |v . a_i|)
+    // with the UNCLAMPED legacy weight — identical scoring to tensor edge
+    // refuse. Trigger when s_eff > cos_cap; bend toward the minimum
+    // eigenvector until s_eff = cos_cap * overshoot (Improvement C).
+    // Improvements A (descent steering, see steerWorkspaceDelta) and
+    // B (second sphere) are documented at their definitions below.
     //
     // NOTE: near an eigenvalue tie (lambda_min ~ lambda_mid) the minimum
     // eigenvector can rotate quickly. Unlike the argmax flip this is
     // benign: the two candidate directions score EQUALLY (the penalty is
     // flat between them), so motion quality is unaffected either way.
     // ------------------------------------------------------------------
-    bool applySamplingBiasTensor(const Eigen::VectorXf& q_near,
-                                 Eigen::VectorXf& q_step_dir,
-                                 const Eigen::MatrixXf& J_EE,
-                                 float envelope,
-                                 float cos_cap) const {
-        if (!sdf_built_) return false;
-        if (q_near.size() != q_step_dir.size()) return false;
-        if (J_EE.rows() != 3 || J_EE.cols() != q_near.size()) return false;
-        if (envelope <= 0.0f || cylinders_.empty()) return false;
+    // ---- shared steering core -------------------------------------------
 
-        // EE reference sphere: panda_hand at offset (0,0,0).
-        // Caller has already set the robot to q_near.
-        Eigen::Vector3f p_ee = Eigen::Vector3f::Zero();
-        float ee_radius = 0.06f;
-        bool found_ee = false;
-        for (const auto& rs : spheres_) {
-            if (rs.link_name == "panda_hand" && rs.offset.norm() < 1e-4f) {
-                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
-                p_ee = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
-                ee_radius = rs.radius;
-                found_ee = true;
-                break;
-            }
-        }
-        if (!found_ee) return false;
+    struct WAxis { float w; Eigen::Vector3f a; };
 
-        // In-envelope branch list at p_ee. NO penetration skip; the legacy
-        // UNCLAMPED weight W = 1 − d/envelope grows past 1 inside contact,
-        // so depth tightens the allowed cone (same convention as tensor
-        // edge refuse — see computeEdgeAxialScoreTensor design history).
-        struct WAxis { float w; Eigen::Vector3f a; };
-        std::vector<WAxis> axes;
-        axes.reserve(cylinders_.size());
+    // Collect in-envelope branch axes at a body point. Legacy UNCLAMPED
+    // weight W = 1 − d/envelope (> 1 inside contact: depth tightens the
+    // cone; same convention as tensor edge refuse). No penetration skip.
+    bool collectSteeringAxes(const Eigen::Vector3f& p_body,
+                             float body_radius,
+                             float envelope,
+                             std::vector<WAxis>& axes,
+                             Eigen::Matrix3f& M) const {
+        axes.clear();
+        M.setZero();
         float w_sum = 0.0f;
-        Eigen::Matrix3f M = Eigen::Matrix3f::Zero();
         for (const auto& cyl : cylinders_) {
             if (cyl.exclude_from_aniso) continue;
             if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
-            float d = distToCylinder(p_ee, cyl) - ee_radius;
+            float d = distToCylinder(p_body, cyl) - body_radius;
             if (d >= envelope) continue;
             float W = 1.0f - d / envelope;   // UNCLAMPED: > 1 inside
             axes.push_back({W, cyl.axis_unit});
             M.noalias() += W * (cyl.axis_unit * cyl.axis_unit.transpose());
             w_sum += W;
         }
-        if (w_sum < 1e-6f) return false;
+        return w_sum > 1e-6f;
+    }
 
-        // Workspace direction of the proposed step.
-        Eigen::Vector3f v = J_EE * q_step_dir;
-        float v_norm = v.norm();
-        if (v_norm < 1e-6f) return false;
-        Eigen::Vector3f v_hat = v / v_norm;
+    // Order-8 soft-max axial score (identical to tensor edge refuse).
+    static float softmaxAxialScore(const std::vector<WAxis>& axes,
+                                   const Eigen::Vector3f& u) {
+        float acc = 0.0f;
+        for (const auto& wa : axes) {
+            float s1 = wa.w * std::abs(u.dot(wa.a));
+            float s2 = s1 * s1, s4 = s2 * s2;
+            acc += s4 * s4;                  // (W c)^8
+        }
+        return std::sqrt(std::sqrt(std::sqrt(acc)));
+    }
 
-        // Unnormalized order-8 soft-max, identical to tensor edge refuse.
-        auto s_eff = [&](const Eigen::Vector3f& u) {
-            float acc = 0.0f;
-            for (const auto& wa : axes) {
-                float s1 = wa.w * std::abs(u.dot(wa.a));
-                float s2 = s1 * s1, s4 = s2 * s2;
-                acc += s4 * s4;                  // (W c)^8
-            }
-            return std::sqrt(std::sqrt(std::sqrt(acc)));
-        };
-        if (s_eff(v_hat) <= cos_cap) return false;   // already radial enough
+    // Bend unit direction v_hat toward the min-eigenvector of M until the
+    // soft-max score drops to `target`. Improvement C: target < trigger,
+    // so the bent motion lands INSIDE the allowed cone instead of exactly
+    // on its boundary (which the minimal bend used to do — systematically
+    // producing the least-radial acceptable motion).
+    // Returns false when v_hat already scores <= trigger.
+    bool bendDirection(const std::vector<WAxis>& axes,
+                       const Eigen::Matrix3f& M,
+                       const Eigen::Vector3f& v_hat,
+                       float trigger, float target,
+                       Eigen::Vector3f& u_out) const {
+        if (softmaxAxialScore(axes, v_hat) <= trigger) return false;
 
-        // Escape direction: minimum eigenvector of the ORDER-2 tensor —
-        // the mean IS the right semantics for picking a best direction
-        // (least axial to all branches on weighted average).
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M / w_sum);
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M);
         if (es.info() != Eigen::Success) return false;
-        Eigen::Vector3f e_min = es.eigenvectors().col(0);
-        if (v_hat.dot(e_min) < 0.0f) e_min = -e_min;   // stay on v's side
+        Eigen::Vector3f e_min = es.eigenvectors().col(0);   // ascending
+        if (v_hat.dot(e_min) < 0.0f) e_min = -e_min;        // stay on v's side
 
-        // Minimal blend beta: s_eff(normalize((1-beta) v_hat + beta e_min))
-        // = cos_cap. If even e_min violates the cap (axial in every
-        // direction), bend fully to e_min — the best achievable.
         float beta = 1.0f;
-        if (s_eff(e_min) < cos_cap) {
+        if (softmaxAxialScore(axes, e_min) < target) {
             float lo = 0.0f, hi = 1.0f;
             for (int it = 0; it < 20; ++it) {
                 float mid = 0.5f * (lo + hi);
                 Eigen::Vector3f u = (1.0f - mid) * v_hat + mid * e_min;
                 float un = u.norm();
                 if (un < 1e-9f) { lo = mid; continue; }
-                if (s_eff(u / un) > cos_cap) lo = mid; else hi = mid;
+                if (softmaxAxialScore(axes, u / un) > target) lo = mid;
+                else hi = mid;
             }
             beta = hi;
         }
         Eigen::Vector3f u = (1.0f - beta) * v_hat + beta * e_min;
         float un = u.norm();
         if (un < 1e-9f) return false;
-        u /= un;
+        u_out = u / un;
+        return true;
+    }
 
-        // Map the workspace correction back to joint space with a damped
-        // least-squares step: dq = J^T (J J^T + eps I)^-1 dv, preserving
-        // the original workspace speed |v|. Caller renormalizes q_step_dir.
+    // Steer the motion of one body point in joint space via its Jacobian.
+    bool steerPointAgainstAxes(const Eigen::Vector3f& p_body,
+                               float body_radius,
+                               const Eigen::MatrixXf& J_point,
+                               Eigen::VectorXf& q_step_dir,
+                               float envelope,
+                               float trigger, float target) const {
+        std::vector<WAxis> axes;
+        Eigen::Matrix3f M;
+        if (!collectSteeringAxes(p_body, body_radius, envelope, axes, M))
+            return false;
+
+        Eigen::Vector3f v = J_point * q_step_dir;
+        float v_norm = v.norm();
+        if (v_norm < 1e-6f) return false;
+        Eigen::Vector3f v_hat = v / v_norm;
+
+        Eigen::Vector3f u;
+        if (!bendDirection(axes, M, v_hat, trigger, target, u)) return false;
+
+        // Damped least-squares mapping back to joint space, preserving the
+        // original workspace speed. Caller renormalizes q_step_dir.
         Eigen::Vector3f dv = (u - v_hat) * v_norm;
-        Eigen::Matrix3f JJt = J_EE * J_EE.transpose()
+        Eigen::Matrix3f JJt = J_point * J_point.transpose()
                             + 1e-6f * Eigen::Matrix3f::Identity();
-        q_step_dir += J_EE.transpose() * JJt.ldlt().solve(dv);
+        q_step_dir += J_point.transpose() * JJt.ldlt().solve(dv);
+        return true;
+    }
+
+    // applySamplingBiasTensor — tensor sample steering, improvements B + C.
+    //   B: steers BOTH engagement spheres (panda_hand via the caller's
+    //      cached Jacobian, panda_link6 via its own sphere Jacobian) in a
+    //      sequential one-pass bend. The two bends can perturb each other
+    //      slightly; a fixed-point iteration is not worth the cost since
+    //      both pull toward the same min-eigenvector family.
+    //   C: bend target = cos_cap * overshoot (default 0.7) — motions land
+    //      inside the allowed cone, mimicking the interior-average that
+    //      rejection resampling achieves. Trigger stays at cos_cap.
+    bool applySamplingBiasTensor(const Eigen::VectorXf& q_near,
+                                 Eigen::VectorXf& q_step_dir,
+                                 const Eigen::MatrixXf& J_EE,
+                                 float envelope,
+                                 float cos_cap,
+                                 float overshoot = 1.0f) const {
+        if (!sdf_built_) return false;
+        if (q_near.size() != q_step_dir.size()) return false;
+        if (J_EE.rows() != 3 || J_EE.cols() != q_near.size()) return false;
+        if (envelope <= 0.0f || cylinders_.empty()) return false;
+
+        const float target =
+            cos_cap * std::max(0.05f, std::min(1.0f, overshoot));
+        bool applied = false;
+
+        // Sphere 1: panda_hand (caller's cached Jacobian).
+        for (const auto& rs : spheres_) {
+            if (rs.link_name == "panda_hand" && rs.offset.norm() < 1e-4f) {
+                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+                Eigen::Vector3f p = pose.block<3,1>(0,3)
+                                  + pose.block<3,3>(0,0) * rs.offset;
+                applied |= steerPointAgainstAxes(
+                    p, rs.radius, J_EE, q_step_dir, envelope, cos_cap, target);
+                break;
+            }
+        }
+
+        // Sphere 2 (Improvement B): panda_link6, own Jacobian.
+        for (const auto& rs : spheres_) {
+            if (rs.link_name == "panda_link6" && rs.offset.norm() < 1e-4f) {
+                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+                Eigen::Vector3f p = pose.block<3,1>(0,3)
+                                  + pose.block<3,3>(0,0) * rs.offset;
+                grasp_rrt::MatrixXf J6;
+                auto panda = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
+                if (panda) {
+                    J6 = panda->computeSphereJacobianDirect(rs.frame_id,
+                                                            rs.offset);
+                } else {
+                    robot_->prepareJacobians();
+                    J6 = robot_->computeSphereJacobianById(rs.frame_id,
+                                                           rs.offset);
+                }
+                applied |= steerPointAgainstAxes(
+                    p, rs.radius, J6, q_step_dir, envelope, cos_cap, target);
+                break;
+            }
+        }
+        return applied;
+    }
+
+    // steerWorkspaceDelta — Improvement A: steer the GRASP DESCENT.
+    // moveTowardsGoal's DiffIK steps were previously unguided (steering
+    // acted only in tree extension), yet the descent produces the deepest
+    // contact — exactly where the penetration-weighted metric accumulates.
+    // Bends the workspace position delta dp of one descent step. Pure
+    // workspace operation, no Jacobian: DiffIK converts afterwards.
+    // Goal-progress guard: if the bent step no longer moves toward the
+    // grasp target, the ORIGINAL dp is kept — steering yields to task
+    // completion, so the descent cannot be stalled by the bias.
+    bool steerWorkspaceDelta(const Eigen::Vector3f& p_body,
+                             float body_radius,
+                             Eigen::Vector3f& dp,
+                             float envelope,
+                             float cos_cap,
+                             float overshoot,
+                             const Eigen::Vector3f& goal_dir) const {
+        if (!sdf_built_ || cylinders_.empty() || envelope <= 0.0f)
+            return false;
+        float dp_norm = dp.norm();
+        if (dp_norm < 1e-9f) return false;
+
+        std::vector<WAxis> axes;
+        Eigen::Matrix3f M;
+        if (!collectSteeringAxes(p_body, body_radius, envelope, axes, M))
+            return false;
+
+        const float target =
+            cos_cap * std::max(0.05f, std::min(1.0f, overshoot));
+        Eigen::Vector3f u;
+        if (!bendDirection(axes, M, dp / dp_norm, cos_cap, target, u))
+            return false;
+
+        if (goal_dir.squaredNorm() > 1e-12f && u.dot(goal_dir) <= 0.0f)
+            return false;   // would stall the descent — keep original
+
+        dp = u * dp_norm;
         return true;
     }
 

@@ -710,7 +710,8 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
                 ? sdf_eval->applySamplingBiasTensor(
                       q_near, q_step_dir, J_EE,
                       config_.sample_steering_envelope,
-                      config_.sample_steering_cos_cap)
+                      config_.sample_steering_cos_cap,
+                      config_.sample_steering_overshoot)
                 : sdf_eval->applySamplingBias(
                       q_near, q_step_dir, J_EE,
                       config_.sample_steering_envelope,
@@ -1207,6 +1208,31 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
     // 计算 delta
     Matrix4f delta_pose = goal_pose * current_pose.inverse();
     delta_pose.block<3,1>(0, 3) = goal_pose.block<3,1>(0, 3) - current_pose.block<3,1>(0, 3);
+
+    // ---- Sample steering, Improvement A: steer the grasp descent ----
+    // The DiffIK descent was previously unguided by steering, yet it
+    // produces the deepest branch contact (which dominates the
+    // penetration-weighted axial metric). Bend the workspace position
+    // delta away from nearby branch axes; the goal-progress guard inside
+    // steerWorkspaceDelta keeps the original step whenever bending would
+    // stall convergence toward the grasp pose.
+    if (config_.sample_steering_enabled && config_.sample_steering_tensor) {
+        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval) {
+            Vector3f p_ee     = current_pose.block<3,1>(0, 3);
+            Vector3f dp       = delta_pose.block<3,1>(0, 3);
+            Vector3f goal_dir = goal_pose.block<3,1>(0, 3) - p_ee;
+            if (sdf_eval->steerWorkspaceDelta(
+                    p_ee, /*body_radius=*/0.06f, dp,
+                    config_.sample_steering_envelope,
+                    config_.sample_steering_cos_cap,
+                    config_.sample_steering_overshoot,
+                    goal_dir)) {
+                delta_pose.block<3,1>(0, 3) = dp;
+            }
+        }
+    }
 
     // 限制步长
     delta_pose = limitWorkspaceStep(delta_pose);
