@@ -177,15 +177,19 @@ struct GraspRrtConfig {
     //                   50% probability q_step_dir = vf_dir     (pure VF)
     bool extension_coin_flip = false;
 
-    // ---- Branch anisotropy (Option A) ----
-    // Adds an axial drag in addition to the existing radial push-out.
-    // Active only when a robot collision sphere is in branch contact (penetration > 0).
+    // ---- Branch anisotropy (Option A) — DISABLED (dormant) ----
+    // Axial drag force on top of the radial push-out:
     //   F_drag = −K_ax · penetration · (v · â) â   (workspace, mapped via J^T)
-    // where â is the unit axis of the nearest branch and v is the intended
-    // extension direction. The drag is non-conservative + velocity-dependent —
-    // the only construction able to express motion-direction anisotropy.
-    // 0.0 = isotropic legacy behavior (back-compat). Recommended: K_ax ≈ 600
-    // (≈ 3× the existing radial coefficient K_rad ≈ 200).
+    // where â comes from findNearestCylinderAxis — a single-nearest-branch
+    // argmin that has NOT been retargeted onto the structure tensor. With a
+    // discrete â the force field chatters at branch handoffs, the same
+    // defect the tensor removed from edge refuse.
+    //
+    // Status: K_ax = 0 in every current experiment (drag path never runs;
+    // the radial repulsion in evaluateAnisotropicForce is unaffected).
+    // The --branch-aniso CLI flag errors out. If Option A is ever revived,
+    // retarget it first: F_drag = −K_ax · pen · (M̂ · v) using
+    // buildLocalAxisTensor. MUST stay 0.0 until then.
     float branch_anisotropy_K_ax        = 0.0f;
 
     // ---- Sample steering ( angle-range cap on extension direction) ----

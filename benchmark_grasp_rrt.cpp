@@ -444,8 +444,18 @@ int main(int argc, char* argv[]) {
             num_threads = std::max(1, std::atoi(argv[++i]));
         } else if (a == "--or-parallel" && i + 1 < argc) {
             or_parallel_K = std::max(1, std::atoi(argv[++i]));
-        } else if (a == "--branch-aniso" && i + 1 < argc) {
-            branch_aniso_K_ax = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--branch-aniso") {
+            // Option A (axial drag force) is disabled: dormant in all current
+            // experiments (K_ax = 0), and its axis source is still the
+            // single-nearest-branch argmin — NOT retargeted onto the
+            // structure tensor. Reviving it without that retarget would
+            // reintroduce a chattering force field. The radial repulsion
+            // (same function, K_ax = 0 path) is unaffected.
+            std::cerr << "ERROR: --branch-aniso is DISABLED (Option A dormant).\n"
+                      << "       Anisotropy is handled by --edge-refuse-tensor.\n"
+                      << "       If Option A is ever revived, retarget its axis\n"
+                      << "       onto buildLocalAxisTensor first.\n";
+            return 1;
         } else if (a == "--no-trajopt") {
             trajopt_enabled = false;
         } else if (a == "--dense-twigs") {
