@@ -655,20 +655,26 @@ int main(int argc, char* argv[]) {
 
     // ---- Sparse-long variant of the standard 10-branch scene ----
     // Same trunk / apple / overhead; branches spread wider (vertical
-    // spacing 0.15 -> 0.20 m, angular gaps widened) and ~1.7x longer
-    // (0.30-0.40 -> 0.55-0.70 m). Fewer envelope overlaps per point but
+    // spacing 0.15 -> 0.20 m, angular gaps widened) and longer
+    // (0.30-0.40 -> 0.55-0.60 m). Fewer envelope overlaps per point but
     // each branch shields a longer corridor — the regime where the robot
     // must cross individual branches cleanly rather than thread a dense
     // mat.
+    //
+    // The two angle-π branches are capped at 0.60 m (not 0.70): at 0.70
+    // their tips reach past the robot base (x ≈ −0.08), so random starts
+    // could begin deep inside a branch envelope — branches are SDF-only,
+    // invisible to the hard-collision start-validity check — inflating
+    // the contact metrics before planning does anything.
     if (sparse_long_scene) {
         scene.branches = {
-            {0.60f, 3.1415f, 0.70f, 0.03f}, {0.60f, 2.40f, 0.55f, 0.03f}, {0.60f, 3.88f, 0.55f, 0.03f},
+            {0.60f, 3.1415f, 0.60f, 0.03f}, {0.60f, 2.40f, 0.55f, 0.03f}, {0.60f, 3.88f, 0.55f, 0.03f},
             {0.80f, 2.55f, 0.60f, 0.03f},   {0.80f, 3.73f, 0.60f, 0.03f},
             {0.80f, 1.90f, 0.55f, 0.03f},   {0.80f, 4.38f, 0.55f, 0.03f},
-            {1.00f, 3.1415f, 0.70f, 0.03f}, {1.00f, 2.40f, 0.55f, 0.03f}, {1.00f, 3.88f, 0.55f, 0.03f}
+            {1.00f, 3.1415f, 0.60f, 0.03f}, {1.00f, 2.40f, 0.55f, 0.03f}, {1.00f, 3.88f, 0.55f, 0.03f}
         };
         std::cout << "[Setup] --sparse-long: 10 branches, heights {0.60, 0.80, 1.00}, "
-                  << "lengths 0.55-0.70 m, widened angular gaps\n";
+                  << "lengths 0.55-0.60 m, widened angular gaps\n";
     }
 
     // ---- tree6 scene override: relocate apple, replace standard scene ----
