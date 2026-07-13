@@ -208,6 +208,12 @@ struct GraspRrtConfig {
     bool  sample_steering_enabled       = false;
     float sample_steering_envelope      = 0.05f;   // 5 cm pre-contact shell
     float sample_steering_cos_cap       = 0.866f;  // cos(30°)
+    // Tensor variant (recommended): cap the full quadratic form
+    // s = sqrt(v^T M_hat v) and escape toward the MINIMUM eigenvector,
+    // with no penetration skip. Fixes the legacy dominant-eigenvector
+    // degeneracy and the switch-off-at-contact defect. When true,
+    // sample_steering_k / sample_steering_min_anisotropy are unused.
+    bool  sample_steering_tensor        = false;
 
     // Multi-branch handling: aggregate the K nearest branches inside envelope
     // into a structure tensor M = Σ wᵢ âᵢ âᵢᵀ, then bias against M's dominant

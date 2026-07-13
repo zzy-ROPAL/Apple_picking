@@ -706,12 +706,17 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
             const MatrixXf& J_EE = getOrComputeEEJacobian(nn->getId(), q_near);
             // Ensure robot is at q_near so SDF / axis lookup matches.
             robot_->setJointValues(q_near);
-            bool applied = sdf_eval->applySamplingBias(
-                q_near, q_step_dir, J_EE,
-                config_.sample_steering_envelope,
-                config_.sample_steering_cos_cap,
-                config_.sample_steering_k,
-                config_.sample_steering_min_anisotropy);
+            bool applied = config_.sample_steering_tensor
+                ? sdf_eval->applySamplingBiasTensor(
+                      q_near, q_step_dir, J_EE,
+                      config_.sample_steering_envelope,
+                      config_.sample_steering_cos_cap)
+                : sdf_eval->applySamplingBias(
+                      q_near, q_step_dir, J_EE,
+                      config_.sample_steering_envelope,
+                      config_.sample_steering_cos_cap,
+                      config_.sample_steering_k,
+                      config_.sample_steering_min_anisotropy);
             if (applied && q_step_dir.norm() > 1e-6f) {
                 q_step_dir.normalize();
             }

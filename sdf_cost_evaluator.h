@@ -1136,6 +1136,123 @@ public:
         return any_bias_applied;
     }
 
+    // ------------------------------------------------------------------
+    // applySamplingBiasTensor — sample steering on the structure tensor
+    //
+    // Fixes the two defects of applySamplingBias (kept above as the
+    // legacy / ablation arm):
+    //
+    //  (1) WRONG EIGENVECTOR. The legacy version caps against the DOMINANT
+    //      eigenvector of M. With one branch that equals the branch axis;
+    //      with two non-parallel branches lambda_1 ~ lambda_2 ties and the
+    //      dominant eigenvector is numerically arbitrary within their span
+    //      — the bias steers against a fictitious direction and can itself
+    //      oscillate. Here the FULL quadratic form
+    //          s(v) = sqrt(v^T M_hat v)
+    //      is capped — every branch constrains the motion simultaneously —
+    //      and the escape direction is the MINIMUM eigenvector: the
+    //      direction least axial to ALL nearby branches at once.
+    //
+    //  (2) PENETRATION SKIP. The legacy version returns false the moment
+    //      the EE touches a branch — switching off exactly where guidance
+    //      matters most (and exactly the regime the axial metrics
+    //      measure). Here contact simply saturates the smoothstep weight
+    //      at 1, same convention as buildLocalAxisTensor / edge refuse.
+    //
+    // Cap semantics: with proximity gate g = min(1, sum_w),
+    //     s_eff(v) = g * sqrt(v_hat^T M_hat v_hat)
+    // and the bend enforces s_eff <= cos_cap by blending v_hat toward the
+    // minimum eigenvector (sign-aligned with v_hat), with the minimal
+    // blend found by bisection. Single dominant branch reduces to the
+    // legacy behavior: s_eff -> w * |cos theta|, and any perpendicular
+    // direction is an eigenvector with eigenvalue 0.
+    //
+    // NOTE: near an eigenvalue tie (lambda_min ~ lambda_mid) the minimum
+    // eigenvector can rotate quickly. Unlike the argmax flip this is
+    // benign: the two candidate directions score EQUALLY (the penalty is
+    // flat between them), so motion quality is unaffected either way.
+    // ------------------------------------------------------------------
+    bool applySamplingBiasTensor(const Eigen::VectorXf& q_near,
+                                 Eigen::VectorXf& q_step_dir,
+                                 const Eigen::MatrixXf& J_EE,
+                                 float envelope,
+                                 float cos_cap) const {
+        if (!sdf_built_) return false;
+        if (q_near.size() != q_step_dir.size()) return false;
+        if (J_EE.rows() != 3 || J_EE.cols() != q_near.size()) return false;
+        if (envelope <= 0.0f || cylinders_.empty()) return false;
+
+        // EE reference sphere: panda_hand at offset (0,0,0).
+        // Caller has already set the robot to q_near.
+        Eigen::Vector3f p_ee = Eigen::Vector3f::Zero();
+        float ee_radius = 0.06f;
+        bool found_ee = false;
+        for (const auto& rs : spheres_) {
+            if (rs.link_name == "panda_hand" && rs.offset.norm() < 1e-4f) {
+                Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+                p_ee = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
+                ee_radius = rs.radius;
+                found_ee = true;
+                break;
+            }
+        }
+        if (!found_ee) return false;
+
+        // Local axis tensor. NO penetration skip: contact means w = 1.
+        float w_sum = 0.0f;
+        Eigen::Matrix3f M = buildLocalAxisTensor(p_ee, ee_radius, envelope,
+                                                 &w_sum);
+        if (w_sum < 1e-6f) return false;
+        Eigen::Matrix3f M_hat = M / w_sum;
+
+        // Workspace direction of the proposed step.
+        Eigen::Vector3f v = J_EE * q_step_dir;
+        float v_norm = v.norm();
+        if (v_norm < 1e-6f) return false;
+        Eigen::Vector3f v_hat = v / v_norm;
+
+        const float g = std::min(1.0f, w_sum);   // proximity gate
+        auto s_eff = [&](const Eigen::Vector3f& u) {
+            return g * std::sqrt(std::max(0.0f, u.dot(M_hat * u)));
+        };
+        if (s_eff(v_hat) <= cos_cap) return false;   // already radial enough
+
+        // Escape direction: minimum eigenvector (Eigen sorts ascending).
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M_hat);
+        if (es.info() != Eigen::Success) return false;
+        Eigen::Vector3f e_min = es.eigenvectors().col(0);
+        if (v_hat.dot(e_min) < 0.0f) e_min = -e_min;   // stay on v's side
+
+        // Minimal blend beta: s_eff(normalize((1-beta) v_hat + beta e_min))
+        // = cos_cap. If even e_min violates the cap (axial in every
+        // direction), bend fully to e_min — the best achievable.
+        float beta = 1.0f;
+        if (s_eff(e_min) < cos_cap) {
+            float lo = 0.0f, hi = 1.0f;
+            for (int it = 0; it < 20; ++it) {
+                float mid = 0.5f * (lo + hi);
+                Eigen::Vector3f u = (1.0f - mid) * v_hat + mid * e_min;
+                float un = u.norm();
+                if (un < 1e-9f) { lo = mid; continue; }
+                if (s_eff(u / un) > cos_cap) lo = mid; else hi = mid;
+            }
+            beta = hi;
+        }
+        Eigen::Vector3f u = (1.0f - beta) * v_hat + beta * e_min;
+        float un = u.norm();
+        if (un < 1e-9f) return false;
+        u /= un;
+
+        // Map the workspace correction back to joint space with a damped
+        // least-squares step: dq = J^T (J J^T + eps I)^-1 dv, preserving
+        // the original workspace speed |v|. Caller renormalizes q_step_dir.
+        Eigen::Vector3f dv = (u - v_hat) * v_norm;
+        Eigen::Matrix3f JJt = J_EE * J_EE.transpose()
+                            + 1e-6f * Eigen::Matrix3f::Identity();
+        q_step_dir += J_EE.transpose() * JJt.ldlt().solve(dv);
+        return true;
+    }
+
     // 查询某世界坐标点的原始 SDF 值（用于可视化/调试）
     float querySdf(const Eigen::Vector3f& p) const {
         if (!sdf_built_) return std::numeric_limits<float>::max();

@@ -404,6 +404,7 @@ int main(int argc, char* argv[]) {
     float tree6_apple_frac  = 0.95f;  // --apple-frac F: fraction along the 5th branch arclength (0=root, 1=tip)
     float branch_rscale     = 1.0f;   // --branch-rscale S: multiply every tree6 branch radius by S (2=double). Apple offset tracks the scaled apple-branch radius.
     bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing sticky-winner. Branch A along x̂ above apple, branch B along ẑ in front of apple.
+    bool sparse_long_scene  = false;  // --sparse-long: standard 10-branch scene with wider vertical/angular spacing and ~1.7x longer branches
     bool xgate_scene        = false;  // --xgate: multi-branch scene = V6 rigid A + two CROSSED soft branches (B1 ŷ, B2 x̂) whose 5cm envelopes overlap on the approach corridor. Tests MAX-vs-winner oscillation.
     bool sticky_edge_refuse_enabled = false;  // --sticky-edge-refuse: enable sticky-winner edge refuse (hysteresis + probabilistic edge refuse using single MAX-scored winner)
     bool sticky_sample_steering_enabled   = false;  // --sticky-sample-steering: enable sticky-winner F (hysteresis + deterministic direction bending using single MAX-scored winner)
@@ -419,6 +420,7 @@ int main(int argc, char* argv[]) {
 
     // sample steering — angle-range cap on extension direction.
     bool  sample_steering_enabled         = false;
+    bool  sample_steering_tensor          = false;  // --sample-steering-tensor: min-eigvec escape, no penetration skip
     float sample_steering_envelope        = 0.05f;
     float sample_steering_cos_cap         = 0.866f;   // cos(30°)
     int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
@@ -481,6 +483,8 @@ int main(int argc, char* argv[]) {
             branch_rscale = std::max(0.1f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--diag-scene") {
             diag_scene = true;
+        } else if (a == "--sparse-long") {
+            sparse_long_scene = true;
         } else if (a == "--xgate") {
             xgate_scene = true;
             diag_scene  = true;   // reuse diag apple/overhead override + geometry gating
@@ -517,6 +521,9 @@ int main(int argc, char* argv[]) {
             edge_refuse_k = std::max(1, std::atoi(argv[++i]));
         } else if (a == "--sample-steering") {
             sample_steering_enabled = true;
+        } else if (a == "--sample-steering-tensor") {
+            sample_steering_enabled = true;
+            sample_steering_tensor  = true;
         } else if (a == "--sample-steering-envelope" && i + 1 < argc) {
             sample_steering_envelope = std::max(0.001f,
                                               static_cast<float>(std::atof(argv[++i])));
@@ -640,6 +647,24 @@ int main(int argc, char* argv[]) {
         scene.apple_pos = Vector3f(0.42f, -0.20f, 0.95f);
         scene.overhead.center = Vector3f(100.0f, 100.0f, 100.0f);
         scene.overhead.radius = 0.001f;
+    }
+
+    // ---- Sparse-long variant of the standard 10-branch scene ----
+    // Same trunk / apple / overhead; branches spread wider (vertical
+    // spacing 0.15 -> 0.20 m, angular gaps widened) and ~1.7x longer
+    // (0.30-0.40 -> 0.55-0.70 m). Fewer envelope overlaps per point but
+    // each branch shields a longer corridor — the regime where the robot
+    // must cross individual branches cleanly rather than thread a dense
+    // mat.
+    if (sparse_long_scene) {
+        scene.branches = {
+            {0.60f, 3.1415f, 0.70f, 0.03f}, {0.60f, 2.40f, 0.55f, 0.03f}, {0.60f, 3.88f, 0.55f, 0.03f},
+            {0.80f, 2.55f, 0.60f, 0.03f},   {0.80f, 3.73f, 0.60f, 0.03f},
+            {0.80f, 1.90f, 0.55f, 0.03f},   {0.80f, 4.38f, 0.55f, 0.03f},
+            {1.00f, 3.1415f, 0.70f, 0.03f}, {1.00f, 2.40f, 0.55f, 0.03f}, {1.00f, 3.88f, 0.55f, 0.03f}
+        };
+        std::cout << "[Setup] --sparse-long: 10 branches, heights {0.60, 0.80, 1.00}, "
+                  << "lengths 0.55-0.70 m, widened angular gaps\n";
     }
 
     // ---- tree6 scene override: relocate apple, replace standard scene ----
@@ -1099,6 +1124,7 @@ int main(int argc, char* argv[]) {
     config.branch_anisotropy_K_ax = branch_aniso_K_ax;   // Option A: axial drag on/off
     config.extension_coin_flip = extension_coin_flip;    // ablation: stochastic switch vs deterministic blend
     config.sample_steering_enabled         = sample_steering_enabled;   // sample steering
+    config.sample_steering_tensor          = sample_steering_tensor;
     config.sample_steering_envelope        = sample_steering_envelope;
     config.sample_steering_cos_cap         = sample_steering_cos_cap;
     config.sample_steering_k               = sample_steering_k;
@@ -1123,15 +1149,21 @@ int main(int argc, char* argv[]) {
         std::cerr << "WARN: both --sticky-sample-steering and --sticky-edge-refuse set; sticky-sample-steering takes precedence.\n";
     }
     if (sample_steering_enabled) {
-        std::cout << "[Setup] Sample steering (structure tensor) ENABLED:\n"
+        std::cout << "[Setup] Sample steering ENABLED ("
+                  << (sample_steering_tensor
+                        ? "TENSOR: min-eigvec escape, active during contact"
+                        : "legacy: dominant-eigvec cap, off at contact")
+                  << "):\n"
                   << "        envelope        = " << sample_steering_envelope << " m\n"
                   << "        cos_cap         = " << sample_steering_cos_cap
                   << " (min angle ≈ "
                   << static_cast<int>(std::acos(sample_steering_cos_cap) * 180.0f / M_PI)
-                  << "° off axis)\n"
-                  << "        K nearest       = " << sample_steering_k << "\n"
-                  << "        min anisotropy  = " << sample_steering_min_anisotropy
-                  << " (skip if (λmax−λmin)/λmax below)\n";
+                  << "° off axis)\n";
+        if (!sample_steering_tensor) {
+            std::cout << "        K nearest       = " << sample_steering_k << "\n"
+                      << "        min anisotropy  = " << sample_steering_min_anisotropy
+                      << " (skip if (λmax−λmin)/λmax below)\n";
+        }
     }
 
     // ---- 9. Output directory ----
