@@ -221,6 +221,11 @@ struct GraspRrtConfig {
     // least-radial acceptable motion); 0.7 = land inside the cone,
     // mimicking the interior-average that rejection resampling achieves.
     float sample_steering_overshoot     = 0.7f;
+    // Change 1(sticky escape sign,仅 tensor 转向):±e_min 得分严格
+    // 相等,旧规则用含噪提议方向定向导致逐周期符号抛硬币(之字形来源
+    // 之一)。开启后箭头沿树父子链/下探步序继承,平局裁决保持一致。
+    // 零质量代价 —— 与 sticky winner(不等分选项间的滞回)本质不同。
+    bool  sample_steering_sticky_sign   = false;
 
     // Multi-branch handling: aggregate the K nearest branches inside envelope
     // into a structure tensor M = Σ wᵢ âᵢ âᵢᵀ, then bias against M's dominant

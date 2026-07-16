@@ -299,10 +299,13 @@ public:
         robot_->setJointValues(q);
         double axial_acc = 0.0, total_acc = 0.0;
 
-        for (const auto& rs : spheres_) {
-            if (engagement_only &&
-                rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
-                continue;
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            const auto& rs = spheres_[k];
+            // engagement_only 现跟随规划目标球集(erSphereActive):默认
+            // hand+link6;--er-links 自定义时按自定义集合计。注意:这使
+            // axial_ee 变成"规划器是否保护了自己的目标"的自评指标,
+            // 不同球集的 arm 之间不再直接可比。
+            if (engagement_only && !erSphereActive(k)) continue;
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
             Eigen::Vector3f p = pose.block<3,1>(0,3)
                               + pose.block<3,3>(0,0) * rs.offset;
@@ -641,6 +644,36 @@ public:
     //      (1.09x for two equal contributors) — conservative, and
     //      selection-free: no argmax, nothing flips at branch handoff.
     // ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 自定义 tensor edge refuse 的计分球集合(实验用)
+    //
+    // sel = {链接名, 该链接上第几个球(0 起,按 addRobotSphere 顺序)}。
+    // 必须在所有 addRobotSphere 之后调用;空集合 = 恢复默认
+    // (panda_hand + panda_link6 的全部球)。只影响 tensor 模式;
+    // legacy MAX 模式仍固定 hand+link6。
+    // ------------------------------------------------------------------
+    void setEdgeRefuseSphereSet(
+        const std::vector<std::pair<std::string, int>>& sel) {
+        if (sel.empty()) { er_sphere_mask_.clear(); return; }
+        er_sphere_mask_.assign(spheres_.size(), 0);
+        for (size_t k = 0; k < spheres_.size(); ++k) {
+            // 该球在其链接上的序号
+            int idx = 0;
+            for (size_t j = 0; j < k; ++j)
+                if (spheres_[j].link_name == spheres_[k].link_name) ++idx;
+            for (const auto& s : sel)
+                if (s.first == spheres_[k].link_name && s.second == idx)
+                    er_sphere_mask_[k] = 1;
+        }
+    }
+
+    // tensor edge refuse:第 k 个球是否参与计分
+    bool erSphereActive(size_t k) const {
+        if (!er_sphere_mask_.empty()) return er_sphere_mask_[k] != 0;
+        const auto& rs = spheres_[k];
+        return rs.link_name == "panda_hand" || rs.link_name == "panda_link6";
+    }
+
     float computeEdgeAxialScoreTensor(const Eigen::VectorXf& q_near,
                                       const Eigen::VectorXf& q_new,
                                       float envelope) const override {
@@ -653,9 +686,8 @@ public:
         std::vector<Eigen::Vector3f> p_prev(spheres_.size(),
                                             Eigen::Vector3f::Zero());
         for (size_t k = 0; k < spheres_.size(); ++k) {
+            if (!erSphereActive(k)) continue;
             const auto& rs = spheres_[k];
-            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
-                continue;
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
             p_prev[k] = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
         }
@@ -663,14 +695,22 @@ public:
         // Evaluate at q_new.
         robot_->setJointValues(q_new);
         float best = 0.0f;
+        // Change 2:hand 球位置,用于末尾的目标邻近衰减 g
+        Eigen::Vector3f p_hand = Eigen::Vector3f::Zero();
+        bool hand_seen = false;
         for (size_t k = 0; k < spheres_.size(); ++k) {
             const auto& rs = spheres_[k];
-            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
-                continue;
+            if (!erSphereActive(k)) continue;
 
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
             Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
                                    + pose.block<3,3>(0,0) * rs.offset;
+            // 注:自定义球集不含 hand 时,goal fade 不生效(fade 需 hand 位置)
+            if (!hand_seen && rs.link_name == "panda_hand"
+                && rs.offset.norm() < 1e-4f) {
+                p_hand = p_curr;
+                hand_seen = true;
+            }
 
             // Fast SDF early-exit (same as legacy): if even the nearest
             // obstacle is beyond the envelope, skip the cylinder loop.
@@ -702,6 +742,9 @@ public:
             float s = std::sqrt(std::sqrt(std::sqrt(acc)));   // ^(1/8)
             if (s > best) best = s;
         }
+        // Change 2:目标邻近衰减 —— 苹果近旁最后几厘米的接近方向由抓取
+        // 位姿决定,拒绝只会造成不可达(完备性),按 g 线性退场。
+        if (hand_seen) best *= goalFadeAt(p_hand);
         return best;
     }
 
@@ -1253,17 +1296,32 @@ public:
     // on its boundary (which the minimal bend used to do — systematically
     // producing the least-radial acceptable motion).
     // Returns false when v_hat already scores <= trigger.
+    //
+    // Change 1(sticky escape sign,可选参数 sticky):特征向量是"线"
+    // 不是"箭头"—— ±e_min 得分严格相等,必须由外部规则定向。旧规则
+    // 对齐当前提议方向 v_hat,而 v_hat 一半是随机噪声:当提议近乎垂直
+    // 于 e_min(恰是转向触发的常态)时,点积符号逐周期抛硬币,连续扩展
+    // 被交替弯向枝条两侧 —— 纯粹由平局裁决制造的之字形。修复:sticky
+    // 非空且已有记录时,与上次用过的箭头同侧;本次所用箭头写回 *sticky
+    // 供子节点/下一步继承。两个符号得分严格相等,粘滞零质量代价 ——
+    // 与已废弃的 sticky winner(得分不等选项间的滞回)本质不同。
     bool bendDirection(const std::vector<WAxis>& axes,
                        const Eigen::Matrix3f& M,
                        const Eigen::Vector3f& v_hat,
                        float trigger, float target,
-                       Eigen::Vector3f& u_out) const {
+                       Eigen::Vector3f& u_out,
+                       Eigen::Vector3f* sticky = nullptr) const {
         if (softmaxAxialScore(axes, v_hat) <= trigger) return false;
 
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M);
         if (es.info() != Eigen::Success) return false;
         Eigen::Vector3f e_min = es.eigenvectors().col(0);   // ascending
-        if (v_hat.dot(e_min) < 0.0f) e_min = -e_min;        // stay on v's side
+        if (sticky && sticky->squaredNorm() > 0.5f) {
+            if (sticky->dot(e_min) < 0.0f) e_min = -e_min;  // 与上次同侧
+        } else if (v_hat.dot(e_min) < 0.0f) {
+            e_min = -e_min;                                 // stay on v's side
+        }
+        if (sticky) *sticky = e_min;   // 记录本次箭头(单位向量)
 
         float beta = 1.0f;
         if (softmaxAxialScore(axes, e_min) < target) {
@@ -1286,16 +1344,23 @@ public:
     }
 
     // Steer the motion of one body point in joint space via its Jacobian.
+    // fade ∈ [0,1](Change 2):按目标邻近度缩放弯折量;sticky(Change 1)
+    // 透传给 bendDirection;离开包络(无枝条)时清空 sticky 记忆。
     bool steerPointAgainstAxes(const Eigen::Vector3f& p_body,
                                float body_radius,
                                const Eigen::MatrixXf& J_point,
                                Eigen::VectorXf& q_step_dir,
                                float envelope,
-                               float trigger, float target) const {
+                               float trigger, float target,
+                               float fade = 1.0f,
+                               Eigen::Vector3f* sticky = nullptr) const {
         std::vector<WAxis> axes;
         Eigen::Matrix3f M;
-        if (!collectSteeringAxes(p_body, body_radius, envelope, axes, M))
+        if (!collectSteeringAxes(p_body, body_radius, envelope, axes, M)) {
+            if (sticky) sticky->setZero();   // 出包络:清除箭头记忆
             return false;
+        }
+        if (fade <= 0.01f) return false;     // 目标近旁:完全不弯折
 
         Eigen::Vector3f v = J_point * q_step_dir;
         float v_norm = v.norm();
@@ -1303,11 +1368,13 @@ public:
         Eigen::Vector3f v_hat = v / v_norm;
 
         Eigen::Vector3f u;
-        if (!bendDirection(axes, M, v_hat, trigger, target, u)) return false;
+        if (!bendDirection(axes, M, v_hat, trigger, target, u, sticky))
+            return false;
 
         // Damped least-squares mapping back to joint space, preserving the
         // original workspace speed. Caller renormalizes q_step_dir.
-        Eigen::Vector3f dv = (u - v_hat) * v_norm;
+        // fade < 1 时按比例缩小修正量(Change 2:靠近目标弯折渐弱)。
+        Eigen::Vector3f dv = (u - v_hat) * v_norm * fade;
         Eigen::Matrix3f JJt = J_point * J_point.transpose()
                             + 1e-6f * Eigen::Matrix3f::Identity();
         q_step_dir += J_point.transpose() * JJt.ldlt().solve(dv);
@@ -1328,7 +1395,8 @@ public:
                                  const Eigen::MatrixXf& J_EE,
                                  float envelope,
                                  float cos_cap,
-                                 float overshoot = 1.0f) const {
+                                 float overshoot = 1.0f,
+                                 Eigen::Vector3f* sticky = nullptr) const {
         if (!sdf_built_) return false;
         if (q_near.size() != q_step_dir.size()) return false;
         if (J_EE.rows() != 3 || J_EE.cols() != q_near.size()) return false;
@@ -1344,8 +1412,11 @@ public:
                 Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
                 Eigen::Vector3f p = pose.block<3,1>(0,3)
                                   + pose.block<3,3>(0,0) * rs.offset;
+                // Change 2:目标邻近衰减(按 hand 位置计算,两球共用)
+                float fade = goalFadeAt(p);
                 applied |= steerPointAgainstAxes(
-                    p, rs.radius, J_EE, q_step_dir, envelope, cos_cap, target);
+                    p, rs.radius, J_EE, q_step_dir, envelope, cos_cap, target,
+                    fade, sticky);
                 break;
             }
         }
@@ -1366,8 +1437,10 @@ public:
                     J6 = robot_->computeSphereJacobianById(rs.frame_id,
                                                            rs.offset);
                 }
+                float fade = goalFadeAt(p);
                 applied |= steerPointAgainstAxes(
-                    p, rs.radius, J6, q_step_dir, envelope, cos_cap, target);
+                    p, rs.radius, J6, q_step_dir, envelope, cos_cap, target,
+                    fade, sticky);
                 break;
             }
         }
@@ -1389,7 +1462,8 @@ public:
                              float envelope,
                              float cos_cap,
                              float overshoot,
-                             const Eigen::Vector3f& goal_dir) const {
+                             const Eigen::Vector3f& goal_dir,
+                             Eigen::Vector3f* sticky = nullptr) const {
         if (!sdf_built_ || cylinders_.empty() || envelope <= 0.0f)
             return false;
         float dp_norm = dp.norm();
@@ -1397,20 +1471,61 @@ public:
 
         std::vector<WAxis> axes;
         Eigen::Matrix3f M;
-        if (!collectSteeringAxes(p_body, body_radius, envelope, axes, M))
+        if (!collectSteeringAxes(p_body, body_radius, envelope, axes, M)) {
+            if (sticky) sticky->setZero();   // 出包络:清除箭头记忆
             return false;
+        }
+
+        // Change 2:靠近抓取目标时手的行进方向由抓取位姿决定,弯折
+        // 无法再产生径向穿越,只会与目标引力形成 bend/re-aim 极限环
+        // (下探之字形的主源)。按目标邻近度衰减弯折。
+        float fade = goalFadeAt(p_body);
+        if (fade <= 0.01f) return false;
 
         const float target =
             cos_cap * std::max(0.05f, std::min(1.0f, overshoot));
+        Eigen::Vector3f v_hat = dp / dp_norm;
         Eigen::Vector3f u;
-        if (!bendDirection(axes, M, dp / dp_norm, cos_cap, target, u))
+        if (!bendDirection(axes, M, v_hat, cos_cap, target, u, sticky))
             return false;
+
+        // fade < 1:在原方向与弯折方向之间插值(线性渐变,无阈值面)
+        if (fade < 1.0f) {
+            Eigen::Vector3f blend = (1.0f - fade) * v_hat + fade * u;
+            float bn = blend.norm();
+            if (bn < 1e-9f) return false;
+            u = blend / bn;
+        }
 
         if (goal_dir.squaredNorm() > 1e-12f && u.dot(goal_dir) <= 0.0f)
             return false;   // would stall the descent — keep original
 
         dp = u * dp_norm;
         return true;
+    }
+
+    // ------------------------------------------------------------------
+    // Change 2:目标邻近衰减 g(goal-proximity fade)
+    //
+    // 动机(完备性):未截断的深度放大权重 W = 1 − d/envelope 使拒绝锥
+    // 随穿入深度变宽;若苹果紧贴/藏于枝条,最后几厘米的一切接近方向都
+    // 是"深且偏轴向"—— edge refuse 会全部拒绝,苹果不可达。同理,转向
+    // 在终端漏斗内只能制造 bend/re-aim 极限环。修复:以到苹果的距离
+    // 线性渐变(平滑,无新阈值面):
+    //     g = clamp(dist(p, apple) / R_relax, 0, 1)
+    // g=1(≥R 处)行为与历史完全一致;g→0(苹果处)拒绝与弯折全部
+    // 退场,终端接近只由普通碰撞检查(刚性障碍照常阻挡)约束。
+    // 两个机制共用同一个 g:只衰减其一会造成"拒绝但不再引导"或
+    // "无谓弯折"的不一致。radius ≤ 0 时禁用(g 恒为 1)。
+    // ------------------------------------------------------------------
+    void setGoalFade(const Eigen::Vector3f& center, float radius) {
+        goal_fade_center_ = center;
+        goal_fade_radius_ = radius;
+    }
+    float goalFadeAt(const Eigen::Vector3f& p) const {
+        if (goal_fade_radius_ <= 0.0f) return 1.0f;
+        float d = (p - goal_fade_center_).norm();
+        return std::max(0.0f, std::min(1.0f, d / goal_fade_radius_));
     }
 
     // 查询某世界坐标点的原始 SDF 值（用于可视化/调试）
@@ -1438,6 +1553,11 @@ private:
     int             nx_, ny_, nz_;
     std::vector<float> sdf_grid_;
     bool            sdf_built_;
+    // Change 2:目标邻近衰减 g 的参数(radius ≤ 0 = 禁用)
+    Eigen::Vector3f goal_fade_center_ = Eigen::Vector3f::Zero();
+    float           goal_fade_radius_ = 0.0f;
+    // tensor edge refuse 自定义计分球掩码(空 = 默认 hand+link6)
+    std::vector<char> er_sphere_mask_;
 
     // ------------------------------------------------------------------
     // 几何辅助：找到离 p 最近的圆柱的轴向单位向量

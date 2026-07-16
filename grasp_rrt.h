@@ -79,6 +79,20 @@ public:
     // ---- 结果获取 ----
 
     ConfigPath getSolution() const { return solution_; }
+
+    // ------------------------------------------------------------------
+    // 方法 1:score-aware shortcutting(捷径剪枝,非 TrajOpt)
+    //
+    // 对解路径反复尝试"跳过中间路点直连":仅当直连段按规划粒度
+    // (extend_step_size 分段)逐段通过与建树完全相同的有效性检查
+    // (DCD 碰撞 + edge refuse 拒绝)时才替换。无代价函数、无梯度、
+    // 无变形 —— 纯剪枝,最终路径的每条边都通过了规划器自己的检查,
+    // 方法保证(受监控球不沿枝轴向穿行)在构造上保持。
+    // 目标:消除 rejection 高压下的 detour-and-retry 徘徊尾巴
+    // (振荡长尾),而不动打分/拒绝机制本身。
+    // ------------------------------------------------------------------
+    std::vector<Config> shortcutSolutionPath(const std::vector<Config>& path,
+                                             int max_rounds = 20);
     std::vector<GraspInfo> getGraspResults() const;
     int getGraspResultCount() const;
     const GraspPlanningPerformance& getPerformance() const { return performance_; }
@@ -157,6 +171,7 @@ private:
         float      collision_time_ms = 0.0f;
         int        col_check_count_delta = 0;
         int        chosen_winner_id = -1;  // sticky-winner: id to store on new node
+        Vector3f   escape_arrow = Vector3f::Zero();  // change 1: 逃逸箭头,提交时写入新节点
     };
     ExtendCandidate extendVFRRTCompute(const Config& target);
 
@@ -177,6 +192,11 @@ private:
 
     // ---- 路径验证 (Lazy collision check) ----
     bool validateSolutionPath(CSpaceNodePtr goal_node);
+
+    // shortcutSolutionPath 的分段有效性检查:把 [a,b] 按
+    // extend_step_size 切成小段,逐段调 cspace_->isPathValid
+    // (= DCD + edge refuse,与建树同粒度、同语义)。
+    bool segmentValidPiecewise(const Config& a, const Config& b);
 
     // ---- 抓取方向引导 ----
 
@@ -304,6 +324,11 @@ private:
     int  cycles_;
     int  last_added_id_;
     int  col_checks_overall_;
+
+    // Change 1(sticky escape sign):抓取下探的逃逸箭头记忆。下探是
+    // 顺序过程(不走树节点),用成员变量在步间传递;每次 moveTowardsGoal
+    // 开始时清零。树扩展侧的记忆存在 CSpaceNode::escape_arrow_ 上。
+    Vector3f descent_escape_arrow_ = Vector3f::Zero();
 
     // 额外硬质障碍物
     Vector3f hard_obstacle_pos_     = Vector3f::Zero();

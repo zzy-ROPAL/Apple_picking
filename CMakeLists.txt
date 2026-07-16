@@ -71,6 +71,28 @@ target_link_libraries(benchmark_grasp_rrt
 )
 
 # ============================================================================
+# 离线工具:对已保存路径成对测量 TrajOpt 前后指标
+# ============================================================================
+
+add_executable(measure_axial measure_axial.cpp)
+target_link_libraries(measure_axial
+    grasp_rrt_lib
+    Eigen3::Eigen
+    pinocchio::pinocchio
+    ${BULLET_LIBRARIES}
+    OpenMP::OpenMP_CXX
+)
+
+add_executable(measure_trajopt measure_trajopt.cpp)
+target_link_libraries(measure_trajopt
+    grasp_rrt_lib
+    Eigen3::Eigen
+    pinocchio::pinocchio
+    ${BULLET_LIBRARIES}
+    OpenMP::OpenMP_CXX
+)
+
+# ============================================================================
 # 打印信息
 # ============================================================================
 

@@ -381,6 +381,7 @@ bool GraspRrt::doPlanningCycleBatch(int K) {
         new_node->setEdgeCostToParent(c.edge_cost);
         // Sticky-winner: propagate chosen winner branch id (batch RRT path).
         new_node->setWinnerBranchId(c.chosen_winner_id);
+        new_node->setEscapeArrow(c.escape_arrow);   // change 1: 逃逸箭头继承链
         last_added_id_ = new_node->getId();
         processNode(new_node);
     }
@@ -706,18 +707,25 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
             const MatrixXf& J_EE = getOrComputeEEJacobian(nn->getId(), q_near);
             // Ensure robot is at q_near so SDF / axis lookup matches.
             robot_->setJointValues(q_near);
+            // Change 1:继承父节点的逃逸箭头;转向更新后的箭头随
+            // candidate 提交写入新节点(ExtendCandidate::escape_arrow)。
+            Vector3f escape_arrow = nn->getEscapeArrow();
             bool applied = config_.sample_steering_tensor
                 ? sdf_eval->applySamplingBiasTensor(
                       q_near, q_step_dir, J_EE,
                       config_.sample_steering_envelope,
                       config_.sample_steering_cos_cap,
-                      config_.sample_steering_overshoot)
+                      config_.sample_steering_overshoot,
+                      config_.sample_steering_sticky_sign ? &escape_arrow
+                                                          : nullptr)
                 : sdf_eval->applySamplingBias(
                       q_near, q_step_dir, J_EE,
                       config_.sample_steering_envelope,
                       config_.sample_steering_cos_cap,
                       config_.sample_steering_k,
                       config_.sample_steering_min_anisotropy);
+            if (config_.sample_steering_sticky_sign)
+                cand.escape_arrow = escape_arrow;
             if (applied && q_step_dir.norm() > 1e-6f) {
                 q_step_dir.normalize();
             }
@@ -845,10 +853,72 @@ ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
     // Sticky-winner: propagate the chosen winner branch id onto the new node.
     // If sticky mode was off, chosen_winner_id is -1 (harmless default).
     new_node->setWinnerBranchId(c.chosen_winner_id);
+    new_node->setEscapeArrow(c.escape_arrow);   // change 1: 逃逸箭头继承链
     last_added_id_ = new_node->getId();
 
     processNode(new_node);
     return ExtensionResult::SUCCESS;
+}
+
+// ============================================================================
+// shortcutSolutionPath — 方法 1:score-aware shortcutting(见 grasp_rrt.h)
+// ============================================================================
+
+bool GraspRrt::segmentValidPiecewise(const Config& a, const Config& b) {
+    float dist = (b - a).norm();
+    int n_seg = std::max(1, static_cast<int>(
+        std::ceil(dist / std::max(1e-4f, config_.extend_step_size))));
+    Config prev = a;
+    for (int s = 1; s <= n_seg; ++s) {
+        Config next = a + (b - a) * (static_cast<float>(s) / n_seg);
+        if (!cspace_->isPathValid(prev, next)) return false;
+        prev = next;
+    }
+    return true;
+}
+
+std::vector<Config> GraspRrt::shortcutSolutionPath(
+    const std::vector<Config>& in, int max_rounds) {
+    std::vector<Config> path = in;
+    if (path.size() < 3) return path;
+
+    // 贪心"最远可直连"扫描:对每个 i 从路径末端向前找最远的 j 使
+    // (i,j) 直连有效,成功则删除中间路点;反复扫描直到无改进。
+    bool improved = true;
+    int round = 0;
+    while (improved && round++ < max_rounds) {
+        improved = false;
+        size_t i = 0;
+        while (i + 2 < path.size()) {
+            size_t found = i;
+            for (size_t j = path.size() - 1; j > i + 1; --j) {
+                if (segmentValidPiecewise(path[i], path[j])) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found > i + 1) {
+                path.erase(path.begin() + i + 1, path.begin() + found);
+                improved = true;
+            }
+            ++i;
+        }
+    }
+
+    // 重新按规划粒度加密:剪枝后可能只剩几个路点,而各向异性指标
+    // 逐路点采样穿入深度,过疏会漏检接触、虚低指标。加密不改变
+    // 几何(仍是同一折线),只恢复采样密度与回放平滑度。
+    std::vector<Config> dense;
+    dense.push_back(path.front());
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+        float dist = (path[i + 1] - path[i]).norm();
+        int n_seg = std::max(1, static_cast<int>(
+            std::ceil(dist / std::max(1e-4f, config_.extend_step_size))));
+        for (int s = 1; s <= n_seg; ++s)
+            dense.push_back(path[i] +
+                (path[i + 1] - path[i]) * (static_cast<float>(s) / n_seg));
+    }
+    return dense;
 }
 
 // ============================================================================
@@ -1095,6 +1165,10 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
 
     auto last_extend_node = start_node;
 
+    // Change 1:每次下探开始时清空逃逸箭头记忆(下探是顺序过程,
+    // 箭头经成员变量在步间传递;见 createWorkspaceSamplingStep)。
+    descent_escape_arrow_.setZero();
+
     // 当前 TCP 到目标的笛卡尔距离
     Matrix4f current_tcp = Matrix4f::Identity();
     auto it = map_config_tcp_.find(last_extend_node->getId());
@@ -1228,7 +1302,9 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                     config_.sample_steering_envelope,
                     config_.sample_steering_cos_cap,
                     config_.sample_steering_overshoot,
-                    goal_dir)) {
+                    goal_dir,
+                    config_.sample_steering_sticky_sign
+                        ? &descent_escape_arrow_ : nullptr)) {
                 delta_pose.block<3,1>(0, 3) = dp;
             }
         }

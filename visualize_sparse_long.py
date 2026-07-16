@@ -108,6 +108,31 @@ def main():
                     waypoints.append([float(x) for x in line.strip().split(",")])
         print(f"[sparse-long viz] loaded {len(waypoints)} waypoints")
 
+    # ---- EE 轨迹描线:蓝(起点)→ 红(终点),之字形一目了然 ----
+    if waypoints:
+        # 找 panda_hand 的 link index(pybullet link index = joint index)
+        hand_link = None
+        for j in range(p.getNumJoints(robot_id)):
+            if p.getJointInfo(robot_id, j)[12].decode() == "panda_hand":
+                hand_link = j
+                break
+        if hand_link is not None:
+            ee = []
+            for w in waypoints:
+                for i in range(7):
+                    p.resetJointState(robot_id, i, w[i])
+                ee.append(p.getLinkState(robot_id, hand_link)[0])
+            n = len(ee)
+            for i in range(n - 1):
+                t = i / max(1, n - 2)
+                p.addUserDebugLine(ee[i], ee[i + 1],
+                                   lineColorRGB=[t, 0.1, 1.0 - t],
+                                   lineWidth=3)
+            # 恢复到起点姿态
+            for i in range(7):
+                p.resetJointState(robot_id, i, waypoints[0][i])
+            print(f"[sparse-long viz] EE trace drawn ({n} points, blue=start, red=goal)")
+
     try:
         if waypoints:
             while p.isConnected():

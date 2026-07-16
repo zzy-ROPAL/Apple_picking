@@ -218,6 +218,7 @@ struct RunResult {
     // Same, restricted to waypoints in-envelope of a branch (where rejection
     // is active) — isolates wiggle caused by branch interaction near the apple.
     float   path_env_turning_deg   = 0.0f;
+    float   shortcut_ms            = 0.0f;  // 方法1: score-aware shortcut 用时 (0 = off)
     int     path_env_turns         = 0;
 };
 
@@ -324,7 +325,7 @@ void writeCsvHeader(std::ofstream& f) {
       << "winner_segments,winner_switches,winner_switch_rate,"
       // Group E4: EE-path smoothness (raw path)
       << "path_total_turning_deg,path_mean_turning_deg,path_reversals,"
-      << "path_env_turning_deg,path_env_turns\n";
+      << "path_env_turning_deg,path_env_turns,shortcut_ms\n";
 }
 
 void writeCsvRow(std::ofstream& f, const RunResult& r) {
@@ -378,7 +379,7 @@ void writeCsvRow(std::ofstream& f, const RunResult& r) {
     // Group E4: EE-path smoothness
     f << fmt(r.path_total_turning_deg) << "," << fmt(r.path_mean_turning_deg) << ","
       << r.path_reversals << "," << fmt(r.path_env_turning_deg) << ","
-      << r.path_env_turns << "\n";
+      << r.path_env_turns << "," << fmt(r.shortcut_ms) << "\n";
 }
 
 // ============================================================================
@@ -431,6 +432,11 @@ int main(int argc, char* argv[]) {
     float sample_steering_cos_cap         = 0.866f;   // cos(30°)
     int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
     float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
+
+    bool  shortcut_enabled   = false;   // --shortcut: 方法1 — 解路径 score-aware 捷径剪枝
+    bool  sticky_escape_sign = false;   // --sticky-escape-sign: change 1 — 逃逸箭头平局一致性(仅 tensor 转向)
+    std::string er_links;               // --er-links "panda_link7:0,panda_link5:2": tensor ER 自定义计分球(链接名:球序号)
+    float goal_fade_radius   = 0.0f;    // --goal-fade R: change 2 — 目标邻近衰减半径 (m), 0 = off
 
     // Parse args
     std::vector<std::string> positional;
@@ -544,6 +550,15 @@ int main(int argc, char* argv[]) {
         } else if (a == "--sample-steering-anisotropy" && i + 1 < argc) {
             sample_steering_min_anisotropy = std::max(0.0f, std::min(1.0f,
                                               static_cast<float>(std::atof(argv[++i]))));
+        } else if (a == "--shortcut") {
+            shortcut_enabled = true;
+        } else if (a == "--sticky-escape-sign") {
+            sticky_escape_sign = true;
+        } else if (a == "--er-links" && i + 1 < argc) {
+            er_links = argv[++i];
+        } else if (a == "--goal-fade" && i + 1 < argc) {
+            goal_fade_radius = std::max(0.0f,
+                                  static_cast<float>(std::atof(argv[++i])));
         } else {
             positional.push_back(a);
         }
@@ -1085,6 +1100,14 @@ int main(int argc, char* argv[]) {
 
     cspace->setCostEvaluator(cost_evaluator);
 
+    // Change 2: goal-proximity fade g — 以苹果为中心的线性衰减,
+    // 同时作用于 tensor edge refuse 的拒绝分数与转向的弯折量。
+    if (goal_fade_radius > 0.0f) {
+        cost_evaluator->setGoalFade(scene.apple_pos, goal_fade_radius);
+        std::cout << "[Setup] GOAL FADE ENABLED (change 2: R = "
+                  << goal_fade_radius << " m around apple)\n";
+    }
+
     // ---- Anisotropic edge refuse (Layer 1, pre-contact directional filter) ----
     if (edge_refuse_enabled) {
         cspace->setEdgeRefuseEnabled(true);
@@ -1107,7 +1130,22 @@ int main(int argc, char* argv[]) {
             std::cout << "        K nearest = " << edge_refuse_k
                       << " (non-rigid branches per sphere)\n";
         }
-        std::cout << "        spheres   = panda_hand + panda_link6\n";
+        if (er_links.empty() || !edge_refuse_tensor) {
+            std::cout << "        spheres   = panda_hand + panda_link6\n";
+        } else {
+            // 解析 "link:idx,link:idx" 为自定义计分球集合(仅 tensor 模式)
+            std::vector<std::pair<std::string, int>> sel;
+            std::stringstream ss(er_links);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                auto pos = tok.find(':');
+                if (pos == std::string::npos) continue;
+                sel.push_back({tok.substr(0, pos),
+                               std::atoi(tok.substr(pos + 1).c_str())});
+            }
+            cost_evaluator->setEdgeRefuseSphereSet(sel);
+            std::cout << "        spheres   = CUSTOM: " << er_links << "\n";
+        }
     }
 
     // ---- 7. Target object (apple) ----
@@ -1145,6 +1183,11 @@ int main(int argc, char* argv[]) {
     config.sample_steering_cos_cap         = sample_steering_cos_cap;
     config.sample_steering_k               = sample_steering_k;
     config.sample_steering_min_anisotropy  = sample_steering_min_anisotropy;
+    // Change 1: sticky escape sign(仅 tensor 转向使用)
+    config.sample_steering_sticky_sign     = sticky_escape_sign;
+    if (sticky_escape_sign) {
+        std::cout << "[Setup] STICKY ESCAPE SIGN ENABLED (change 1: tie-break consistency)\n";
+    }
     // Sticky-winner variants
     config.sticky_sample_steering_enabled              = sticky_sample_steering_enabled;
     config.sticky_edge_refuse_enabled            = sticky_edge_refuse_enabled;
@@ -1399,6 +1442,19 @@ int main(int argc, char* argv[]) {
                                                           - result.pose_calc_ms);
 
             auto solution = planner->getSolution();
+            // 方法1:score-aware shortcutting(与建树同一有效性检查;
+            // 指标与 grasp_path CSV 均在剪枝后的路径上计)
+            if (shortcut_enabled && solution.size() > 2) {
+                auto t_sc0 = std::chrono::high_resolution_clock::now();
+                auto sc = planner->shortcutSolutionPath(solution);
+                auto t_sc1 = std::chrono::high_resolution_clock::now();
+                result.shortcut_ms =
+                    std::chrono::duration<float, std::milli>(t_sc1 - t_sc0).count();
+                std::cout << "  [shortcut] " << solution.size() << " -> "
+                          << sc.size() << " waypoints ("
+                          << result.shortcut_ms << " ms)\n";
+                solution = std::move(sc);
+            }
             result.waypoints = static_cast<int>(solution.size());
 
             if (!solution.empty()) {

@@ -1,0 +1,307 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c095005..27fa13c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,6 +70,19 @@ target_link_libraries(benchmark_grasp_rrt
+     OpenMP::OpenMP_CXX
+ )
+ 
++# ============================================================================
++# 离线工具:对已保存路径成对测量 TrajOpt 前后指标
++# ============================================================================
++
++add_executable(measure_trajopt measure_trajopt.cpp)
++target_link_libraries(measure_trajopt
++    grasp_rrt_lib
++    Eigen3::Eigen
++    pinocchio::pinocchio
++    ${BULLET_LIBRARIES}
++    OpenMP::OpenMP_CXX
++)
++
+ # ============================================================================
+ # 打印信息
+ # ============================================================================
+diff --git a/benchmark_grasp_rrt.cpp b/benchmark_grasp_rrt.cpp
+index 19d7dfb..85141e9 100644
+--- a/benchmark_grasp_rrt.cpp
++++ b/benchmark_grasp_rrt.cpp
+@@ -432,6 +432,10 @@ int main(int argc, char* argv[]) {
+     int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
+     float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
+ 
++    bool  er_midarm            = false;  // --er-midarm: 3a — tensor edge refuse 附加 link4/link5 穿入门控计分
++    bool  nullspace_elbow      = false;  // --nullspace-elbow: 3b — 下探 DiffIK 零空间肘部推离
++    float nullspace_elbow_gain = 0.5f;   // --nullspace-elbow-gain F
++
+     // Parse args
+     std::vector<std::string> positional;
+     for (int i = 1; i < argc; i++) {
+@@ -544,6 +548,13 @@ int main(int argc, char* argv[]) {
+         } else if (a == "--sample-steering-anisotropy" && i + 1 < argc) {
+             sample_steering_min_anisotropy = std::max(0.0f, std::min(1.0f,
+                                               static_cast<float>(std::atof(argv[++i]))));
++        } else if (a == "--er-midarm") {
++            er_midarm = true;
++        } else if (a == "--nullspace-elbow") {
++            nullspace_elbow = true;
++        } else if (a == "--nullspace-elbow-gain" && i + 1 < argc) {
++            nullspace_elbow_gain = std::max(0.0f, std::min(2.0f,
++                                  static_cast<float>(std::atof(argv[++i]))));
+         } else {
+             positional.push_back(a);
+         }
+@@ -1107,7 +1118,12 @@ int main(int argc, char* argv[]) {
+             std::cout << "        K nearest = " << edge_refuse_k
+                       << " (non-rigid branches per sphere)\n";
+         }
+-        std::cout << "        spheres   = panda_hand + panda_link6\n";
++        std::cout << "        spheres   = panda_hand + panda_link6";
++        if (er_midarm && edge_refuse_tensor) {
++            cost_evaluator->setMidarmCoverage(true);
++            std::cout << " + link4/link5 (3a: penetration-gated)";
++        }
++        std::cout << "\n";
+     }
+ 
+     // ---- 7. Target object (apple) ----
+@@ -1145,6 +1161,13 @@ int main(int argc, char* argv[]) {
+     config.sample_steering_cos_cap         = sample_steering_cos_cap;
+     config.sample_steering_k               = sample_steering_k;
+     config.sample_steering_min_anisotropy  = sample_steering_min_anisotropy;
++    // 3b: null-space elbow push (grasp descent only)
++    config.nullspace_elbow      = nullspace_elbow;
++    config.nullspace_elbow_gain = nullspace_elbow_gain;
++    if (nullspace_elbow) {
++        std::cout << "[Setup] NULL-SPACE ELBOW ENABLED (3b, gain="
++                  << nullspace_elbow_gain << ")\n";
++    }
+     // Sticky-winner variants
+     config.sticky_sample_steering_enabled              = sticky_sample_steering_enabled;
+     config.sticky_edge_refuse_enabled            = sticky_edge_refuse_enabled;
+diff --git a/grasp_rrt.cpp b/grasp_rrt.cpp
+index d649af3..797405c 100644
+--- a/grasp_rrt.cpp
++++ b/grasp_rrt.cpp
+@@ -1273,6 +1273,27 @@ std::pair<MoveArmResult, Config> GraspRrt::moveArmDiffKin(const Matrix4f& delta_
+     MatrixXf J_pinv = computePseudoInverseJacobian();
+     Eigen::VectorXf d_theta = J_pinv * e;
+ 
++    // ---- 3b:肘部零空间推离 ----
++    // 在 EE 任务零空间内附加肘部径向逃逸(见 types.h nullspace_elbow 注释
++    // 与 SdfCostEvaluator::nullspaceElbowJointPush)。投影算子保证手部
++    // 运动完全不变;仅在肘部包络内有软枝条时才触发。
++    if (config_.nullspace_elbow) {
++        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
++            cspace_->getCostEvaluator());
++        Eigen::VectorXf q_push;
++        if (sdf_eval && sdf_eval->nullspaceElbowJointPush(
++                q_push, config_.sample_steering_envelope)) {
++            MatrixXf J = robot_->computeJacobian();
++            MatrixXf N = MatrixXf::Identity(J.cols(), J.cols()) - J_pinv * J;
++            Eigen::VectorXf dn = N * q_push;
++            float dn_norm   = dn.norm();
++            float task_norm = d_theta.norm();
++            if (dn_norm > 1e-8f && task_norm > 1e-8f)
++                d_theta += config_.nullspace_elbow_gain * task_norm
++                         * (dn / dn_norm);
++        }
++    }
++
+     // 新的关节配置
+     Config new_config = start_config + d_theta.head(dimension_).cast<float>();
+ 
+diff --git a/sdf_cost_evaluator.h b/sdf_cost_evaluator.h
+index 1116e78..7ae326d 100644
+--- a/sdf_cost_evaluator.h
++++ b/sdf_cost_evaluator.h
+@@ -648,14 +648,25 @@ public:
+         if (q_near.size() != q_new.size()) return 0.0f;
+         if (envelope <= 0.0f) return 0.0f;
+ 
+-        // Sphere positions at q_near (engagement spheres only).
++        // 球的角色:1 = engagement(hand/link6,包络内即计分);
++        //           2 = mid-arm(link4/link5,仅在实际穿入 d<0 时计分,
++        //               见下方 3a 注释);0 = 不参与。
++        auto sphereRole = [this](const RobotSphere& rs) -> int {
++            if (rs.link_name == "panda_hand" || rs.link_name == "panda_link6")
++                return 1;
++            if (midarm_coverage_ &&
++                (rs.link_name == "panda_link4" || rs.link_name == "panda_link5"))
++                return 2;
++            return 0;
++        };
++
++        // Sphere positions at q_near.
+         robot_->setJointValues(q_near);
+         std::vector<Eigen::Vector3f> p_prev(spheres_.size(),
+                                             Eigen::Vector3f::Zero());
+         for (size_t k = 0; k < spheres_.size(); ++k) {
+             const auto& rs = spheres_[k];
+-            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
+-                continue;
++            if (sphereRole(rs) == 0) continue;
+             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+             p_prev[k] = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * rs.offset;
+         }
+@@ -665,8 +676,8 @@ public:
+         float best = 0.0f;
+         for (size_t k = 0; k < spheres_.size(); ++k) {
+             const auto& rs = spheres_[k];
+-            if (rs.link_name != "panda_hand" && rs.link_name != "panda_link6")
+-                continue;
++            const int role = sphereRole(rs);
++            if (role == 0) continue;
+ 
+             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
+             Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
+@@ -674,8 +685,14 @@ public:
+ 
+             // Fast SDF early-exit (same as legacy): if even the nearest
+             // obstacle is beyond the envelope, skip the cylinder loop.
++            // 3a(mid-arm 穿入门控):肘/前臂球仅在"确实穿入枝条"(d<0)
++            // 时才计分 —— "肘部靠近枝条"在树冠里是常态,若按包络计分会
++            // 大幅抬高拒绝率、拖慢建树(拒绝率成本,非算力成本);而
++            // "肘部在枝条内部沿轴滑动"正是全臂 axial 残差的来源,只拒
++            // 绝这部分边。早退阈值随角色收紧:mid-arm 用 0 而非 envelope。
+             float sdf_val = sampleSdf(p_curr);
+-            if (sdf_val - rs.radius > envelope) continue;
++            float gate = (role == 2) ? 0.0f : envelope;
++            if (sdf_val - rs.radius > gate) continue;
+ 
+             Eigen::Vector3f dp = p_curr - p_prev[k];
+             float dp_norm = dp.norm();
+@@ -689,7 +706,7 @@ public:
+                 if (cyl.exclude_from_aniso) continue;
+                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+                 float d = distToCylinder(p_curr, cyl) - rs.radius;
+-                if (d >= envelope) continue;
++                if (d >= gate) continue;         // engagement: 包络;mid-arm: 穿入
+                 float W = 1.0f - d / envelope;   // UNCLAMPED: > 1 inside
+                 float c = std::abs(dp_hat.dot(cyl.axis_unit));
+                 float s1 = W * c;
+@@ -705,6 +722,11 @@ public:
+         return best;
+     }
+ 
++    // 3a 开关:tensor edge refuse 是否附加 mid-arm(link4/link5)穿入门控
++    // 计分。默认关闭 —— 与历史实验行为完全一致。
++    void setMidarmCoverage(bool on) { midarm_coverage_ = on; }
++    bool getMidarmCoverage() const  { return midarm_coverage_; }
++
+     // ------------------------------------------------------------------
+     // maxWinnerBranchId — post-hoc "which branch is most dangerous here"
+     //
+@@ -1413,6 +1435,83 @@ public:
+         return true;
+     }
+ 
++    // ------------------------------------------------------------------
++    // nullspaceElbowJointPush — 3b:肘部零空间推离(抓取下探专用)
++    //
++    // 动机:各方法只控制 hand+link6,而 Panda 是 7 关节做 6 自由度手部
++    // 任务,肘部(link3/4)在零空间里自由摆动,沿枝条轴向"耙"过去 ——
++    // 这就是全臂 axial 指标(~0.43)与 axial_ee(~0.37)之间的残差来源。
++    //
++    // 本函数只计算"肘部想往哪推"的关节空间方向 q_push = J_eᵀ·u:
++    //   u = 肘部球处结构张量 M = Σ W·â·âᵀ 的最小特征向量(对所有邻近
++    //       枝条同时最径向的方向),符号对齐"离开最深枝条"的径向。
++    // 调用方(moveArmDiffKin)负责投影到 EE 任务零空间:
++    //   dθ += gain · |dθ_task| · normalize((I − J⁺J)·q_push)
++    // 投影算子保证手部运动完全不变 —— 零边拒绝、零目标冲突,只消耗
++    // 冗余自由度。局限:零空间仅 1 维(肘部圆),且只作用于下探
++    // (树扩展不走 DiffIK);树扩展侧的肘部覆盖由 3a 承担。
++    //
++    // 返回 false = 肘部附近(包络内)无软枝条,无需修正。
++    // ------------------------------------------------------------------
++    bool nullspaceElbowJointPush(Eigen::VectorXf& q_push, float envelope) const {
++        if (!sdf_built_ || cylinders_.empty() || envelope <= 0.0f) return false;
++
++        // 肘部球:panda_link4 的第一个球(z=0.05,肘关节处)
++        const RobotSphere* elbow = nullptr;
++        for (const auto& rs : spheres_)
++            if (rs.link_name == "panda_link4") { elbow = &rs; break; }
++        if (!elbow) return false;
++
++        Eigen::Matrix4f pose = robot_->getFramePoseById(elbow->frame_id);
++        Eigen::Vector3f p = pose.block<3,1>(0,3)
++                          + pose.block<3,3>(0,0) * elbow->offset;
++        if (sampleSdf(p) - elbow->radius > envelope) return false;  // 早退
++
++        // 张量 + 最深枝条的径向逃逸方向(用于定符号)
++        Eigen::Matrix3f M = Eigen::Matrix3f::Zero();
++        Eigen::Vector3f r_out = Eigen::Vector3f::Zero();
++        float w_max = 0.0f;
++        bool  any = false;
++        for (const auto& cyl : cylinders_) {
++            if (cyl.exclude_from_aniso) continue;
++            if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
++            float d = distToCylinder(p, cyl) - elbow->radius;
++            if (d >= envelope) continue;
++            float W = 1.0f - d / envelope;   // UNCLAMPED,同 tensor 约定
++            M.noalias() += W * (cyl.axis_unit * cyl.axis_unit.transpose());
++            any = true;
++            if (W > w_max) {
++                w_max = W;
++                const Eigen::Vector3f v = cyl.p1 - cyl.p0;
++                float vsq = v.squaredNorm();
++                float t = (vsq > 1e-6f)
++                          ? std::max(0.0f, std::min(1.0f, (p - cyl.p0).dot(v) / vsq))
++                          : 0.0f;
++                Eigen::Vector3f r = p - (cyl.p0 + t * v);
++                float rn = r.norm();
++                if (rn > 1e-6f) r_out = r / rn;
++            }
++        }
++        if (!any) return false;
++
++        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(M);
++        if (es.info() != Eigen::Success) return false;
++        Eigen::Vector3f u = es.eigenvectors().col(0);   // 最小特征向量(升序)
++        if (r_out.squaredNorm() > 1e-6f && u.dot(r_out) < 0.0f) u = -u;
++
++        // 关节空间推力方向:q_push = J_eᵀ u(梯度方向;幅值由调用方定)
++        grasp_rrt::MatrixXf Je;
++        auto panda = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
++        if (panda) {
++            Je = panda->computeSphereJacobianDirect(elbow->frame_id, elbow->offset);
++        } else {
++            robot_->prepareJacobians();
++            Je = robot_->computeSphereJacobianById(elbow->frame_id, elbow->offset);
++        }
++        q_push = Je.transpose() * u;
++        return q_push.norm() > 1e-8f;
++    }
++
+     // 查询某世界坐标点的原始 SDF 值（用于可视化/调试）
+     float querySdf(const Eigen::Vector3f& p) const {
+         if (!sdf_built_) return std::numeric_limits<float>::max();
+@@ -1438,6 +1537,8 @@ private:
+     int             nx_, ny_, nz_;
+     std::vector<float> sdf_grid_;
+     bool            sdf_built_;
++    // 3a:tensor edge refuse 的 mid-arm(link4/link5)穿入门控计分开关
++    bool            midarm_coverage_ = false;
+ 
+     // ------------------------------------------------------------------
+     // 几何辅助：找到离 p 最近的圆柱的轴向单位向量
+diff --git a/types.h b/types.h
+index 479db77..b73f1ba 100644
+--- a/types.h
++++ b/types.h
+@@ -222,6 +222,15 @@ struct GraspRrtConfig {
+     // mimicking the interior-average that rejection resampling achieves.
+     float sample_steering_overshoot     = 0.7f;
+ 
++    // ---- 3b:肘部零空间推离(抓取下探) ----
++    // DiffIK 下探每步在 EE 任务零空间内附加肘部修正:
++    //   dθ += gain · |dθ_task| · normalize((I − J⁺J) · J_eᵀ u)
++    // u 为肘部球处结构张量的最小特征向量(对所有邻近枝条最径向)。
++    // 投影算子 (I − J⁺J) 保证手部运动不受任何影响 —— 零边拒绝、
++    // 零目标冲突,只消耗 7-DOF 的冗余自由度(肘部圆,1 维)。
++    bool  nullspace_elbow       = false;
++    float nullspace_elbow_gain  = 0.5f;   // 零空间步长 / 任务步长 之比
++
+     // Multi-branch handling: aggregate the K nearest branches inside envelope
+     // into a structure tensor M = Σ wᵢ âᵢ âᵢᵀ, then bias against M's dominant
+     // eigenvector. Falls back gracefully when fewer than K branches present.
