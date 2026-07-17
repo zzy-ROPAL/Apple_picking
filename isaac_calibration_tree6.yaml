@@ -1,0 +1,70 @@
+# =========================================================================
+# tree6 场景 ←→ Franka 机器人 相对位姿标定数据(供 Isaac Sim 复现用)
+#
+# 来源(唯一事实源,均为本仓库代码):
+#   - 机器人基座偏移: panda_pinocchio.h  base_offset_ = (0, 0, 0.4)
+#     (规划器 FK 全部加此偏移 —— 不只是可视化,C++ 规划就在这个世界系里)
+#   - 树几何:       benchmark_grasp_rrt.cpp --tree6 块 (TRUNK_NODES 等,
+#                    行 ~921);python 镜像 visualize_tree6.py
+#   - 苹果放置:     benchmark_grasp_rrt.cpp 行 ~700 (--apple-frac, 默认 0.95)
+#
+# 关键约定:
+#   * 单位一律米;世界系 = 规划器输出 CSV (grasp_path_*.csv) 的坐标系。
+#   * 复现时重要的是"相对变换",不是各自的绝对位置:
+#     树立在地面 (z≈0),机器人基座抬高 0.4 m,水平相距 ≈0.755 m。
+#   * 所有轨迹 CSV 是 7 关节角序列;只有 tree-robot 相对位姿与此文件
+#     一致,Isaac 回放才与 Bullet/SDF 规划场景匹配。
+# =========================================================================
+
+units: meters
+frame: planner_world   # = grasp_path CSV 所在坐标系
+
+robot:
+  base_position: [0.0, 0.0, 0.4]      # Panda 基座法兰中心(立在 0.4 m 台座上)
+  base_orientation_rpy: [0.0, 0.0, 0.0]
+  urdf: franka_panda/panda.urdf        # pybullet_data 版;Isaac 用官方 Panda 时
+                                       # 注意基座原点定义需一致(基座底面中心)
+  home_joint_positions: [0.0, -0.7853981634, 0.0, -2.3561944902, 0.0, 1.5707963268, 0.7853981634]
+
+tree:
+  root_node: [0.7526, -0.0624, 0.0011]   # 树干最底节点(≈地面)
+  trunk_is_rigid: true                    # 树干 = 硬障碍;枝条 = 软(SDF)
+  trunk_nodes:                            # 9 节点 → 8 段,首尾相接连续
+    - [0.7526, -0.0624, 0.0011]
+    - [0.7454, -0.0440, 0.2991]
+    - [0.7334, -0.0345, 0.5977]
+    - [0.7319, -0.0335, 0.9226]
+    - [0.6726, -0.0063, 1.1675]
+    - [0.6255,  0.0163, 1.3831]
+    - [0.7273,  0.0267, 1.5939]
+    - [0.6326,  0.0541, 1.7930]
+    - [0.6561,  0.1058, 2.0094]
+  trunk_radii: [0.0160, 0.0142, 0.0124, 0.0104, 0.0087, 0.0072, 0.0056, 0.0041, 0.0026]
+  branches:
+    count: 23
+    nodes_per_branch: 6                  # 完整数组见 visualize_tree6.py
+    source: visualize_tree6.py           #  (BRANCH_NODES / BRANCH_RAD)
+
+apple:
+  radius: 0.04
+  placement_rule: "第 5 枝(index 4)弧长 frac 处,枝表面正下方 (z - local_r - 0.04)"
+  default_frac: 0.95
+  position_frac_0_95: [0.2189, 0.0607, 0.7669]   # 默认位置(frac=0.95, rscale=1)
+  position_frac_0_25: [0.6026, 0.0198, 0.7814]   # --apple-root (frac=0.25)
+
+# ---- 派生量(校验用;由上面数据算出,标定后应能对上) ----
+derived:
+  base_to_tree_root_horizontal: 0.7552   # sqrt(0.7526^2 + 0.0624^2)
+  base_to_tree_root_dxdydz: [0.7526, -0.0624, -0.3989]   # root - base
+  base_height_above_tree_root: 0.3989    # ≈ 0.40
+  tree_root_bearing_deg_from_plus_x: -4.7   # 树根在基座 +x 方向偏 -y 侧 4.7°
+  trunk_centerline_at_z0_40: [0.7413, -0.0408]   # 树干有倾斜,轴线随高度移动
+  trunk_centerline_at_z0_82: [0.7320, -0.0339]   # 苹果枝高度处
+
+validation_hint: |
+  在 Isaac 里摆好后自检:
+  1) 机器人基座底面中心到树干最底节点的水平距离 ≈ 0.755 m;
+  2) 基座比树根高 ≈ 0.40 m(两者同站地面时给机器人 0.4 m 台座);
+  3) 把 home_joint_positions 打到机械臂上,EE 应指向树的方向;
+  4) 回放任一 grasp_path_*.csv,末帧 EE 应落在苹果位置附近
+     (默认 frac=0.95 时 ≈ [0.219, 0.061, 0.767],误差 < 2 cm)。
