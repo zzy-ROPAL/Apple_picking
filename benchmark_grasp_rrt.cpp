@@ -219,6 +219,10 @@ struct RunResult {
     // is active) — isolates wiggle caused by branch interaction near the apple.
     float   path_env_turning_deg   = 0.0f;
     float   shortcut_ms            = 0.0f;  // 方法1: score-aware shortcut 用时 (0 = off)
+    // finger-first 事后指标: 路径上手部球首次触及苹果的部位与对准角
+    int         first_contact_wp        = -1;     // -1 = 全程未触
+    float       first_contact_align_deg = -1.0f;  // 触点处 ẑ_g 与 palm→apple 夹角
+    std::string first_contact_part      = "none"; // palm / mouth / finger
     int     path_env_turns         = 0;
 };
 
@@ -325,7 +329,7 @@ void writeCsvHeader(std::ofstream& f) {
       << "winner_segments,winner_switches,winner_switch_rate,"
       // Group E4: EE-path smoothness (raw path)
       << "path_total_turning_deg,path_mean_turning_deg,path_reversals,"
-      << "path_env_turning_deg,path_env_turns,shortcut_ms\n";
+      << "path_env_turning_deg,path_env_turns,shortcut_ms,first_contact_wp,first_contact_align_deg,first_contact_part\n";
 }
 
 void writeCsvRow(std::ofstream& f, const RunResult& r) {
@@ -379,7 +383,9 @@ void writeCsvRow(std::ofstream& f, const RunResult& r) {
     // Group E4: EE-path smoothness
     f << fmt(r.path_total_turning_deg) << "," << fmt(r.path_mean_turning_deg) << ","
       << r.path_reversals << "," << fmt(r.path_env_turning_deg) << ","
-      << r.path_env_turns << "," << fmt(r.shortcut_ms) << "\n";
+      << r.path_env_turns << "," << fmt(r.shortcut_ms) << ","
+      << r.first_contact_wp << "," << fmt(r.first_contact_align_deg) << ","
+      << r.first_contact_part << "\n";
 }
 
 // ============================================================================
@@ -433,6 +439,7 @@ int main(int argc, char* argv[]) {
     int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
     float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
 
+    bool  finger_first       = false;   // --finger-first: 指尖先触转向引导(纯引导,无拒绝)
     bool  shortcut_enabled   = false;   // --shortcut: 方法1 — 解路径 score-aware 捷径剪枝
     bool  sticky_escape_sign = false;   // --sticky-escape-sign: change 1 — 逃逸箭头平局一致性(仅 tensor 转向)
     std::string er_links;               // --er-links "panda_link7:0,panda_link5:2": tensor ER 自定义计分球(链接名:球序号)
@@ -550,6 +557,8 @@ int main(int argc, char* argv[]) {
         } else if (a == "--sample-steering-anisotropy" && i + 1 < argc) {
             sample_steering_min_anisotropy = std::max(0.0f, std::min(1.0f,
                                               static_cast<float>(std::atof(argv[++i]))));
+        } else if (a == "--finger-first") {
+            finger_first = true;
         } else if (a == "--shortcut") {
             shortcut_enabled = true;
         } else if (a == "--sticky-escape-sign") {
@@ -1183,6 +1192,13 @@ int main(int argc, char* argv[]) {
     config.sample_steering_cos_cap         = sample_steering_cos_cap;
     config.sample_steering_k               = sample_steering_k;
     config.sample_steering_min_anisotropy  = sample_steering_min_anisotropy;
+    // Finger-first steering(纯引导,无拒绝)
+    config.finger_first_steering = finger_first;
+    if (finger_first) {
+        std::cout << "[Setup] FINGER-FIRST STEERING ENABLED (align gain="
+                  << config.ff_align_gain << ", zone " << config.ff_far
+                  << "->" << config.ff_near << " m)\n";
+    }
     // Change 1: sticky escape sign(仅 tensor 转向使用)
     config.sample_steering_sticky_sign     = sticky_escape_sign;
     if (sticky_escape_sign) {
@@ -1234,6 +1250,40 @@ int main(int argc, char* argv[]) {
     if (!label_suffix.empty()) out_dir += "_" + label_suffix;
     mkdir(out_dir.c_str(), 0755);  // ignore EEXIST
     std::cout << "[Setup] Output directory: " << out_dir << "/\n";
+
+    // ---- 9b. 导出场景布局 (给 Isaac Sim 对齐用) ----
+    // 单一出口: SdfCostEvaluator 里注册过的全部圆柱 (rigid 标志区分硬/软),
+    // 自动覆盖所有场景变体 (标准 / --sparse-long / --diag / --tree6 / aniso)。
+    // 坐标均在机器人基座 frame (基座即原点), 单位米。
+    // 注意: --diag 场景的 Branch A 在 Bullet 里是硬障碍但 SDF 里登记为软,
+    // 导出 class 以 SDF rigid 标志为准, 该诊断场景下需人工留意。
+    {
+        std::ofstream sf(out_dir + "/scene_layout.json");
+        if (sf.is_open()) {
+            auto vec3 = [](const Vector3f& v) {
+                std::ostringstream ss;
+                ss << "[" << v.x() << ", " << v.y() << ", " << v.z() << "]";
+                return ss.str();
+            };
+            const auto& cyls = cost_evaluator->getCylinders();
+            sf << "{\n"
+               << "  \"comment\": \"机器人基座 frame, 米; 圆柱 = p0/p1 两端点 + 半径; "
+                  "p0==p1 表示球体; class hard=碰到判FAIL, soft=可推开\",\n"
+               << "  \"apple\": {\"center\": " << vec3(scene.apple_pos)
+               << ", \"radius\": " << scene.apple_radius << "},\n"
+               << "  \"cylinders\": [\n";
+            for (size_t i = 0; i < cyls.size(); ++i) {
+                const auto& c = cyls[i];
+                sf << "    {\"p0\": " << vec3(c.p0) << ", \"p1\": " << vec3(c.p1)
+                   << ", \"radius\": " << c.radius
+                   << ", \"class\": \"" << (c.exclude_from_aniso ? "hard" : "soft")
+                   << "\"}" << (i + 1 < cyls.size() ? "," : "") << "\n";
+            }
+            sf << "  ]\n}\n";
+            std::cout << "[Setup] Scene layout exported: " << out_dir
+                      << "/scene_layout.json (" << cyls.size() << " cylinders)\n";
+        }
+    }
 
     std::ofstream csv_file(out_dir + "/benchmark_results.csv");
     if (!csv_file.is_open()) {
@@ -1563,6 +1613,46 @@ int main(int argc, char* argv[]) {
                 }
                 result.path_env_turning_deg = static_cast<float>(env_turn);
                 result.path_env_turns       = env_turns;
+
+                // ---- Finger-first 事后指标:首次触及苹果的部位与对准角 ----
+                // 手部 4 球(palm / mouth-front / 两指),球心距苹果心
+                // ≤ r_sphere + r_apple 记为接触;取路径上首个接触路点。
+                {
+                    struct HS { const char* part; Vector3f off; };
+                    const HS hs[4] = {
+                        {"palm",   Vector3f(0.0f, 0.0f, 0.0f)},
+                        {"mouth",  Vector3f(0.0f, 0.0f, 0.08f)},
+                        {"finger", Vector3f(0.0f, 0.04f, 0.05f)},
+                        {"finger", Vector3f(0.0f, -0.04f, 0.05f)},
+                    };
+                    const float touch_r = 0.06f + scene.apple_radius;
+                    for (size_t i = 0; i < solution.size(); ++i) {
+                        robot->setJointValues(solution[i]);
+                        Matrix4f hp = robot->getGCPGlobalPose();
+                        Vector3f p_palm = hp.block<3,1>(0,3);
+                        const char* hit = nullptr;
+                        for (const auto& h : hs) {
+                            Vector3f pw = p_palm + hp.block<3,3>(0,0) * h.off;
+                            if ((pw - scene.apple_pos).norm() <= touch_r) {
+                                hit = h.part;
+                                break;
+                            }
+                        }
+                        if (hit) {
+                            result.first_contact_wp   = static_cast<int>(i);
+                            result.first_contact_part = hit;
+                            Vector3f z_g = hp.block<3,1>(0,2);
+                            Vector3f u = scene.apple_pos - p_palm;
+                            if (u.norm() > 1e-6f && z_g.norm() > 1e-6f) {
+                                float c = std::max(-1.0f, std::min(1.0f,
+                                    z_g.normalized().dot(u.normalized())));
+                                result.first_contact_align_deg =
+                                    std::acos(c) * 180.0f / static_cast<float>(M_PI);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
 
             auto grasps = planner->getGraspResults();

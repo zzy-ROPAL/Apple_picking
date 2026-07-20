@@ -1310,6 +1310,51 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
         }
     }
 
+    // ---- Finger-first steering(纯引导,见 types.h 注释) ----
+    // 侧向先触会把自由苹果拨走;这里在下探每步:
+    //   (a) 把爪口轴转向苹果(提前对准,改变收敛顺序:先转后到);
+    //   (b) 未对准时软性放慢朝苹果的前进分量(给 (a) 转身时间)。
+    // 全程平滑权重、无拒绝 —— 最坏情况只是多走几步,不会失败。
+    if (config_.finger_first_steering) {
+        Vector3f p_palm = current_pose.block<3,1>(0, 3);
+        Vector3f z_g    = current_pose.block<3,1>(0, 2);   // 手爪接近轴
+        Vector3f to_apple = target_object_position_ - p_palm;
+        float d = to_apple.norm();
+        if (d > 1e-6f && d < config_.ff_far && z_g.norm() > 1e-6f) {
+            // 平滑激活权重 w(d): ff_far→ff_near 从 0 升到 1
+            float s = (config_.ff_far - d)
+                    / std::max(1e-6f, config_.ff_far - config_.ff_near);
+            s = std::max(0.0f, std::min(1.0f, s));
+            float w = s * s * (3.0f - 2.0f * s);
+
+            Vector3f u = to_apple / d;
+            float cos_phi = std::max(-1.0f, std::min(1.0f, z_g.dot(u)));
+            float phi = std::acos(cos_phi);
+
+            // (a) 旋转偏置:Δω = w·gain·φ,绕 (ẑ_g × u)
+            Vector3f rot_axis = z_g.cross(u);
+            float axis_norm = rot_axis.norm();
+            if (axis_norm > 1e-6f && phi > 1e-3f) {
+                float ang = w * config_.ff_align_gain * phi;
+                Eigen::AngleAxisf bias(ang, rot_axis / axis_norm);
+                delta_pose.block<3,3>(0, 0) =
+                    bias.toRotationMatrix() * delta_pose.block<3,3>(0, 0);
+            }
+
+            // (b) 前进软刹车:缩放位置增量里朝苹果的分量(仅在靠近时)
+            Vector3f dp = delta_pose.block<3,1>(0, 3);
+            float adv = dp.dot(u);
+            if (adv > 0.0f) {
+                float scale = config_.ff_min_advance
+                            + (1.0f - config_.ff_min_advance)
+                              * std::max(0.0f, cos_phi);
+                float scale_eff = 1.0f - w * (1.0f - scale);
+                dp += (scale_eff - 1.0f) * adv * u;
+                delta_pose.block<3,1>(0, 3) = dp;
+            }
+        }
+    }
+
     // 限制步长
     delta_pose = limitWorkspaceStep(delta_pose);
 

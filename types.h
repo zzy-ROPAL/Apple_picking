@@ -221,6 +221,21 @@ struct GraspRrtConfig {
     // least-radial acceptable motion); 0.7 = land inside the cone,
     // mimicking the interior-average that rejection resampling achieves.
     float sample_steering_overshoot     = 0.7f;
+    // ---- Finger-first steering(纯引导,无拒绝) ----
+    // 下探接近苹果时软性引导"指尖先接触":
+    //   (a) 旋转偏置:把爪口轴 ẑ_g 转向苹果方向 u,提前对准
+    //       Δω = w(d)·gain·φ·(ẑ_g×u)̂,φ = 夹角;
+    //   (b) 前进软刹车:未对准时缩放朝苹果的前进分量
+    //       scale = min_advance + (1−min_advance)·cosφ(下限 0.3,永不禁止);
+    //   w(d) = smoothstep,d 从 ff_far 到 ff_near 平滑升到 1(无阈值面)。
+    // 动机:侧向先触会把自由苹果拨走(Isaac 实测);硬约束会加拒绝
+    // 压力,故全部用转向偏置实现。
+    bool  finger_first_steering = false;
+    float ff_align_gain         = 1.0f;
+    float ff_far                = 0.15f;   // 激活外半径 (m)
+    float ff_near               = 0.05f;   // w=1 内半径 (m)
+    float ff_min_advance        = 0.3f;    // 前进分量最小保留比例
+
     // Change 1(sticky escape sign,仅 tensor 转向):±e_min 得分严格
     // 相等,旧规则用含噪提议方向定向导致逐周期符号抛硬币(之字形来源
     // 之一)。开启后箭头沿树父子链/下探步序继承,平局裁决保持一致。
