@@ -469,32 +469,60 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
             {fid_lh, Vector3f(0,0,0.08f)}
         };
 
-        Vector3f trunk_axis(0.7f, 0.0f, 0.0f);
-        constexpr float trunk_trigger = 0.20f;
+        // ---- 泛化:遍历全部 rigid 圆柱,每段用真实轴向 ----
+        // 原实现只针对树干且硬编码竖直轴 (0.7,0)——对 tree6 倾斜树干仅是
+        // 近似,对刚性苹果枝(水平)完全无覆盖:引力场把搜索直拽进刚性
+        // 枝、无切向绕行(start 3 卡死成因之一)。现遍历 SDF 中全部
+        // rigid 圆柱(exclude_from_aniso=true:树干各段 + tree6 刚性
+        // 苹果枝):
+        //   斥力 = 径向(点到线段最近点方向),1/d²
+        //   旋涡 = axis_unit × radial(绕该段真实轴的切向),1.5× 权重
+        // 退化圆柱(p0==p1,如 overhead 球)跳过——其斥力仍由
+        // setHardObstacle 单独提供,与旧版一致。标准场景的竖直树干在
+        // 新公式下方向与旧版相同(axis=ẑ 时二者等价),历史行为保持。
+        constexpr float rigid_trigger = 0.20f;
+        auto sdf_eval_vf = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
 
-        for (const auto& pt : trunk_points) {
-            Matrix4f pose = robot_->getFramePoseById(pt.fid);
-            Vector3f p = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * pt.offset;
-            Vector3f p_to_trunk = p - trunk_axis;
-            p_to_trunk.z() = 0.0f;
-            float dist = p_to_trunk.norm();
+        if (sdf_eval_vf) {
+            const auto& cyls = sdf_eval_vf->getCylinders();
+            for (const auto& pt : trunk_points) {
+                Matrix4f pose = robot_->getFramePoseById(pt.fid);
+                Vector3f p = pose.block<3,1>(0,3)
+                           + pose.block<3,3>(0,0) * pt.offset;
 
-            if (dist < trunk_trigger && dist > 0.01f) {
-                p_to_trunk.normalize();
-                float force_mag = 1.0f / (dist * dist);
+                for (const auto& cyl : cyls) {
+                    if (!cyl.exclude_from_aniso) continue;             // 仅 rigid
+                    if (cyl.axis_unit.squaredNorm() < 0.25f) continue; // 退化跳过
 
-                Eigen::VectorXf e_rep = Eigen::VectorXf::Zero(6);
-                e_rep.head<3>() = p_to_trunk * force_mag;
-                Config link_rep = J_T * e_rep;
-                if (link_rep.norm() > 1e-6f) hard_trunk_rep_vector += link_rep.normalized();
+                    Vector3f seg = cyl.p1 - cyl.p0;
+                    float seg_sq = seg.squaredNorm();
+                    float t = (seg_sq > 1e-9f)
+                        ? std::max(0.0f, std::min(1.0f,
+                              (p - cyl.p0).dot(seg) / seg_sq))
+                        : 0.0f;
+                    Vector3f radial = p - (cyl.p0 + t * seg);
+                    float dist = radial.norm();
+                    if (dist >= rigid_trigger || dist <= 0.01f) continue;
 
-                Vector3f vortex_dir = Vector3f(0,0,1).cross(p_to_trunk);
-                if (vortex_dir.norm() > 1e-6f) {
-                    vortex_dir.normalize();
-                    Eigen::VectorXf e_v = Eigen::VectorXf::Zero(6);
-                    e_v.head<3>() = vortex_dir * force_mag * 1.5f;
-                    Config link_vortex = J_T * e_v;
-                    if (link_vortex.norm() > 1e-6f) vortex_vector += link_vortex.normalized();
+                    radial /= dist;
+                    float force_mag = 1.0f / (dist * dist);
+
+                    Eigen::VectorXf e_rep = Eigen::VectorXf::Zero(6);
+                    e_rep.head<3>() = radial * force_mag;
+                    Config link_rep = J_T * e_rep;
+                    if (link_rep.norm() > 1e-6f)
+                        hard_trunk_rep_vector += link_rep.normalized();
+
+                    Vector3f vortex_dir = cyl.axis_unit.cross(radial);
+                    if (vortex_dir.norm() > 1e-6f) {
+                        vortex_dir.normalize();
+                        Eigen::VectorXf e_v = Eigen::VectorXf::Zero(6);
+                        e_v.head<3>() = vortex_dir * force_mag * 1.5f;
+                        Config link_vortex = J_T * e_v;
+                        if (link_vortex.norm() > 1e-6f)
+                            vortex_vector += link_vortex.normalized();
+                    }
                 }
             }
         }
