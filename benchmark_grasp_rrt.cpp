@@ -411,7 +411,8 @@ int main(int argc, char* argv[]) {
     bool aniso_horiz_scene = false;   // --aniso-horiz-scene: horizontal cylinder (axis y) wrapping apple
     bool aniso_branch_scene = false;  // --aniso-branch-scene: cylinder grown from trunk toward apple
     bool add_apple_branch   = false;  // --apple-branch: add the thick trunk→apple cylinder ON TOP of standard 10-branch apple-tree scene (apple embedded inside the new branch)
-    bool tree6_scene        = false;  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches × 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
+    bool tree6_scene        = false;
+    bool tree6_simple       = false;  // --tree6-simple: 简化加粗版 tree6 (枝条按 30° 合并 + 统一 r=0.03; 苹果枝仍 rigid)  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches × 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
     bool tree6_apple_root   = false;  // --apple-root: shortcut for --apple-frac 0.25 (only meaningful with --tree6)
     float tree6_apple_frac  = 0.95f;  // --apple-frac F: fraction along the 5th branch arclength (0=root, 1=tip)
     float branch_rscale     = 1.0f;   // --branch-rscale S: multiply every tree6 branch radius by S (2=double). Apple offset tracks the scaled apple-branch radius.
@@ -440,6 +441,8 @@ int main(int argc, char* argv[]) {
     float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
 
     bool  finger_first       = false;   // --finger-first: 指尖先触转向引导(纯引导,无拒绝)
+    float ff_gain            = 1.0f;    // --ff-gain F: 转向旋转偏置增益
+    float ff_far             = 0.15f;   // --ff-far F: 激活外半径 (m)
     bool  shortcut_enabled   = false;   // --shortcut: 方法1 — 解路径 score-aware 捷径剪枝
     bool  sticky_escape_sign = false;   // --sticky-escape-sign: change 1 — 逃逸箭头平局一致性(仅 tensor 转向)
     std::string er_links;               // --er-links "panda_link7:0,panda_link5:2": tensor ER 自定义计分球(链接名:球序号)
@@ -493,6 +496,9 @@ int main(int argc, char* argv[]) {
             add_apple_branch = true;
         } else if (a == "--tree6") {
             tree6_scene = true;
+        } else if (a == "--tree6-simple") {
+            tree6_scene  = true;
+            tree6_simple = true;
         } else if (a == "--apple-root") {
             tree6_apple_root = true;
         } else if (a == "--apple-frac" && i + 1 < argc) {
@@ -559,6 +565,10 @@ int main(int argc, char* argv[]) {
                                               static_cast<float>(std::atof(argv[++i]))));
         } else if (a == "--finger-first") {
             finger_first = true;
+        } else if (a == "--ff-gain" && i + 1 < argc) {
+            ff_gain = std::max(0.1f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--ff-far" && i + 1 < argc) {
+            ff_far = std::max(0.06f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--shortcut") {
             shortcut_enabled = true;
         } else if (a == "--sticky-escape-sign") {
@@ -738,6 +748,7 @@ int main(int argc, char* argv[]) {
             }
             acc += seg_len[i];
         }
+        if (tree6_simple) local_r = 0.03f;  // 简化版: 统一枝半径 0.03
         local_r *= branch_rscale;   // apple sits below the (possibly thickened) branch surface
         scene.apple_pos = Vector3f(attach.x(), attach.y(),
                                     attach.z() - local_r - scene.apple_radius);
@@ -991,9 +1002,31 @@ int main(int argc, char* argv[]) {
         int n_soft = 0, n_rigid = 0;
         for (int b = 0; b < 23; ++b) {
             bool is_apple_branch = (b == APPLE_BRANCH_IDX);
-            for (int i = 0; i < 5; ++i) {
-                Vector3f p0 = BRANCH_NODES[b][i], p1 = BRANCH_NODES[b][i+1];
-                float r = 0.5f * (BRANCH_RAD[b][i] + BRANCH_RAD[b][i+1]) * branch_rscale;
+
+            // 简化版(--tree6-simple):按 30° 弯折角合并节点(与
+            // visualize_tree6_simple.py 同算法), 统一半径 0.03。
+            std::vector<Vector3f> poly;
+            if (tree6_simple) {
+                poly.push_back(BRANCH_NODES[b][0]);
+                for (int i = 1; i < 5; ++i) {
+                    Vector3f d0 = BRANCH_NODES[b][i] - poly.back();
+                    Vector3f d1 = BRANCH_NODES[b][i+1] - BRANCH_NODES[b][i];
+                    if (d0.norm() < 1e-9f || d1.norm() < 1e-9f) continue;
+                    float c = std::max(-1.0f, std::min(1.0f,
+                        d0.normalized().dot(d1.normalized())));
+                    if (std::acos(c) * 180.0f / static_cast<float>(M_PI) >= 30.0f)
+                        poly.push_back(BRANCH_NODES[b][i]);
+                }
+                poly.push_back(BRANCH_NODES[b][5]);
+            } else {
+                for (int i = 0; i <= 5; ++i) poly.push_back(BRANCH_NODES[b][i]);
+            }
+
+            for (size_t i = 0; i + 1 < poly.size(); ++i) {
+                Vector3f p0 = poly[i], p1 = poly[i+1];
+                float r = tree6_simple
+                    ? 0.03f * branch_rscale
+                    : 0.5f * (BRANCH_RAD[b][i] + BRANCH_RAD[b][i+1]) * branch_rscale;
                 if (is_apple_branch) {
                     float halfLen = 0.5f * (p1 - p0).norm();
                     collision_checker_ptr->addObstacleCylinder(r, halfLen, makeCylinderPose(p0, p1));
@@ -1005,7 +1038,8 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
-        std::cout << "[Setup] --tree6: 8 trunk segs (hard+SDF), "
+        std::cout << "[Setup] --tree6" << (tree6_simple ? "-simple" : "")
+                  << ": 8 trunk segs (hard+SDF), "
                   << n_rigid << " rigid apple-branch segs (hard+SDF), "
                   << n_soft << " soft branch segs (SDF only), apple at "
                   << scene.apple_pos.transpose() << "\n";
@@ -1194,6 +1228,8 @@ int main(int argc, char* argv[]) {
     config.sample_steering_min_anisotropy  = sample_steering_min_anisotropy;
     // Finger-first steering(纯引导,无拒绝)
     config.finger_first_steering = finger_first;
+    config.ff_align_gain         = ff_gain;
+    config.ff_far                = ff_far;
     if (finger_first) {
         std::cout << "[Setup] FINGER-FIRST STEERING ENABLED (align gain="
                   << config.ff_align_gain << ", zone " << config.ff_far

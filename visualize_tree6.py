@@ -215,6 +215,14 @@ def main():
     home_pose = [0.0, -math.pi / 4, 0.0, -3 * math.pi / 4, 0.0, math.pi / 2, math.pi / 4]
     for i, q in enumerate(home_pose):
         p.resetJointState(robot_id, i, q)
+    import sys as _sys2
+    if "--start" in _sys2.argv:
+        _si = _sys2.argv.index("--start")
+        if _si + 1 < len(_sys2.argv):
+            vals = [float(x) for x in _sys2.argv[_si + 1].split(",")]
+            for i in range(7):
+                p.resetJointState(robot_id, i, vals[i])
+            print("[tree6 viz] robot posed at --start config")
 
     # Camera framing the tree from the front
     p.resetDebugVisualizerCamera(

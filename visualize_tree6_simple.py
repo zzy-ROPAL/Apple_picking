@@ -63,12 +63,12 @@ def report(simplified):
     print(f"new uniform radius:     {BR_R_10BRANCH*1000:.0f} mm (= 10-branch scene)")
 
 
-def apple_position(radius_override):
-    """与 benchmark 相同逻辑:第 5 枝(index 4)弧长 0.95 处,枝面下方。"""
+def apple_position(radius_override, frac=0.95):
+    """与 benchmark 相同逻辑:第 5 枝(index 4)弧长 frac 处,枝面下方。"""
     nodes = [np.asarray(q, float) for q in BRANCH_NODES[4]]
     seg = [np.linalg.norm(nodes[i + 1] - nodes[i]) for i in range(5)]
     total = sum(seg)
-    target = 0.95 * total
+    target = frac * total
     acc = 0.0
     attach = nodes[5]
     for i in range(5):
@@ -88,6 +88,10 @@ def main():
     ap.add_argument("--radius", type=float, default=BR_R_10BRANCH)
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--path", type=str, default=None)
+    ap.add_argument("--start", type=str, default=None,
+                    help="7 comma-separated joint values: pose the robot there")
+    ap.add_argument("--apple-frac", type=float, default=0.95,
+                    help="apple position as fraction along branch 5 arclength (0.25 = near root)")
     args, _ = ap.parse_known_args()
 
     simplified = build_simplified(args.angle)
@@ -142,7 +146,7 @@ def main():
         for i in range(len(poly) - 1):
             add_cyl(poly[i], poly[i + 1], args.radius, col)
 
-    apple = apple_position(args.radius)
+    apple = apple_position(args.radius, args.apple_frac)
     vis = p.createVisualShape(p.GEOM_SPHERE, radius=APPLE_R, rgbaColor=[0.85, 0.10, 0.10, 1.0])
     p.createMultiBody(0, baseVisualShapeIndex=vis, basePosition=apple)
     print(f"[tree6-simple viz] apple at {np.round(apple,3)}")
@@ -150,13 +154,58 @@ def main():
     robot_id = p.loadURDF("franka_panda/panda.urdf", [0, 0, 0.4], useFixedBase=True)
     for i, q in enumerate(HOME):
         p.resetJointState(robot_id, i, q)
+    if args.start:
+        vals = [float(x) for x in args.start.split(",")]
+        for i in range(7):
+            p.resetJointState(robot_id, i, vals[i])
+        print("[tree6-simple viz] robot posed at --start config")
     p.resetDebugVisualizerCamera(cameraDistance=2.0, cameraYaw=-55.0,
                                  cameraPitch=-12.0, cameraTargetPosition=[0.6, 0.0, 1.0])
 
+    # ---- 轨迹回放 + EE 蓝→红描线(注意:历史路径是在"细枝原版"
+    # 场景里规划的,放到加粗场景里只作直观参考,穿枝属正常现象) ----
+    waypoints = []
+    if args.path and __import__("os").path.exists(args.path):
+        with open(args.path) as f:
+            for line in f:
+                if line.strip():
+                    waypoints.append([float(x) for x in line.strip().split(",")])
+        print(f"[tree6-simple viz] loaded {len(waypoints)} waypoints")
+        hand_link = None
+        for j in range(p.getNumJoints(robot_id)):
+            if p.getJointInfo(robot_id, j)[12].decode() == "panda_hand":
+                hand_link = j
+                break
+        if hand_link is not None:
+            ee = []
+            for w in waypoints:
+                for i in range(7):
+                    p.resetJointState(robot_id, i, w[i])
+                ee.append(p.getLinkState(robot_id, hand_link)[0])
+            n = len(ee)
+            for i in range(n - 1):
+                t = i / max(1, n - 2)
+                p.addUserDebugLine(ee[i], ee[i + 1],
+                                   lineColorRGB=[t, 0.1, 1.0 - t], lineWidth=3)
+            for i in range(7):
+                p.resetJointState(robot_id, i, waypoints[0][i])
+
     print("[tree6-simple viz] close window to exit")
     try:
-        while p.isConnected():
-            time.sleep(1.0 / 60.0)
+        if waypoints:
+            while p.isConnected():
+                for w in range(len(waypoints) - 1):
+                    a = np.array(waypoints[w][:7])
+                    b = np.array(waypoints[w + 1][:7])
+                    for k in range(6):
+                        q = (1 - k / 6.0) * a + (k / 6.0) * b
+                        for i in range(7):
+                            p.resetJointState(robot_id, i, q[i])
+                        time.sleep(0.01)
+                time.sleep(1.5)
+        else:
+            while p.isConnected():
+                time.sleep(1.0 / 60.0)
     except Exception:
         pass
 
