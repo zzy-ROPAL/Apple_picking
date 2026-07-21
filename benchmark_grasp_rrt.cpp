@@ -412,7 +412,8 @@ int main(int argc, char* argv[]) {
     bool aniso_branch_scene = false;  // --aniso-branch-scene: cylinder grown from trunk toward apple
     bool add_apple_branch   = false;  // --apple-branch: add the thick trunk→apple cylinder ON TOP of standard 10-branch apple-tree scene (apple embedded inside the new branch)
     bool tree6_scene        = false;
-    bool tree6_simple       = false;  // --tree6-simple: 简化加粗版 tree6 (枝条按 30° 合并 + 统一 r=0.03; 苹果枝仍 rigid)  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches × 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
+    bool tree6_simple       = false;
+    bool apple_branch_soft  = false;  // --apple-branch-soft: tree6 苹果枝改为软枝 (仅 SDF, 无硬碰撞, 无 rigid 旋涡)  // --tree6-simple: 简化加粗版 tree6 (枝条按 30° 合并 + 统一 r=0.03; 苹果枝仍 rigid)  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches × 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
     bool tree6_apple_root   = false;  // --apple-root: shortcut for --apple-frac 0.25 (only meaningful with --tree6)
     float tree6_apple_frac  = 0.95f;  // --apple-frac F: fraction along the 5th branch arclength (0=root, 1=tip)
     float branch_rscale     = 1.0f;   // --branch-rscale S: multiply every tree6 branch radius by S (2=double). Apple offset tracks the scaled apple-branch radius.
@@ -499,6 +500,8 @@ int main(int argc, char* argv[]) {
         } else if (a == "--tree6-simple") {
             tree6_scene  = true;
             tree6_simple = true;
+        } else if (a == "--apple-branch-soft") {
+            apple_branch_soft = true;
         } else if (a == "--apple-root") {
             tree6_apple_root = true;
         } else if (a == "--apple-frac" && i + 1 < argc) {
@@ -1027,7 +1030,7 @@ int main(int argc, char* argv[]) {
                 float r = tree6_simple
                     ? 0.03f * branch_rscale
                     : 0.5f * (BRANCH_RAD[b][i] + BRANCH_RAD[b][i+1]) * branch_rscale;
-                if (is_apple_branch) {
+                if (is_apple_branch && !apple_branch_soft) {
                     float halfLen = 0.5f * (p1 - p0).norm();
                     collision_checker_ptr->addObstacleCylinder(r, halfLen, makeCylinderPose(p0, p1));
                     cost_evaluator->addRigidCylinder(p0, p1, r);
