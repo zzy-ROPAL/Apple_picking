@@ -447,6 +447,8 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
 
     Config hard_trunk_rep_vector = Eigen::VectorXf::Zero(dimension_);
     Config vortex_vector = Eigen::VectorXf::Zero(dimension_);
+    Config soft_stiff_vector = Eigen::VectorXf::Zero(dimension_);  // 软枝刚度场
+    float  bs_act = 0.0f;   // 最深接触的激活度 ∈ [0,1](轴心主导用)
 
     // Per-link trunk repulsion: check every major link, not just TCP
     {
@@ -492,9 +494,44 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                            + pose.block<3,3>(0,0) * pt.offset;
 
                 for (const auto& cyl : cyls) {
-                    if (!cyl.exclude_from_aniso) continue;             // 仅 rigid
                     if (cyl.axis_unit.squaredNorm() < 0.25f) continue; // 退化跳过
 
+                    // ---- 软枝刚度场(branch stiffness,可选) ----
+                    // force ∝ stiffness(t)·depth:根部/深处强推,梢部弱推。
+                    // 深度激活度 bs_act_ 抬升该项在 VF 合成中的权重直至
+                    // 轴心主导(> 引力),见合成处注释。
+                    if (!cyl.exclude_from_aniso) {
+                        if (!config_.branch_stiffness_enabled) continue;
+                        Vector3f seg = cyl.p1 - cyl.p0;
+                        float seg_sq = seg.squaredNorm();
+                        float u = (seg_sq > 1e-9f)
+                            ? std::max(0.0f, std::min(1.0f,
+                                  (p - cyl.p0).dot(seg) / seg_sq))
+                            : 0.0f;
+                        Vector3f radial = p - (cyl.p0 + u * seg);
+                        float dist = radial.norm();
+                        float shell = cyl.radius + config_.bs_shell;
+                        if (dist >= shell || dist <= 1e-4f) continue;
+
+                        float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
+                        float stiff = SdfCostEvaluator::branchStiffness(
+                            t_arc, config_.bs_k_root, config_.bs_k_tip);
+                        // depth ∈ (0,1]: 枝面 0 → 轴心 1
+                        float depth = (shell - dist) / shell;
+                        float act = std::min(1.0f,
+                            stiff * depth / std::max(1e-3f, config_.bs_k_root));
+                        if (act > bs_act) bs_act = act;
+
+                        radial /= dist;
+                        Eigen::VectorXf e_rep = Eigen::VectorXf::Zero(6);
+                        e_rep.head<3>() = radial * (stiff * depth);
+                        Config link_rep = J_T * e_rep;
+                        if (link_rep.norm() > 1e-6f)
+                            soft_stiff_vector += link_rep.normalized() * act;
+                        continue;
+                    }
+
+                    // ---- rigid 圆柱:斥力 + 旋涡(真实轴向) ----
                     Vector3f seg = cyl.p1 - cyl.p0;
                     float seg_sq = seg.squaredNorm();
                     float t = (seg_sq > 1e-9f)
@@ -528,6 +565,7 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
         }
         if (hard_trunk_rep_vector.norm() > 1e-6f) hard_trunk_rep_vector.normalize();
         if (vortex_vector.norm() > 1e-6f) vortex_vector.normalize();
+        if (soft_stiff_vector.norm() > 1e-6f) soft_stiff_vector.normalize();
     }
 
     Config total_hard_obs_rep = Eigen::VectorXf::Zero(dimension_);
@@ -620,7 +658,11 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
     }
 
     // 4. 加权融合
-    vf = 1.2f * rep_vector +
+    // 软枝刚度项权重:随最深接触激活度 0 → bs_weight_max(默认 6.0,
+    // 超过引力权重 4.0)。浅接触时只是普通斥力补充;贴近枝轴心时净场
+    // 必然向外 —— "轴心不可占据"。
+    float w_stiff = bs_act * config_.bs_weight_max;
+    vf = 1.2f * rep_vector + w_stiff * soft_stiff_vector +
          2.5f * hard_trunk_rep_vector + 2.0f * vortex_vector +
          2.5f * total_hard_obs_rep +
          4.0f * att_vector;
@@ -1379,6 +1421,58 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                 float scale_eff = 1.0f - w * (1.0f - scale);
                 dp += (scale_eff - 1.0f) * adv * u;
                 delta_pose.block<3,1>(0, 3) = dp;
+            }
+        }
+    }
+
+    // ---- Branch stiffness 下探偏置(与 VF 同款刚度模型) ----
+    // 下探不走 VF,单独加偏置:手部点在软枝壳层内时,把位置增量朝
+    // "刚度加权径向"方向弯折 —— 根部/深处强推,梢部弱推。按到苹果
+    // 距离渐隐(bs_descent_fade_r):终端漏斗内抓取位姿说了算,保证
+    // 嵌在枝上的苹果仍可达。纯引导,无拒绝。
+    if (config_.branch_stiffness_enabled) {
+        auto sdf_eval_bs = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval_bs) {
+            Vector3f p_ee = current_pose.block<3,1>(0, 3);
+            float d_apple = (target_object_position_ - p_ee).norm();
+            float fade = std::max(0.0f, std::min(1.0f,
+                d_apple / std::max(1e-3f, config_.bs_descent_fade_r)));
+            if (fade > 0.01f) {
+                Vector3f push = Vector3f::Zero();
+                float act = 0.0f;
+                for (const auto& cyl : sdf_eval_bs->getCylinders()) {
+                    if (cyl.exclude_from_aniso) continue;               // 仅软枝
+                    if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+                    Vector3f seg = cyl.p1 - cyl.p0;
+                    float seg_sq = seg.squaredNorm();
+                    float u = (seg_sq > 1e-9f)
+                        ? std::max(0.0f, std::min(1.0f,
+                              (p_ee - cyl.p0).dot(seg) / seg_sq))
+                        : 0.0f;
+                    Vector3f radial = p_ee - (cyl.p0 + u * seg);
+                    float dist = radial.norm();
+                    float shell = cyl.radius + config_.bs_shell;
+                    if (dist >= shell || dist <= 1e-4f) continue;
+                    float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
+                    float stiff = SdfCostEvaluator::branchStiffness(
+                        t_arc, config_.bs_k_root, config_.bs_k_tip);
+                    float depth = (shell - dist) / shell;
+                    push += (radial / dist) * (stiff * depth);
+                    act = std::max(act, std::min(1.0f,
+                        stiff * depth / std::max(1e-3f, config_.bs_k_root)));
+                }
+                float pn = push.norm();
+                Vector3f dp = delta_pose.block<3,1>(0, 3);
+                float dpn = dp.norm();
+                if (pn > 1e-6f && dpn > 1e-9f && act > 0.0f) {
+                    // 方向弯折,幅值保持:最坏情况只是绕行,不会停滞
+                    Vector3f bent = dp + fade * config_.bs_descent_gain
+                                       * act * dpn * (push / pn);
+                    float bn = bent.norm();
+                    if (bn > 1e-9f)
+                        delta_pose.block<3,1>(0, 3) = bent / bn * dpn;
+                }
             }
         }
     }

@@ -221,6 +221,24 @@ struct GraspRrtConfig {
     // least-radial acceptable motion); 0.7 = land inside the cone,
     // mimicking the interior-average that rejection resampling achieves.
     float sample_steering_overshoot     = 0.7f;
+    // ---- Branch stiffness(软枝刚度场,纯引导,无拒绝) ----
+    // 物理模型:枝条是悬臂梁 —— 根部硬(推不动,硬推会折断),梢部软
+    // (易拨开);越深入枝轴心,所需位移越大。编码为软枝斥力的
+    // 刚度加权:force ∝ stiffness(t)·depth,t = 弧长占比(0 根 1 梢)。
+    // 轴心主导:随最深接触的 stiffness·depth 激活度,斥力在 VF 合成中
+    // 的权重从 0 平滑升到 bs_weight_max(> 引力权重 4.0)——枝轴心
+    // 区域净场必然向外,"从中段硬切"不再被扩展强化。
+    // 下探侧同款偏置(bs_descent_gain),但按到苹果距离渐隐
+    // (bs_descent_fade_r),保证嵌在枝上的苹果仍可达。
+    // 只改提议分布,不改任何有效性判定:C_free 不变,概率完备性保持。
+    bool  branch_stiffness_enabled = false;
+    float bs_k_root        = 3.0f;   // 枝根刚度系数
+    float bs_k_tip         = 0.5f;   // 枝梢刚度系数
+    float bs_shell         = 0.10f;  // 作用壳层厚度 (m, 枝面以外)
+    float bs_weight_max    = 6.0f;   // 轴心主导权重上限 (> 4.0 攻击力权重)
+    float bs_descent_gain  = 1.0f;   // 下探偏置强度
+    float bs_descent_fade_r = 0.12f; // 下探偏置在苹果近旁的渐隐半径 (m)
+
     // ---- Finger-first steering(纯引导,无拒绝) ----
     // 下探接近苹果时软性引导"指尖先接触":
     //   (a) 旋转偏置:把爪口轴 ẑ_g 转向苹果方向 u,提前对准

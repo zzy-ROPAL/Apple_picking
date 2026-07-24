@@ -221,6 +221,10 @@ struct RunResult {
     float   shortcut_ms            = 0.0f;  // 方法1: score-aware shortcut 用时 (0 = off)
     // finger-first 事后指标: 路径上手部球首次触及苹果的部位与对准角
     int         first_contact_wp        = -1;     // -1 = 全程未触
+    // branch-stiffness 事后指标: "硬切"违规 —— 探针点穿入软枝深度
+    // 超过 allow(t)=5mm+25mm·t 的路点数, 以及最大超限量 (m)
+    int   cut_violations = 0;
+    float cut_worst_over = 0.0f;
     float       first_contact_align_deg = -1.0f;  // 触点处 ẑ_g 与 palm→apple 夹角
     std::string first_contact_part      = "none"; // palm / mouth / finger
     int     path_env_turns         = 0;
@@ -329,7 +333,7 @@ void writeCsvHeader(std::ofstream& f) {
       << "winner_segments,winner_switches,winner_switch_rate,"
       // Group E4: EE-path smoothness (raw path)
       << "path_total_turning_deg,path_mean_turning_deg,path_reversals,"
-      << "path_env_turning_deg,path_env_turns,shortcut_ms,first_contact_wp,first_contact_align_deg,first_contact_part\n";
+      << "path_env_turning_deg,path_env_turns,shortcut_ms,first_contact_wp,first_contact_align_deg,first_contact_part,cut_violations,cut_worst_over\n";
 }
 
 void writeCsvRow(std::ofstream& f, const RunResult& r) {
@@ -385,7 +389,8 @@ void writeCsvRow(std::ofstream& f, const RunResult& r) {
       << r.path_reversals << "," << fmt(r.path_env_turning_deg) << ","
       << r.path_env_turns << "," << fmt(r.shortcut_ms) << ","
       << r.first_contact_wp << "," << fmt(r.first_contact_align_deg) << ","
-      << r.first_contact_part << "\n";
+      << r.first_contact_part << "," << r.cut_violations << ","
+      << fmt(r.cut_worst_over) << "\n";
 }
 
 // ============================================================================
@@ -442,6 +447,7 @@ int main(int argc, char* argv[]) {
     int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
     float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
 
+    bool  branch_stiffness   = false;   // --branch-stiffness: 软枝刚度场 (根硬梢软 + 轴心主导 + 下探偏置)
     bool  finger_first       = false;   // --finger-first: 指尖先触转向引导(纯引导,无拒绝)
     float ff_gain            = 1.0f;    // --ff-gain F: 转向旋转偏置增益
     float ff_far             = 0.15f;   // --ff-far F: 激活外半径 (m)
@@ -569,6 +575,8 @@ int main(int argc, char* argv[]) {
         } else if (a == "--sample-steering-anisotropy" && i + 1 < argc) {
             sample_steering_min_anisotropy = std::max(0.0f, std::min(1.0f,
                                               static_cast<float>(std::atof(argv[++i]))));
+        } else if (a == "--branch-stiffness") {
+            branch_stiffness = true;
         } else if (a == "--finger-first") {
             finger_first = true;
         } else if (a == "--ff-gain" && i + 1 < argc) {
@@ -1031,6 +1039,12 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i <= 5; ++i) poly.push_back(BRANCH_NODES[b][i]);
             }
 
+            // 各段在整枝上的弧长占比 (branch-stiffness 刚度模型用)
+            std::vector<float> arc(poly.size(), 0.0f);
+            for (size_t i = 1; i < poly.size(); ++i)
+                arc[i] = arc[i-1] + (poly[i] - poly[i-1]).norm();
+            float arc_total = std::max(1e-6f, arc.back());
+
             for (size_t i = 0; i + 1 < poly.size(); ++i) {
                 Vector3f p0 = poly[i], p1 = poly[i+1];
                 float r = tree6_simple
@@ -1042,7 +1056,8 @@ int main(int argc, char* argv[]) {
                     cost_evaluator->addRigidCylinder(p0, p1, r);
                     ++n_rigid;
                 } else {
-                    cost_evaluator->addBranchCylinder(p0, p1, r);
+                    cost_evaluator->addBranchCylinder(p0, p1, r,
+                        arc[i] / arc_total, arc[i+1] / arc_total);
                     ++n_soft;
                 }
             }
@@ -1236,6 +1251,13 @@ int main(int argc, char* argv[]) {
     config.sample_steering_k               = sample_steering_k;
     config.sample_steering_min_anisotropy  = sample_steering_min_anisotropy;
     // Finger-first steering(纯引导,无拒绝)
+    config.branch_stiffness_enabled = branch_stiffness;
+    if (branch_stiffness) {
+        std::cout << "[Setup] BRANCH STIFFNESS ENABLED (k_root="
+                  << config.bs_k_root << " -> k_tip=" << config.bs_k_tip
+                  << ", shell=" << config.bs_shell
+                  << " m, w_max=" << config.bs_weight_max << ")\n";
+    }
     config.finger_first_steering = finger_first;
     config.ff_align_gain         = ff_gain;
     config.ff_far                = ff_far;
@@ -1696,6 +1718,53 @@ int main(int argc, char* argv[]) {
                             }
                             break;
                         }
+                    }
+                }
+
+                // ---- Branch-stiffness 事后指标:"硬切"违规计数 ----
+                // 探针点(与 VF 同款 6 个手臂点)穿入软枝的深度超过
+                // allow(t) = 5mm + 25mm·t(根部几乎不许压,梢部可压
+                // ~3cm)即记一次违规。反映"会折断枝条"的穿越。
+                {
+                    struct Probe { const char* frame; Vector3f off; };
+                    const Probe probes[6] = {
+                        {"panda_link3", Vector3f(0,0,0.15f)},
+                        {"panda_link4", Vector3f(0,0,0.05f)},
+                        {"panda_link5", Vector3f(0,0,0.15f)},
+                        {"panda_link6", Vector3f(0,0,0)},
+                        {"panda_link7", Vector3f(0,0,0.05f)},
+                        {"panda_hand",  Vector3f(0,0,0.08f)},
+                    };
+                    const auto& cyls2 = cost_evaluator->getCylinders();
+                    for (size_t i = 0; i < solution.size(); ++i) {
+                        robot->setJointValues(solution[i]);
+                        bool violated = false;
+                        for (const auto& pr : probes) {
+                            Matrix4f pose = robot->getFramePose(pr.frame);
+                            Vector3f pp = pose.block<3,1>(0,3)
+                                        + pose.block<3,3>(0,0) * pr.off;
+                            for (const auto& cyl : cyls2) {
+                                if (cyl.exclude_from_aniso) continue;
+                                if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+                                Vector3f seg = cyl.p1 - cyl.p0;
+                                float seg_sq = seg.squaredNorm();
+                                float u = (seg_sq > 1e-9f)
+                                    ? std::max(0.0f, std::min(1.0f,
+                                          (pp - cyl.p0).dot(seg) / seg_sq))
+                                    : 0.0f;
+                                float dist = (pp - (cyl.p0 + u * seg)).norm();
+                                float pen = cyl.radius - dist;   // >0 = 点在枝内
+                                if (pen <= 0.0f) continue;
+                                float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
+                                float allow = 0.005f + 0.025f * t_arc;
+                                if (pen > allow) {
+                                    violated = true;
+                                    result.cut_worst_over = std::max(
+                                        result.cut_worst_over, pen - allow);
+                                }
+                            }
+                        }
+                        if (violated) ++result.cut_violations;
                     }
                 }
             }

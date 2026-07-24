@@ -92,6 +92,8 @@ def main():
                     help="7 comma-separated joint values: pose the robot there")
     ap.add_argument("--apple-frac", type=float, default=0.95,
                     help="apple position as fraction along branch 5 arclength (0.25 = near root)")
+    ap.add_argument("--apple-hang", type=float, default=-1.0,
+                    help="apple center depth below branch axis in m (default: radius+0.04)")
     args, _ = ap.parse_known_args()
 
     simplified = build_simplified(args.angle)
@@ -146,7 +148,10 @@ def main():
         for i in range(len(poly) - 1):
             add_cyl(poly[i], poly[i + 1], args.radius, col)
 
+    hang = args.apple_hang if args.apple_hang > 0 else None
     apple = apple_position(args.radius, args.apple_frac)
+    if hang is not None:
+        apple[2] = apple[2] + (args.radius + APPLE_R) - hang   # 换成指定垂距
     vis = p.createVisualShape(p.GEOM_SPHERE, radius=APPLE_R, rgbaColor=[0.85, 0.10, 0.10, 1.0])
     p.createMultiBody(0, baseVisualShapeIndex=vis, basePosition=apple)
     print(f"[tree6-simple viz] apple at {np.round(apple,3)}")

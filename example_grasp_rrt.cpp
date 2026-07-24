@@ -23,6 +23,7 @@
 #include <cmath>
 #include <string>
 #include <fstream>
+#include <sstream>
 
 // GraspRRT 框架
 #include "types.h"
@@ -134,6 +135,69 @@ struct SceneConfig {
         home_pose << 0.0f, -M_PI/4, 0.0f, -3*M_PI/4, 0.0f, M_PI/2, M_PI/4;
     }
 };
+
+// ============================================================================
+// 场景布局导出 (给 Isaac Sim 对齐用)
+// ============================================================================
+// 把 Bullet 侧作为基准场景, 导出所有几何到 scene_layout.json。
+// 全部坐标在**机器人基座 frame**(本场景中机器人基座即世界原点):
+// Isaac 侧不要动机器人(FK 标定已验证过它), 只把树/苹果摆到这些相对位姿。
+static void exportSceneLayout(const SceneConfig& scene,
+                              const Config& start_config,
+                              const std::string& out_path = "scene_layout.json") {
+    std::ofstream f(out_path);
+    if (!f.is_open()) {
+        std::cerr << "[Warn] 无法写出场景布局: " << out_path << "\n";
+        return;
+    }
+    auto vec3 = [](const Vector3f& v) {
+        std::ostringstream ss;
+        ss << "[" << v.x() << ", " << v.y() << ", " << v.z() << "]";
+        return ss.str();
+    };
+
+    f << "{\n";
+    f << "  \"comment\": \"所有坐标在机器人基座 frame, 单位米/弧度; 圆柱以两端点 p0/p1 + 半径表示\",\n";
+    f << "  \"robot_base_note\": \"机器人基座在原点, Isaac 侧保持机器人不动, 移动树来对齐\",\n";
+    f << "  \"start_config\": [";
+    for (int i = 0; i < start_config.size(); ++i)
+        f << start_config[i] << (i + 1 < start_config.size() ? ", " : "");
+    f << "],\n";
+
+    // 树干 (硬障碍, 碰到 = FAIL)
+    Vector3f t0 = scene.trunk_center - Vector3f(0, 0, scene.trunk_height / 2.0f);
+    Vector3f t1 = scene.trunk_center + Vector3f(0, 0, scene.trunk_height / 2.0f);
+    f << "  \"trunk\": {\"p0\": " << vec3(t0) << ", \"p1\": " << vec3(t1)
+      << ", \"radius\": " << scene.trunk_radius << ", \"class\": \"hard\"},\n";
+
+    // 苹果上方硬障碍 (在硬碰撞检测里是球体, half_h 未使用)
+    f << "  \"overhead_obstacle\": {\"center\": " << vec3(scene.overhead.center)
+      << ", \"radius\": " << scene.overhead.radius << ", \"shape\": \"sphere\""
+      << ", \"class\": \"hard\"},\n";
+
+    // 树冠枝条 (可穿透软障碍, 允许推开) —— 端点计算与 SDF 导入完全一致
+    f << "  \"branches\": [\n";
+    for (size_t i = 0; i < scene.branches.size(); ++i) {
+        const auto& br = scene.branches[i];
+        float cos_a = std::cos(br.angle);
+        float sin_a = std::sin(br.angle);
+        Vector3f p0 = scene.trunk_center;
+        p0.z() = br.h;
+        p0.x() += scene.trunk_radius * cos_a;
+        p0.y() += scene.trunk_radius * sin_a;
+        Vector3f p1 = p0 + Vector3f(cos_a, sin_a, 0) * br.length;
+        f << "    {\"p0\": " << vec3(p0) << ", \"p1\": " << vec3(p1)
+          << ", \"radius\": " << br.radius << ", \"class\": \"soft\"}"
+          << (i + 1 < scene.branches.size() ? "," : "") << "\n";
+    }
+    f << "  ],\n";
+
+    // 苹果 (目标)
+    f << "  \"apple\": {\"center\": " << vec3(scene.apple_pos)
+      << ", \"radius\": " << scene.apple_radius << "}\n";
+    f << "}\n";
+    std::cout << "[Setup] Scene layout exported to: " << out_path << "\n";
+}
 
 // ============================================================================
 // Main
@@ -425,6 +489,9 @@ int main(int argc, char* argv[]) {
               << start_tcp.block<3,1>(0,3).transpose() << "\n";
     std::cout << "[Setup] Distance to apple: "
               << (start_tcp.block<3,1>(0,3) - scene.apple_pos).norm() << "m\n\n";
+
+    // 导出场景布局 (树/苹果/起始构型), 供 Isaac Sim 侧对齐场景
+    exportSceneLayout(scene, start_config);
 
     // ---- 12. 执行规划! ----
     std::cout << "============================================\n"

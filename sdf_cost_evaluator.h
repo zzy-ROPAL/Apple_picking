@@ -54,6 +54,10 @@ public:
         // (Optimization B) so per-cycle anisotropy checks skip the
         // normalize() call. Zero for degenerate cylinders (p0 == p1).
         Eigen::Vector3f axis_unit = Eigen::Vector3f::Zero();
+        // 本段在所属枝条上的弧长占比区间 [t0, t1](0 = 枝根, 1 = 枝梢)。
+        // 用于 branch-stiffness 刚度模型(根部更"硬")。单段枝默认 0..1。
+        float t0 = 0.0f;
+        float t1 = 1.0f;
     };
 
     struct RobotSphere {
@@ -73,14 +77,25 @@ public:
 
     void addBranchCylinder(const Eigen::Vector3f& p0,
                            const Eigen::Vector3f& p1,
-                           float radius) {
+                           float radius,
+                           float t0 = 0.0f, float t1 = 1.0f) {
         Eigen::Vector3f a = p1 - p0;
         float len = a.norm();
         Eigen::Vector3f a_unit = (len > 1e-6f)
             ? Eigen::Vector3f(a / len)
             : Eigen::Vector3f::Zero();
-        cylinders_.push_back({p0, p1, radius, /*exclude_from_aniso=*/false, a_unit});
+        cylinders_.push_back({p0, p1, radius, /*exclude_from_aniso=*/false,
+                              a_unit, t0, t1});
         sdf_built_ = false;
+    }
+
+    // branch-stiffness 刚度模型:软枝上 t 处的刚度系数。
+    //   t = 0(枝根,悬臂最硬)→ k_root;t = 1(枝梢,易弯)→ k_tip。
+    //   物理动机:真实枝条是悬臂梁,根部位移代价远大于梢部;把
+    //   "从中段/根部硬切过去会折断枝条"编码成场强差异。
+    static float branchStiffness(float t, float k_root, float k_tip) {
+        t = std::max(0.0f, std::min(1.0f, t));
+        return k_root + (k_tip - k_root) * t;
     }
 
     // Same as addBranchCylinder but flags the cylinder as RIGID — the
@@ -98,6 +113,10 @@ public:
         cylinders_.push_back({p0, p1, radius, /*exclude_from_aniso=*/true, a_unit});
         sdf_built_ = false;
     }
+
+    // 只读访问全部圆柱障碍 (含 rigid 标志)。用于把场景几何导出给
+    // Isaac Sim 对齐 (scene_layout.json), 单一出口, 覆盖所有场景变体。
+    const std::vector<CylinderObstacle>& getCylinders() const { return cylinders_; }
 
     void addRobotSphere(const std::string& link_name,
                         float radius,
