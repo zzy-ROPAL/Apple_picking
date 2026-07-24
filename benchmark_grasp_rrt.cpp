@@ -413,7 +413,8 @@ int main(int argc, char* argv[]) {
     bool add_apple_branch   = false;  // --apple-branch: add the thick trunk→apple cylinder ON TOP of standard 10-branch apple-tree scene (apple embedded inside the new branch)
     bool tree6_scene        = false;
     bool tree6_simple       = false;
-    bool apple_branch_soft  = false;  // --apple-branch-soft: tree6 苹果枝改为软枝 (仅 SDF, 无硬碰撞, 无 rigid 旋涡)  // --tree6-simple: 简化加粗版 tree6 (枝条按 30° 合并 + 统一 r=0.03; 苹果枝仍 rigid)  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches × 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
+    bool apple_branch_soft  = false;
+    float apple_hang        = -1.0f;  // --apple-hang F: 苹果心到枝轴的垂直距离 (m), <0 = 默认(枝面相切)  // --apple-branch-soft: tree6 苹果枝改为软枝 (仅 SDF, 无硬碰撞, 无 rigid 旋涡)  // --tree6-simple: 简化加粗版 tree6 (枝条按 30° 合并 + 统一 r=0.03; 苹果枝仍 rigid)  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches × 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
     bool tree6_apple_root   = false;  // --apple-root: shortcut for --apple-frac 0.25 (only meaningful with --tree6)
     float tree6_apple_frac  = 0.95f;  // --apple-frac F: fraction along the 5th branch arclength (0=root, 1=tip)
     float branch_rscale     = 1.0f;   // --branch-rscale S: multiply every tree6 branch radius by S (2=double). Apple offset tracks the scaled apple-branch radius.
@@ -502,6 +503,8 @@ int main(int argc, char* argv[]) {
             tree6_simple = true;
         } else if (a == "--apple-branch-soft") {
             apple_branch_soft = true;
+        } else if (a == "--apple-hang" && i + 1 < argc) {
+            apple_hang = static_cast<float>(std::atof(argv[++i]));
         } else if (a == "--apple-root") {
             tree6_apple_root = true;
         } else if (a == "--apple-frac" && i + 1 < argc) {
@@ -753,8 +756,11 @@ int main(int argc, char* argv[]) {
         }
         if (tree6_simple) local_r = 0.03f;  // 简化版: 统一枝半径 0.03
         local_r *= branch_rscale;   // apple sits below the (possibly thickened) branch surface
-        scene.apple_pos = Vector3f(attach.x(), attach.y(),
-                                    attach.z() - local_r - scene.apple_radius);
+        // --apple-hang: 直接指定苹果心到枝轴的垂距(可小于 local_r+r_apple,
+        // 即苹果嵌入枝包络 —— 用于对齐细枝场景的悬挂几何)
+        float hang = (apple_hang > 0.0f) ? apple_hang
+                                          : (local_r + scene.apple_radius);
+        scene.apple_pos = Vector3f(attach.x(), attach.y(), attach.z() - hang);
         // No overhead obstacle in tree6 — push it far so any hint referencing it is a no-op
         scene.overhead.center = Vector3f(100.0f, 100.0f, 100.0f);
         scene.overhead.radius = 0.001f;
