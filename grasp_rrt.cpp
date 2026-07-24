@@ -460,15 +460,18 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
         static int fid_l7 = robot_->getFrameId("panda_link7");
         static int fid_lh = robot_->getFrameId("panda_hand");
 
-        struct TrunkPoint { int fid; Vector3f offset; };
+        // radius = 该处机体近似半径(与 SDF 球模型一致)。软枝刚度场用
+        // "体表距离"(dist − radius)衡量深度 —— 质心距轴 6cm 而机体半径
+        // 6cm 时,机体已在碾压枝条,点距离会把深度低估整整一个体半径。
+        struct TrunkPoint { int fid; Vector3f offset; float radius; };
         TrunkPoint trunk_points[] = {
-            {fid_l2, Vector3f(0,0,0)},
-            {fid_l3, Vector3f(0,0,0.15f)},
-            {fid_l4, Vector3f(0,0,0.05f)},
-            {fid_l5, Vector3f(0,0,0.15f)},
-            {fid_l6, Vector3f(0,0,0)},
-            {fid_l7, Vector3f(0,0,0.05f)},
-            {fid_lh, Vector3f(0,0,0.08f)}
+            {fid_l2, Vector3f(0,0,0),     0.08f},
+            {fid_l3, Vector3f(0,0,0.15f), 0.07f},
+            {fid_l4, Vector3f(0,0,0.05f), 0.07f},
+            {fid_l5, Vector3f(0,0,0.15f), 0.06f},
+            {fid_l6, Vector3f(0,0,0),     0.06f},
+            {fid_l7, Vector3f(0,0,0.05f), 0.06f},
+            {fid_lh, Vector3f(0,0,0.08f), 0.06f}
         };
 
         // ---- 泛化:遍历全部 rigid 圆柱,每段用真实轴向 ----
@@ -510,14 +513,16 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                             : 0.0f;
                         Vector3f radial = p - (cyl.p0 + u * seg);
                         float dist = radial.norm();
+                        // 体积化:从机体表面起算(dist − 体半径),而非质心
+                        float dist_eff = std::max(0.0f, dist - pt.radius);
                         float shell = cyl.radius + config_.bs_shell;
-                        if (dist >= shell || dist <= 1e-4f) continue;
+                        if (dist_eff >= shell || dist <= 1e-4f) continue;
 
                         float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                         float stiff = SdfCostEvaluator::branchStiffness(
                             t_arc, config_.bs_k_root, config_.bs_k_tip);
-                        // depth ∈ (0,1]: 枝面 0 → 轴心 1
-                        float depth = (shell - dist) / shell;
+                        // depth ∈ (0,1]: 体表在壳层外缘 0 → 体表贴轴心 1
+                        float depth = (shell - dist_eff) / shell;
                         float act = std::min(1.0f,
                             stiff * depth / std::max(1e-3f, config_.bs_k_root));
                         if (act > bs_act) bs_act = act;
@@ -1452,12 +1457,14 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                         : 0.0f;
                     Vector3f radial = p_ee - (cyl.p0 + u * seg);
                     float dist = radial.norm();
+                    // 体积化:手部体半径 0.06,从体表起算深度
+                    float dist_eff = std::max(0.0f, dist - 0.06f);
                     float shell = cyl.radius + config_.bs_shell;
-                    if (dist >= shell || dist <= 1e-4f) continue;
+                    if (dist_eff >= shell || dist <= 1e-4f) continue;
                     float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                     float stiff = SdfCostEvaluator::branchStiffness(
                         t_arc, config_.bs_k_root, config_.bs_k_tip);
-                    float depth = (shell - dist) / shell;
+                    float depth = (shell - dist_eff) / shell;
                     push += (radial / dist) * (stiff * depth);
                     act = std::max(act, std::min(1.0f,
                         stiff * depth / std::max(1e-3f, config_.bs_k_root)));

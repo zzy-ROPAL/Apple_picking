@@ -1726,14 +1726,22 @@ int main(int argc, char* argv[]) {
                 // allow(t) = 5mm + 25mm·t(根部几乎不许压,梢部可压
                 // ~3cm)即记一次违规。反映"会折断枝条"的穿越。
                 {
-                    struct Probe { const char* frame; Vector3f off; };
-                    const Probe probes[6] = {
-                        {"panda_link3", Vector3f(0,0,0.15f)},
-                        {"panda_link4", Vector3f(0,0,0.05f)},
-                        {"panda_link5", Vector3f(0,0,0.15f)},
-                        {"panda_link6", Vector3f(0,0,0)},
-                        {"panda_link7", Vector3f(0,0,0.05f)},
-                        {"panda_hand",  Vector3f(0,0,0.08f)},
+                    // 体积化探针(半径 = SDF 球模型;含手指),穿入深度
+                    // pen = (r_枝 + r_体) − dist,即枝条被机体挤开的位移。
+                    // allow(t) = 15mm + 60mm·t:根部几乎不许挤,梢部可挤
+                    // ~7.5cm(细枝易弯)。苹果近旁 12cm 内的接触是抓取
+                    // 固有的(嵌枝苹果),不计入 —— 只统计"途中硬切"。
+                    struct Probe { const char* frame; Vector3f off; float r; };
+                    const Probe probes[9] = {
+                        {"panda_link3", Vector3f(0,0,0.15f), 0.07f},
+                        {"panda_link4", Vector3f(0,0,0.05f), 0.07f},
+                        {"panda_link5", Vector3f(0,0,0.15f), 0.06f},
+                        {"panda_link5", Vector3f(0,0,0.30f), 0.06f},
+                        {"panda_link6", Vector3f(0,0,0),     0.06f},
+                        {"panda_link7", Vector3f(0,0,0.05f), 0.06f},
+                        {"panda_hand",  Vector3f(0,0,0.08f), 0.06f},
+                        {"panda_hand",  Vector3f(0,0.04f,0.05f),  0.06f},
+                        {"panda_hand",  Vector3f(0,-0.04f,0.05f), 0.06f},
                     };
                     const auto& cyls2 = cost_evaluator->getCylinders();
                     for (size_t i = 0; i < solution.size(); ++i) {
@@ -1743,6 +1751,8 @@ int main(int argc, char* argv[]) {
                             Matrix4f pose = robot->getFramePose(pr.frame);
                             Vector3f pp = pose.block<3,1>(0,3)
                                         + pose.block<3,3>(0,0) * pr.off;
+                            if ((pp - scene.apple_pos).norm() < 0.12f)
+                                continue;   // 终端抓取接触不计
                             for (const auto& cyl : cyls2) {
                                 if (cyl.exclude_from_aniso) continue;
                                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
@@ -1753,10 +1763,10 @@ int main(int argc, char* argv[]) {
                                           (pp - cyl.p0).dot(seg) / seg_sq))
                                     : 0.0f;
                                 float dist = (pp - (cyl.p0 + u * seg)).norm();
-                                float pen = cyl.radius - dist;   // >0 = 点在枝内
+                                float pen = (cyl.radius + pr.r) - dist;  // 体积化
                                 if (pen <= 0.0f) continue;
                                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
-                                float allow = 0.005f + 0.025f * t_arc;
+                                float allow = 0.015f + 0.060f * t_arc;
                                 if (pen > allow) {
                                     violated = true;
                                     result.cut_worst_over = std::max(
