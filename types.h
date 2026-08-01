@@ -239,6 +239,38 @@ struct GraspRrtConfig {
     float bs_descent_gain  = 1.0f;   // 下探偏置强度
     float bs_descent_fade_r = 0.12f; // 下探偏置在苹果近旁的渐隐半径 (m)
 
+    // ---- Depth steering(穿透闸门的提议层配套,纯引导) ----
+    // 闸门 (pen gate) 是有效性层的硬拒绝;深度转向在提议层把扩展步
+    // 投影到"许可穿透边界"的切向:对接触邻域内的每个 (探针, 软枝) 对,
+    // 预测本步径向加深量,超过 κ·slack (slack = allow(t) − 当前穿透)
+    // 就减去超出分量 —— 正对枝根的步变成贴面滑移,枝梢几乎不改。
+    // 线性化近似,不是保证:安全仍由闸门兜底 (与 sample steering /
+    // edge refuse 同款两层结构)。只在闸门启用时生效。
+    bool  pen_steer_enabled = false;
+    float pen_steer_safety  = 0.8f;   // κ: 每步最多消耗剩余许可深度的比例
+    float pen_steer_margin  = 0.03f;  // 激活壳层: 探针距接触面 < margin 才投影 (m)
+
+    // ---- Unified refuse(统一分支交互规则,提议层开关) ----
+    // 把 tensor edge refuse(轴向)与 depth steering(径向)合并为绕枝轴
+    // 的单一运动锥:severity = 内压/深度预算 + G·轴滑/滑移预算 ≤ 1。
+    // G 双段:预接触 0→η 随接近升起(编码"从侧面接近苹果"的采摘模式,
+    // 沿枝轴线接近会被枝条顶到,人也不这么摘);接触后 η→1 随深度
+    // (压得越深越不许拖锯)。超预算时内压/轴滑分量按 1/severity 收缩,
+    // 剩余 ≈ 环向缠绕。位置硬核仍由 pen gate 保证(方向规则封不住区域)。
+    // 参数(env/η/滑移预算/κ)存于 SdfCostEvaluator::enableUnifiedRefuse。
+    bool  uni_refuse_enabled = false;
+
+    // ---- Nav field(B 计划:测地吸引场,见 sdf_cost_evaluator.h) ----
+    // 远场(测地距离 > switch+band)吸引方向 = 洪泛下坡(绕冠入漏斗);
+    // 近场(测地距离 < switch)回退随机球冠点直线吸引(均匀覆盖苹果
+    // 底部;吸引到点不熄火)。切换一律用测地距离,不用欧氏 —— 苹果
+    // 正上方欧氏近而测地远,必须留在绕行域(防止从上硬凿复发)。
+    // 下探触发同理换测地阈值。
+    bool  nav_field_enabled = false;
+    float nav_switch_dist   = 0.15f;   // 近远切换测地阈值 (m 沿路线)
+    float nav_blend_band    = 0.10f;   // 切换平滑带宽 (m)
+    float nav_descent_dist  = 0.60f;   // 下探触发测地阈值 (m, 对应旧 600mm)
+
     // ---- Finger-first steering(纯引导,无拒绝) ----
     // 下探接近苹果时软性引导"指尖先接触":
     //   (a) 旋转偏置:把爪口轴 ẑ_g 转向苹果方向 u,提前对准

@@ -83,6 +83,15 @@ target_link_libraries(measure_axial
     OpenMP::OpenMP_CXX
 )
 
+add_executable(probe_dump probe_dump.cpp)
+target_link_libraries(probe_dump
+    grasp_rrt_lib
+    Eigen3::Eigen
+    pinocchio::pinocchio
+    ${BULLET_LIBRARIES}
+    OpenMP::OpenMP_CXX
+)
+
 add_executable(measure_trajopt measure_trajopt.cpp)
 target_link_libraries(measure_trajopt
     grasp_rrt_lib

@@ -118,8 +118,9 @@ public:
     }
 
     // ---- 综合有效性检查 (对应 Python isConfigValid) ----
+    // virtual: CSpaceSampled 覆盖以追加软枝穿透闸门 (penetration gate)。
 
-    bool isConfigValid(const Config& config,
+    virtual bool isConfigValid(const Config& config,
                        bool check_borders = true,
                        bool check_collisions = true,
                        bool check_constraints = true) {

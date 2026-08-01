@@ -79,6 +79,31 @@ public:
         float /*envelope*/) const {
         return 0.0f;
     }
+
+    // ---- 软枝穿透闸门 (penetration gate, 硬有效性约束) ----
+    //
+    // 判定构型 q 下机体探针对软枝的穿透深度是否全部在许可范围内:
+    //   pen = (r_枝 + r_体) − dist_轴  ≤  allow(t) = root + (tip−root)·t
+    // t = 接触点在枝上的弧长占比 (0 根 1 梢) —— 根部几乎不许挤压
+    // (会折断), 梢部可大幅拨开。与 benchmark 的 cut_violations 事后
+    // 指标同一判据, 但装进有效性层: 违规构型直接无效, 等价于撞到
+    // 刚体。苹果近旁豁免球内的接触不计 (嵌枝苹果的终端抓取固有)。
+    //
+    // true = 通过 (或闸门未启用)。默认恒真, SdfCostEvaluator 覆盖。
+    virtual bool isPenetrationAllowed(const Eigen::VectorXf& /*q*/) const {
+        return true;
+    }
+
+    // ---- Unified refuse 的边级 severity ----
+    // 整条边 q1→q2 上 (探针, 软枝) 对的最大 severity(内压/深度预算 +
+    // G·轴滑/滑移预算)。>1 = 越权。0 = 未启用 / 无接触邻域。
+    // CSpaceSampled 以 sigmoid(gain·(score−threshold)) 概率拒绝,
+    // threshold 取 1(预算刚好用满时 50/50)。SdfCostEvaluator 覆盖。
+    virtual float computeEdgeUnifiedSeverity(
+        const Eigen::VectorXf& /*q1*/,
+        const Eigen::VectorXf& /*q2*/) const {
+        return 0.0f;
+    }
 };
 
 // ============================================================================
@@ -155,12 +180,41 @@ public:
     // computeEdgeAxialScoreTensor). Same sigmoid, same threshold/gain —
     // only the score function changes.
     void setEdgeRefuseTensorMode(bool on)    { edge_refuse_tensor_mode_ = on; }
+    // Unified 模式: score = computeEdgeUnifiedSeverity, threshold 语义变为
+    // "severity 预算占用" (默认 1.0), 其余 sigmoid 管线复用。
+    void setEdgeRefuseUnifiedMode(bool on)   { edge_refuse_unified_mode_ = on; }
     bool  getEdgeRefuseEnabled() const       { return edge_refuse_enabled_; }
     float getEdgeRefuseEnvelope() const      { return edge_refuse_envelope_; }
     float getEdgeRefuseThreshold() const     { return edge_refuse_threshold_; }
     float getEdgeRefuseGain() const          { return edge_refuse_gain_; }
     int   getEdgeRefuseK() const             { return edge_refuse_k_; }
     bool  getEdgeRefuseTensorMode() const    { return edge_refuse_tensor_mode_; }
+
+    // ---- 构型有效性 (覆盖基类: 追加软枝穿透闸门) ----
+    //
+    // 闸门在 Bullet 窄相之前跑 (~10 μs FK 探针 vs ~300-700 μs 几何检测),
+    // 与 edge refuse 相同的 cheap-check-first 模式。挂在 isConfigValid 上
+    // 意味着 DCD 递归的每个采样构型、下探阶段 (moveTowardsGoal 走同一个
+    // isPathValid)、以及随机起点生成全部自动继承 —— 约束只写一处。
+    bool isConfigValid(const Config& config,
+                       bool check_borders = true,
+                       bool check_collisions = true,
+                       bool check_constraints = true) override {
+        if (check_borders && !isInBoundary(config)) return false;
+        if (check_collisions && cost_evaluator_) {
+            pen_gate_checks_++;
+            if (!cost_evaluator_->isPenetrationAllowed(config)) {
+                pen_gate_rejects_++;
+                return false;
+            }
+        }
+        return CSpace::isConfigValid(config, /*check_borders=*/false,
+                                     check_collisions, check_constraints);
+    }
+
+    // ---- Penetration-gate telemetry (cumulative; caller diffs across runs) ----
+    unsigned long long getPenGateChecks()  const { return pen_gate_checks_; }
+    unsigned long long getPenGateRejects() const { return pen_gate_rejects_; }
 
     // ---- 离散碰撞检测 (覆盖基类) ----
 
@@ -182,11 +236,13 @@ public:
     bool isPathValid(const Config& q1, const Config& q2) override {
         // Step 1 (cheap, ~15 μs): directional check, if enabled.
         if (edge_refuse_enabled_ && cost_evaluator_) {
-            float score = edge_refuse_tensor_mode_
-                ? cost_evaluator_->computeEdgeAxialScoreTensor(
-                      q1, q2, edge_refuse_envelope_)
-                : cost_evaluator_->computeEdgeAxialScore(
-                      q1, q2, edge_refuse_envelope_, edge_refuse_k_);
+            float score = edge_refuse_unified_mode_
+                ? cost_evaluator_->computeEdgeUnifiedSeverity(q1, q2)
+                : (edge_refuse_tensor_mode_
+                    ? cost_evaluator_->computeEdgeAxialScoreTensor(
+                          q1, q2, edge_refuse_envelope_)
+                    : cost_evaluator_->computeEdgeAxialScore(
+                          q1, q2, edge_refuse_envelope_, edge_refuse_k_));
             er_checks_++;
             er_score_sum_ += score;
             if (score > 0.85f) er_hi_++;
@@ -276,12 +332,19 @@ private:
     int   edge_refuse_k_         = 3;
     // false = legacy MAX aggregation; true = structure-tensor quadratic form
     bool  edge_refuse_tensor_mode_ = false;
+    // true = unified severity score (统一规则), 优先于 tensor/MAX
+    bool  edge_refuse_unified_mode_ = false;
 
     // Edge-refuse telemetry
     mutable unsigned long long er_checks_  = 0;
     mutable unsigned long long er_rejects_ = 0;
     mutable unsigned long long er_hi_      = 0;
     mutable double er_score_sum_ = 0.0;
+
+    // Penetration-gate telemetry (闸门未启用时 rejects 恒 0; 与 er_ 计数
+    // 同款: 并行 batch 下允许非原子竞态, 仅作遥测)
+    mutable unsigned long long pen_gate_checks_  = 0;
+    mutable unsigned long long pen_gate_rejects_ = 0;
 
     // Private RNG for the probabilistic accept/reject decision. Seeded with
     // a fixed value so soft rejection is deterministic per CSpaceSampled

@@ -448,6 +448,12 @@ int main(int argc, char* argv[]) {
     float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
 
     bool  branch_stiffness   = false;   // --branch-stiffness: 软枝刚度场 (根硬梢软 + 轴心主导 + 下探偏置)
+    bool  pen_gate_enabled   = false;   // --pen-gate: 软枝穿透闸门 (硬有效性约束, cut_violations 同判据进 isConfigValid)
+    bool  pen_steer_enabled  = false;   // --pen-steer: depth steering (提议层切向投影, 隐含 --pen-gate)
+    bool  uni_refuse_enabled = false;   // --uni-refuse: 统一分支交互规则 (隐含 --pen-gate; 取代 --edge-refuse* / --sample-steering* / --pen-steer)
+    bool  nav_field_enabled  = false;   // --nav-field: 测地吸引场 (球冠多源洪泛; 远场绕行 + 近场随机冠点 + 测地下探门)
+    float pen_gate_root_mm   = 15.0f;   // --pen-gate-root-mm F: allow(t=0), 枝根许可穿透 (mm)
+    float pen_gate_tip_mm    = 75.0f;   // --pen-gate-tip-mm F:  allow(t=1), 枝梢许可穿透 (mm)
     bool  finger_first       = false;   // --finger-first: 指尖先触转向引导(纯引导,无拒绝)
     float ff_gain            = 1.0f;    // --ff-gain F: 转向旋转偏置增益
     float ff_far             = 0.15f;   // --ff-far F: 激活外半径 (m)
@@ -556,6 +562,22 @@ int main(int argc, char* argv[]) {
                                           static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--edge-refuse-k" && i + 1 < argc) {
             edge_refuse_k = std::max(1, std::atoi(argv[++i]));
+        } else if (a == "--pen-gate") {
+            pen_gate_enabled = true;
+        } else if (a == "--pen-steer") {
+            pen_steer_enabled = true;
+            pen_gate_enabled  = true;   // 转向依赖闸门的 allow(t)/探针, 且需其兜底
+        } else if (a == "--uni-refuse") {
+            uni_refuse_enabled = true;
+            pen_gate_enabled   = true;  // 统一规则依赖闸门的探针/allow(t), 且需其兜底
+        } else if (a == "--nav-field") {
+            nav_field_enabled = true;
+        } else if (a == "--pen-gate-root-mm" && i + 1 < argc) {
+            pen_gate_root_mm = std::max(0.0f,
+                                  static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--pen-gate-tip-mm" && i + 1 < argc) {
+            pen_gate_tip_mm = std::max(0.0f,
+                                  static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--sample-steering") {
             sample_steering_enabled = true;
         } else if (a == "--sample-steering-tensor") {
@@ -1215,6 +1237,66 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // ---- 软枝穿透闸门 (硬有效性约束) ----
+    // 与事后指标 cut_violations 同判据 (allow(t) 线性插值 + 苹果 12cm
+    // 豁免), 但装进 isConfigValid: 违规构型 = 无效, 切断在构造上不可能。
+    if (pen_gate_enabled) {
+        cost_evaluator->enablePenetrationGate(
+            pen_gate_root_mm * 0.001f, pen_gate_tip_mm * 0.001f,
+            scene.apple_pos, /*exempt_radius=*/0.12f);
+        std::cout << "[Setup] PENETRATION GATE ENABLED (hard validity):\n"
+                  << "        allow(t) = " << pen_gate_root_mm << " mm (root) → "
+                  << pen_gate_tip_mm << " mm (tip), apple exempt r = 0.12 m\n";
+    }
+
+    // ---- Unified refuse (统一分支交互规则, 提议层投影 + 边级 sigmoid) ----
+    // 依赖 pen gate 的探针/allow(t) —— 必须在 enablePenetrationGate 之后。
+    if (uni_refuse_enabled) {
+        if (edge_refuse_enabled || sticky_edge_refuse_enabled ||
+            sample_steering_enabled || pen_steer_enabled) {
+            std::cout << "[Setup] WARNING: --uni-refuse 取代旧 edge refuse / "
+                         "sample steering / pen-steer, 已忽略这些旧开关\n";
+            edge_refuse_enabled = false;
+            sticky_edge_refuse_enabled = false;
+            sample_steering_enabled = false;
+            pen_steer_enabled = false;
+        }
+        // ax_tip 30→8mm(2026-07-28 用户澄清):枝梢的自由是"径向压入",
+        // 不是"轴向滑行"—— allow(t) 保持斜坡(径向自由随 t 增大),
+        // L_ax 全枝收紧(轴向到处严格)。
+        cost_evaluator->enableUnifiedRefuse(
+            /*env=*/0.05f, /*eta=*/0.5f,
+            /*ax_root=*/0.005f, /*ax_tip=*/0.008f, /*safety=*/0.8f,
+            /*clamp_target=*/0.7f);
+        cspace->setEdgeRefuseEnabled(true);
+        cspace->setEdgeRefuseUnifiedMode(true);
+        cspace->setEdgeRefuseThreshold(0.7f);   // 压枝上限: 70% 预算占用 = 50/50
+        cspace->setEdgeRefuseGain(6.0f);
+        std::cout << "[Setup] UNIFIED REFUSE ENABLED:\n"
+                  << "        env=0.05 m, eta=0.5, L_ax(t)=5→30 mm, kappa=0.8, "
+                     "in-ramp=0.03 m\n"
+                  << "        edge sigmoid: threshold=0.7 (severity), gain=6; "
+                     "steer clamp=0.7; axis hard-clear=10 mm\n";
+    }
+
+    // ---- Nav field(测地吸引场):同网格二次洪泛 ----
+    // 必须在 enablePenetrationGate 之后(禁核用闸门 allow(t))。种子 =
+    // 苹果下方球冠(与 shell attractor 同几何);构建耗时并入 setup。
+    if (nav_field_enabled) {
+        GraspRrtConfig tmp_cfg;   // 读球冠默认几何参数
+        auto t_nav0 = std::chrono::high_resolution_clock::now();
+        cost_evaluator->buildNavField(
+            scene.apple_pos,
+            tmp_cfg.shell_attractor_target_radius + tmp_cfg.shell_attractor_offset,
+            tmp_cfg.shell_attractor_cap_height,
+            /*robot_r=*/0.06f);
+        auto t_nav1 = std::chrono::high_resolution_clock::now();
+        float nav_ms = std::chrono::duration<float, std::milli>(t_nav1 - t_nav0).count();
+        voxel_build_ms += nav_ms;   // 并入 setup 时间统计
+        std::cout << "[Setup] NAV FIELD ENABLED (geodesic attraction, build "
+                  << nav_ms << " ms; switch=0.15 m, descent gate=0.60 m geodesic)\n";
+    }
+
     // ---- 7. Target object (apple) ----
     auto target = std::make_shared<SimpleTargetObject>(scene.apple_pos, scene.apple_radius);
     collision_checker_ptr->addGoalObstacleSphere(scene.apple_radius, scene.apple_pos);
@@ -1257,6 +1339,14 @@ int main(int argc, char* argv[]) {
                   << config.bs_k_root << " -> k_tip=" << config.bs_k_tip
                   << ", shell=" << config.bs_shell
                   << " m, w_max=" << config.bs_weight_max << ")\n";
+    }
+    config.uni_refuse_enabled = uni_refuse_enabled;
+    config.nav_field_enabled  = nav_field_enabled;
+    config.pen_steer_enabled = pen_steer_enabled;
+    if (pen_steer_enabled) {
+        std::cout << "[Setup] DEPTH STEERING ENABLED (proposal-layer projection, "
+                  << "safety=" << config.pen_steer_safety
+                  << ", margin=" << config.pen_steer_margin << " m)\n";
     }
     config.finger_first_steering = finger_first;
     config.ff_align_gain         = ff_gain;
@@ -1314,6 +1404,10 @@ int main(int argc, char* argv[]) {
         : "benchmark_results_no_A";
     if (!face_disable_enabled) out_dir += "_noFD";
     if (!shell_attractor_enabled) out_dir += "_noShell";
+    if (pen_gate_enabled) out_dir += "_pengate";
+    if (pen_steer_enabled) out_dir += "_pensteer";
+    if (uni_refuse_enabled) out_dir += "_uni";
+    if (nav_field_enabled) out_dir += "_nav";
     if (!label_suffix.empty()) out_dir += "_" + label_suffix;
     mkdir(out_dir.c_str(), 0755);  // ignore EEXIST
     std::cout << "[Setup] Output directory: " << out_dir << "/\n";
@@ -1344,7 +1438,8 @@ int main(int argc, char* argv[]) {
                 sf << "    {\"p0\": " << vec3(c.p0) << ", \"p1\": " << vec3(c.p1)
                    << ", \"radius\": " << c.radius
                    << ", \"class\": \"" << (c.exclude_from_aniso ? "hard" : "soft")
-                   << "\"}" << (i + 1 < cyls.size() ? "," : "") << "\n";
+                   << "\", \"t0\": " << c.t0 << ", \"t1\": " << c.t1
+                   << "}" << (i + 1 < cyls.size() ? "," : "") << "\n";
             }
             sf << "  ]\n}\n";
             std::cout << "[Setup] Scene layout exported: " << out_dir
@@ -1864,6 +1959,35 @@ int main(int argc, char* argv[]) {
                   << "  mean_score=" << (chk ? ssum/chk : 0.0)
                   << "  score>0.85: " << hi
                   << " (" << (chk ? 100.0*hi/chk : 0.0) << "%)\n";
+    }
+
+    // ---- Penetration-gate telemetry (whole benchmark, all runs pooled) ----
+    if (pen_gate_enabled) {
+        unsigned long long chk = cspace->getPenGateChecks();
+        unsigned long long rej = cspace->getPenGateRejects();
+        std::cout << "\n[PenGate telemetry] configs checked=" << chk
+                  << "  rejects=" << rej
+                  << " (" << (chk ? 100.0*rej/chk : 0.0) << "%)"
+                  << "  —— 期望: 有解 run 的 cut_violations 恒为 0\n";
+    }
+    if (pen_steer_enabled) {
+        unsigned long long calls = cost_evaluator->getDepthSteerCalls();
+        unsigned long long bends = cost_evaluator->getDepthSteerBends();
+        std::cout << "[DepthSteer telemetry] steering calls=" << calls
+                  << "  bends=" << bends
+                  << " (" << (calls ? 100.0*bends/calls : 0.0) << "%)\n";
+    }
+    if (uni_refuse_enabled) {
+        unsigned long long calls = cost_evaluator->getUnifiedCalls();
+        unsigned long long bends = cost_evaluator->getUnifiedBends();
+        unsigned long long chk = cspace->getEdgeRefuseChecks();
+        unsigned long long rej = cspace->getEdgeRefuseRejects();
+        std::cout << "[UnifiedRefuse telemetry] steer calls=" << calls
+                  << "  bends=" << bends
+                  << " (" << (calls ? 100.0*bends/calls : 0.0) << "%)"
+                  << "  edge checks=" << chk
+                  << "  rejects=" << rej
+                  << " (" << (chk ? 100.0*rej/chk : 0.0) << "%)\n";
     }
 
     // ---- 12. Final summary ----

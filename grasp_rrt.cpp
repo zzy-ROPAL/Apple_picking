@@ -649,11 +649,33 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
             {fid_link7_a, Vector3f(0,0,0.05f), 0.6f},
             {fid_hand_a,  Vector3f(0,0,0.08f), 1.0f},  // ~TCP
         };
+        // Nav field 混合吸引(见 types.h 注释):远场走洪泛下坡,
+        // 近场回退随机球冠点直线;切换用测地距离(smoothstep 过渡)。
+        auto sdf_nav = config_.nav_field_enabled
+            ? std::dynamic_pointer_cast<SdfCostEvaluator>(
+                  cspace_->getCostEvaluator())
+            : nullptr;
+        const float NAV_FAR = std::numeric_limits<float>::max() / 4.0f;
         for (const auto& ap : apts) {
             Matrix4f pose = robot_->getFramePoseById(ap.fid);
             Vector3f link_pos = pose.block<3,1>(0,3) + pose.block<3,3>(0,0) * ap.offset;
             Vector3f dir = virtual_target - link_pos;
             if (dir.norm() > 1e-6f) dir.normalize();
+            if (sdf_nav && sdf_nav->isNavBuilt()) {
+                float dnav = sdf_nav->queryNavDistance(link_pos);
+                if (dnav < NAV_FAR) {
+                    Vector3f ndir = sdf_nav->queryNavDirection(link_pos);
+                    if (ndir.norm() > 1e-6f) {
+                        float s = (dnav - config_.nav_switch_dist)
+                                / std::max(1e-3f, config_.nav_blend_band);
+                        s = std::max(0.0f, std::min(1.0f, s));
+                        float w = s * s * (3.0f - 2.0f * s);   // 1=远场洪泛
+                        Vector3f blend = w * ndir + (1.0f - w) * dir;
+                        if (blend.norm() > 1e-6f) dir = blend.normalized();
+                    }
+                }
+                // dnav = ∞(场外/不可达)→ 保持直线回退
+            }
             Eigen::VectorXf e_a = Eigen::VectorXf::Zero(6);
             e_a.head<3>() = dir * ap.weight;
             Config link_att = J_T * e_a;
@@ -858,6 +880,24 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
             step_size = computeAdaptiveStep(dist, config_.extend_step_size);
         }
     }
+
+    // ---- Depth steering / Unified steering(提议层,见 types.h 注释) ----
+    // 在真实步长已知后、成边之前投影提议方向:unified 同时管内压与轴滑
+    // (剩余 ≈ 环向缠绕);depth steering 只管内压。二者互斥,unified 优先。
+    if ((config_.uni_refuse_enabled || config_.pen_steer_enabled) &&
+        q_step_dir.norm() > 1e-6f) {
+        auto sdf_eval_ds = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval_ds) {
+            bool bent = config_.uni_refuse_enabled
+                ? sdf_eval_ds->applyUnifiedSteering(q_near, q_step_dir, step_size)
+                : sdf_eval_ds->applyDepthSteering(q_near, q_step_dir, step_size,
+                                                  config_.pen_steer_safety,
+                                                  config_.pen_steer_margin);
+            if (bent && q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
+        }
+    }
+
     Config new_config = q_near + q_step_dir * step_size;
 
 #if 0  // ============ STICKY WINNER (deferred rejection) — DISABLED =======
@@ -1484,6 +1524,22 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
         }
     }
 
+    // ---- Depth / Unified steering 下探版(提议层) ----
+    // 手部探针的预算夹持,取代盲目下压;臂上探针仍由闸门在
+    // isPathValid 里兜底。苹果豁免球内接触不计 (方法内部处理)。
+    if (config_.uni_refuse_enabled || config_.pen_steer_enabled) {
+        auto sdf_eval_ps = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval_ps) {
+            Vector3f dp = delta_pose.block<3,1>(0, 3);
+            bool bent = config_.uni_refuse_enabled
+                ? sdf_eval_ps->applyUnifiedSteeringDescent(dp)
+                : sdf_eval_ps->applyDepthSteeringDescent(
+                      dp, config_.pen_steer_safety, config_.pen_steer_margin);
+            if (bent) delta_pose.block<3,1>(0, 3) = dp;
+        }
+    }
+
     // 限制步长
     delta_pose = limitWorkspaceStep(delta_pose);
 
@@ -1678,7 +1734,18 @@ bool GraspRrt::processNode(CSpaceNodePtr node) {
         closest_below_node_id_ = node->getId();
     }
 
-    if (pose_sphere_ && dist2 < config_.try_grasps_distance2) {
+    // 下探候选门:默认欧氏阈值;nav field 启用时改用测地行程 —— 苹果
+    // 正上方的悬停节点欧氏近而测地远,不再从那里刷下探尝试。
+    bool near_enough = dist2 < config_.try_grasps_distance2;
+    if (config_.nav_field_enabled) {
+        auto sdf_nav_pn = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_nav_pn && sdf_nav_pn->isNavBuilt()) {
+            near_enough = sdf_nav_pn->queryNavDistance(tcp_pos)
+                        < config_.nav_descent_dist;
+        }
+    }
+    if (pose_sphere_ && near_enough) {
         pose_sphere_->addCSpaceNode(tcp_pos, node);
     } else if (pose_sphere_) {
         if (verbose_) {
