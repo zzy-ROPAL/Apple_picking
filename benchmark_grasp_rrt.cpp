@@ -47,6 +47,48 @@
 
 using namespace grasp_rrt;
 
+// ---- tree6 枝几何 (23 枝 × 6 节点), 提升到文件作用域: 苹果定位 (--apple-branch-idx/
+//      --apple-frac) 与几何构建共用同一份数据, 不再各自硬编码 ----
+static const Vector3f TREE6_BRANCH_NODES[23][6] = {
+    {{0.7338f,-0.0364f,0.6730f},{0.6963f, 0.0236f,0.6883f},{0.6504f, 0.0901f,0.6923f},{0.6114f, 0.1617f,0.6865f},{0.5648f, 0.2300f,0.7012f},{0.5171f, 0.2968f,0.7215f}},
+    {{0.7341f,-0.0374f,0.6980f},{0.6641f,-0.0716f,0.6774f},{0.6178f,-0.1627f,0.6953f},{0.5486f,-0.2075f,0.6671f},{0.4574f,-0.2419f,0.6056f},{0.3546f,-0.2674f,0.5607f}},
+    {{0.7335f,-0.0382f,0.7231f},{0.7821f, 0.0132f,0.7384f},{0.8349f, 0.0744f,0.7424f},{0.8943f, 0.1302f,0.7365f},{0.9486f, 0.1925f,0.7513f},{1.0013f, 0.2554f,0.7716f}},
+    {{0.7307f,-0.0393f,0.7733f},{0.6198f,-0.0544f,0.7767f},{0.5131f,-0.0478f,0.7733f},{0.4022f,-0.0703f,0.7646f},{0.2957f,-0.1365f,0.7597f},{0.2079f,-0.2281f,0.7597f}},
+    {{0.7328f,-0.0420f,0.8233f},{0.6355f,-0.0015f,0.8288f},{0.5440f, 0.0577f,0.8254f},{0.4381f, 0.0931f,0.8176f},{0.3128f, 0.0886f,0.8117f},{0.1912f, 0.0524f,0.8118f}},
+    {{0.7328f,-0.0353f,0.8973f},{0.7047f,-0.1514f,0.8297f},{0.7241f,-0.2402f,0.7218f},{0.7175f,-0.1885f,0.7896f},{0.7677f,-0.1361f,0.7888f},{0.8158f,-0.0801f,0.8041f}},
+    {{0.7308f,-0.0326f,0.9480f},{0.7244f,-0.0413f,0.9473f},{0.7179f,-0.0500f,0.9470f},{0.7115f,-0.0579f,0.9476f},{0.7043f,-0.0630f,0.9475f},{0.6975f,-0.0660f,0.9466f}},
+    {{0.7296f,-0.0307f,0.9984f},{0.7401f,-0.0973f,0.9858f},{0.7248f,-0.1196f,0.9603f},{0.7172f,-0.1549f,0.9210f},{0.7123f,-0.1910f,0.8752f},{0.7027f,-0.2282f,0.8309f}},
+    {{0.7292f,-0.0291f,1.0235f},{0.7921f,-0.0049f,1.0507f},{0.8722f, 0.0098f,1.0371f},{0.9751f, 0.0207f,1.0386f},{1.0928f,-0.0137f,1.0707f},{1.1828f,-0.0535f,1.1150f}},
+    {{0.7290f,-0.0249f,1.0736f},{0.6835f, 0.0485f,1.0521f},{0.6157f, 0.1149f,1.0971f},{0.5880f, 0.1374f,1.1261f},{0.5669f, 0.0906f,1.0594f},{0.4825f, 0.1128f,1.0263f}},
+    {{0.7140f,-0.0168f,1.1326f},{0.7063f,-0.0522f,1.1151f},{0.6832f,-0.0998f,1.0719f},{0.6702f,-0.1373f,1.0469f},{0.6446f,-0.2074f,1.0120f},{0.6318f,-0.2767f,0.9944f}},
+    {{0.6302f, 0.0038f,1.1993f},{0.6715f,-0.0195f,1.2540f},{0.7072f,-0.0558f,1.2990f},{0.7502f,-0.0902f,1.3270f},{0.7862f,-0.1337f,1.3534f},{0.8044f,-0.1540f,1.4100f}},
+    {{0.6075f, 0.0127f,1.2480f},{0.6125f,-0.0232f,1.2305f},{0.6075f,-0.0759f,1.1874f},{0.6083f,-0.1155f,1.1623f},{0.6088f,-0.1901f,1.1275f},{0.6209f,-0.2595f,1.1099f}},
+    {{0.6106f, 0.0135f,1.2959f},{0.7221f, 0.0449f,1.2733f},{0.8309f, 0.0882f,1.2315f},{0.6704f, 0.0552f,1.2685f},{0.5943f, 0.0756f,1.2557f},{0.5111f, 0.1015f,1.2659f}},
+    {{0.6168f, 0.0154f,1.3664f},{0.5907f, 0.0009f,1.3847f},{0.5715f,-0.0166f,1.3821f},{0.5521f,-0.0261f,1.3871f},{0.5183f,-0.0402f,1.3994f},{0.4936f,-0.0564f,1.4108f}},
+    {{0.7362f, 0.0169f,1.4796f},{0.7435f, 0.0112f,1.4844f},{0.7497f, 0.0056f,1.4866f},{0.7618f,-0.0086f,1.4872f},{0.7768f,-0.0270f,1.4866f},{0.7887f,-0.0363f,1.4830f}},
+    {{0.7381f, 0.0208f,1.5245f},{0.7604f, 0.0407f,1.5428f},{0.7753f, 0.0620f,1.5402f},{0.7922f, 0.0755f,1.5452f},{0.8220f, 0.0966f,1.5576f},{0.8425f, 0.1178f,1.5689f}},
+    {{0.7372f, 0.0236f,1.5489f},{0.7464f, 0.0242f,1.5537f},{0.7548f, 0.0243f,1.5559f},{0.7733f, 0.0219f,1.5565f},{0.7968f, 0.0183f,1.5559f},{0.8118f, 0.0194f,1.5523f}},
+    {{0.7273f, 0.0267f,1.5939f},{0.7264f, 0.0359f,1.5986f},{0.7262f, 0.0443f,1.6009f},{0.7281f, 0.0628f,1.6015f},{0.7311f, 0.0864f,1.6009f},{0.7296f, 0.1014f,1.5973f}},
+    {{0.7033f, 0.0290f,1.6251f},{0.5796f, 0.0899f,1.5926f},{0.3903f, 0.0973f,1.5967f},{0.6138f, 0.0567f,1.5920f},{0.6650f,-0.0006f,1.5778f},{0.7238f,-0.0655f,1.5875f}},
+    {{0.6445f, 0.0335f,1.6729f},{0.6474f, 0.0423f,1.6776f},{0.6506f, 0.0500f,1.6799f},{0.6599f, 0.0662f,1.6805f},{0.6722f, 0.0865f,1.6799f},{0.6769f, 0.1008f,1.6763f}},
+    {{0.6348f, 0.0468f,1.7469f},{0.6327f, 0.0466f,1.7580f},{0.6287f, 0.0453f,1.7690f},{0.6256f, 0.0443f,1.7803f},{0.6220f, 0.0421f,1.7913f},{0.6180f, 0.0392f,1.8021f}},
+    {{0.6317f, 0.0577f,1.8163f},{0.6305f, 0.0596f,1.8166f},{0.6271f, 0.0652f,1.8177f},{0.6237f, 0.0712f,1.8179f},{0.6201f, 0.0770f,1.8179f},{0.6171f, 0.0832f,1.8178f}},
+};
+static const float TREE6_BRANCH_RAD[23][6] = {
+    {0.0061f,0.0059f,0.0053f,0.0049f,0.0042f,0.0036f},{0.0081f,0.0071f,0.0059f,0.0048f,0.0036f,0.0025f},
+    {0.0057f,0.0059f,0.0053f,0.0049f,0.0042f,0.0036f},{0.0058f,0.0058f,0.0053f,0.0046f,0.0040f,0.0033f},
+    {0.0077f,0.0069f,0.0055f,0.0057f,0.0051f,0.0046f},{0.0085f,0.0066f,0.0041f,0.0037f,0.0031f,0.0023f},
+    {0.0050f,0.0053f,0.0044f,0.0036f,0.0028f,0.0023f},{0.0039f,0.0046f,0.0039f,0.0032f,0.0023f,0.0016f},
+    {0.0069f,0.0067f,0.0061f,0.0056f,0.0049f,0.0043f},{0.0040f,0.0054f,0.0048f,0.0045f,0.0040f,0.0035f},
+    {0.0067f,0.0061f,0.0052f,0.0042f,0.0032f,0.0022f},{0.0052f,0.0050f,0.0046f,0.0042f,0.0037f,0.0033f},
+    {0.0065f,0.0061f,0.0052f,0.0042f,0.0032f,0.0022f},{0.0057f,0.0046f,0.0033f,0.0022f,0.0019f,0.0016f},
+    {0.0068f,0.0061f,0.0053f,0.0046f,0.0036f,0.0029f},{0.0051f,0.0052f,0.0045f,0.0036f,0.0027f,0.0020f},
+    {0.0053f,0.0050f,0.0043f,0.0037f,0.0029f,0.0023f},{0.0049f,0.0052f,0.0045f,0.0036f,0.0027f,0.0020f},
+    {0.0052f,0.0047f,0.0041f,0.0033f,0.0024f,0.0018f},{0.0112f,0.0105f,0.0096f,0.0037f,0.0049f,0.0047f},
+    {0.0047f,0.0042f,0.0037f,0.0030f,0.0022f,0.0016f},{0.0044f,0.0039f,0.0035f,0.0030f,0.0026f,0.0021f},
+    {0.0035f,0.0038f,0.0035f,0.0032f,0.0029f,0.0027f},
+};
+
 // ============================================================================
 // URDF discovery
 // ============================================================================
@@ -225,6 +267,11 @@ struct RunResult {
     // 超过 allow(t)=5mm+25mm·t 的路点数, 以及最大超限量 (m)
     int   cut_violations = 0;
     float cut_worst_over = 0.0f;
+    // 软枝(绿枝)穿透深度指标: 沿路径机体表面穿入软枝的深度 pen (m)
+    //   = (r_枝 + r_探针) − dist。判断"是否穿绿枝太深", 与 allow 无关。
+    //   途中(排除苹果 12cm 终端抓取区)统计: 最大 / 平均(仅计有接触的探针-路点样本)
+    float max_soft_pen  = 0.0f;   // 全程最深穿入 (m)
+    float mean_soft_pen = 0.0f;   // 有接触样本的平均穿入 (m); 0 = 全程无接触
     float       first_contact_align_deg = -1.0f;  // 触点处 ẑ_g 与 palm→apple 夹角
     std::string first_contact_part      = "none"; // palm / mouth / finger
     int     path_env_turns         = 0;
@@ -333,7 +380,9 @@ void writeCsvHeader(std::ofstream& f) {
       << "winner_segments,winner_switches,winner_switch_rate,"
       // Group E4: EE-path smoothness (raw path)
       << "path_total_turning_deg,path_mean_turning_deg,path_reversals,"
-      << "path_env_turning_deg,path_env_turns,shortcut_ms,first_contact_wp,first_contact_align_deg,first_contact_part,cut_violations,cut_worst_over\n";
+      << "path_env_turning_deg,path_env_turns,shortcut_ms,first_contact_wp,first_contact_align_deg,first_contact_part,cut_violations,cut_worst_over,"
+      // 软枝穿透深度 (m): 全程最深 / 有接触样本平均
+      << "max_soft_pen,mean_soft_pen\n";
 }
 
 void writeCsvRow(std::ofstream& f, const RunResult& r) {
@@ -390,7 +439,8 @@ void writeCsvRow(std::ofstream& f, const RunResult& r) {
       << r.path_env_turns << "," << fmt(r.shortcut_ms) << ","
       << r.first_contact_wp << "," << fmt(r.first_contact_align_deg) << ","
       << r.first_contact_part << "," << r.cut_violations << ","
-      << fmt(r.cut_worst_over) << "\n";
+      << fmt(r.cut_worst_over) << ","
+      << fmt(r.max_soft_pen) << "," << fmt(r.mean_soft_pen) << "\n";
 }
 
 // ============================================================================
@@ -423,6 +473,10 @@ int main(int argc, char* argv[]) {
     bool tree6_apple_root   = false;  // --apple-root: shortcut for --apple-frac 0.25 (only meaningful with --tree6)
     float tree6_apple_frac  = 0.95f;  // --apple-frac F: fraction along the 5th branch arclength (0=root, 1=tip)
     float branch_rscale     = 1.0f;   // --branch-rscale S: multiply every tree6 branch radius by S (2=double). Apple offset tracks the scaled apple-branch radius.
+    float tree_yaw_deg      = 0.0f;    // --tree-yaw DEG: 绕树根竖直轴旋转整棵树 (+CCW, 从顶视). 顺时针 90° = -90. 机器人基座不动.
+    float tree_dist_scale   = 1.0f;    // --tree-dist-scale S: 把树根到机器人基座的水平距离缩放为 S 倍 (0.5=减半, 更易够到). 整棵树平移.
+    int   apple_branch_idx  = 4;       // --apple-branch-idx N: 苹果挂在第 N 根枝上 (0-based, tree6 的 23 根枝; 默认 4 = 原苹果枝). 该枝获得与原苹果枝相同的特殊处理 (rigid 或 --apple-branch-soft).
+    float base_raise        = 0.0f;    // --base-raise F: 机器人基座抬高 F 米 (实现 = 整棵树在机器人系下沉 F; 场景 json 导出的即下沉后坐标).
     bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing sticky-winner. Branch A along x̂ above apple, branch B along ẑ in front of apple.
     bool sparse_long_scene  = false;  // --sparse-long: standard 10-branch scene with wider vertical/angular spacing and ~1.7x longer branches
     bool xgate_scene        = false;  // --xgate: multi-branch scene = V6 rigid A + two CROSSED soft branches (B1 ŷ, B2 x̂) whose 5cm envelopes overlap on the approach corridor. Tests MAX-vs-winner oscillation.
@@ -454,6 +508,7 @@ int main(int argc, char* argv[]) {
     bool  nav_field_enabled  = false;   // --nav-field: 测地吸引场 (球冠多源洪泛; 远场绕行 + 近场随机冠点 + 测地下探门)
     float pen_gate_root_mm   = 15.0f;   // --pen-gate-root-mm F: allow(t=0), 枝根许可穿透 (mm)
     float pen_gate_tip_mm    = 75.0f;   // --pen-gate-tip-mm F:  allow(t=1), 枝梢许可穿透 (mm)
+    float pen_gate_ramp_t0   = 0.0f;    // --pen-gate-ramp-t0 F: 斜坡起点 (根区平台宽, 弧长占比)。0 = 从枝根线性 (2026-08-10 用户指定恢复; method-a 曾用 0.25 = 外 3/4 斜坡, 留作消融)
     bool  finger_first       = false;   // --finger-first: 指尖先触转向引导(纯引导,无拒绝)
     float ff_gain            = 1.0f;    // --ff-gain F: 转向旋转偏置增益
     float ff_far             = 0.15f;   // --ff-far F: 激活外半径 (m)
@@ -524,6 +579,14 @@ int main(int argc, char* argv[]) {
                                   static_cast<float>(std::atof(argv[++i]))));
         } else if (a == "--branch-rscale" && i + 1 < argc) {
             branch_rscale = std::max(0.1f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--tree-yaw" && i + 1 < argc) {
+            tree_yaw_deg = static_cast<float>(std::atof(argv[++i]));
+        } else if (a == "--tree-dist-scale" && i + 1 < argc) {
+            tree_dist_scale = std::max(0.05f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--apple-branch-idx" && i + 1 < argc) {
+            apple_branch_idx = std::max(0, std::min(22, std::atoi(argv[++i])));
+        } else if (a == "--base-raise" && i + 1 < argc) {
+            base_raise = static_cast<float>(std::atof(argv[++i]));
         } else if (a == "--diag-scene") {
             diag_scene = true;
         } else if (a == "--sparse-long") {
@@ -578,6 +641,9 @@ int main(int argc, char* argv[]) {
         } else if (a == "--pen-gate-tip-mm" && i + 1 < argc) {
             pen_gate_tip_mm = std::max(0.0f,
                                   static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--pen-gate-ramp-t0" && i + 1 < argc) {
+            pen_gate_ramp_t0 = std::max(0.0f, std::min(0.9f,
+                                  static_cast<float>(std::atof(argv[++i]))));
         } else if (a == "--sample-steering") {
             sample_steering_enabled = true;
         } else if (a == "--sample-steering-tensor") {
@@ -752,20 +818,32 @@ int main(int argc, char* argv[]) {
                   << "lengths 0.55-0.60 m, widened angular gaps\n";
     }
 
+    // ---- tree6 刚体场景变换: 绕树根竖直轴 yaw + 水平缩放到基座距离 ----
+    // 机器人基座在原点; 保持树根竖直轴与基座不动, 只旋转/平移整棵树 (trunk+枝+苹果)。
+    // 对 tree6 / tree6-simple 两个几何块与苹果定位统一生效。
+    const Vector3f TREE_ROOT(0.7526f, -0.0624f, 0.0011f);   // = TRUNK_NODES[0]
+    const float _tree_yaw = tree_yaw_deg * static_cast<float>(M_PI) / 180.0f;
+    const float _cy = std::cos(_tree_yaw), _sy = std::sin(_tree_yaw);
+    const float _shx = (tree_dist_scale - 1.0f) * TREE_ROOT.x();
+    const float _shy = (tree_dist_scale - 1.0f) * TREE_ROOT.y();
+    auto treeXform = [&](const Vector3f& p) -> Vector3f {
+        float dx = p.x() - TREE_ROOT.x(), dy = p.y() - TREE_ROOT.y();
+        float rx = TREE_ROOT.x() + _cy * dx - _sy * dy;
+        float ry = TREE_ROOT.y() + _sy * dx + _cy * dy;
+        // yaw 绕竖直轴 + 水平平移; --base-raise 抬高机器人 = 整树下沉
+        return Vector3f(rx + _shx, ry + _shy, p.z() - base_raise);
+    };
+
     // ---- tree6 scene override: relocate apple, replace standard scene ----
     if (tree6_scene) {
         // --apple-root is a back-compat alias for --apple-frac 0.25.
         if (tree6_apple_root) tree6_apple_frac = 0.25f;
 
-        // Compute apple position from the requested fraction along the 5th branch
-        // (index 4) arclength. The branch nodes / radii here must match the
-        // BRANCH_NODES / BRANCH_RAD arrays defined later in the tree6 setup.
-        Vector3f b5_nodes[6] = {
-            Vector3f(0.7328f,-0.0420f,0.8233f), Vector3f(0.6355f,-0.0015f,0.8288f),
-            Vector3f(0.5440f, 0.0577f,0.8254f), Vector3f(0.4381f, 0.0931f,0.8176f),
-            Vector3f(0.3128f, 0.0886f,0.8117f), Vector3f(0.1912f, 0.0524f,0.8118f),
-        };
-        float b5_rad[6] = {0.0077f,0.0069f,0.0055f,0.0057f,0.0051f,0.0046f};
+        // Compute apple position from the requested fraction along the apple
+        // branch (--apple-branch-idx, default 4) arclength — shared TREE6_BRANCH_*
+        // file-scope arrays, same data the geometry block builds from.
+        const Vector3f* b5_nodes = TREE6_BRANCH_NODES[apple_branch_idx];
+        const float*    b5_rad   = TREE6_BRANCH_RAD[apple_branch_idx];
         float seg_len[5], total = 0.0f;
         for (int i = 0; i < 5; ++i) {
             seg_len[i] = (b5_nodes[i+1] - b5_nodes[i]).norm();
@@ -790,7 +868,9 @@ int main(int argc, char* argv[]) {
         // 即苹果嵌入枝包络 —— 用于对齐细枝场景的悬挂几何)
         float hang = (apple_hang > 0.0f) ? apple_hang
                                           : (local_r + scene.apple_radius);
-        scene.apple_pos = Vector3f(attach.x(), attach.y(), attach.z() - hang);
+        // 苹果挂在(变换后)枝上附着点正下方; yaw/平移只动 xy, 悬挂垂距沿 -z 不变。
+        Vector3f attach_t = treeXform(attach);
+        scene.apple_pos = Vector3f(attach_t.x(), attach_t.y(), attach_t.z() - hang);
         // No overhead obstacle in tree6 — push it far so any hint referencing it is a no-op
         scene.overhead.center = Vector3f(100.0f, 100.0f, 100.0f);
         scene.overhead.radius = 0.001f;
@@ -821,11 +901,15 @@ int main(int argc, char* argv[]) {
 
     // 5c-d. Robot collision capsules (mirrors example)
     struct LinkCapsule { std::string name; float radius, center_z, half_h; };
+    // 2026-08-10 修正: 旧表假设所有 link 网格沿各自 frame 的 +z 延伸, 但 Franka URDF
+    // 中 link1/3/5 网格在 −z 侧 (实测网格中心 z = −0.07/−0.03/−0.11) —— 旧 capsule
+    // 罩住的是关节另一侧的空气, link5(前臂) 对 DCD 完全隐形, 在 root-apple 场景中
+    // 被实测穿干 68mm。新表按 pybullet 实测网格 AABB 中心/范围重新放置。
     std::vector<LinkCapsule> capsule_structure = {
-        {"panda_link0", 0.10f, 0.05f, 0.02f}, {"panda_link1", 0.08f, 0.15f, 0.12f},
-        {"panda_link2", 0.07f, 0.00f, 0.02f}, {"panda_link3", 0.06f, 0.15f, 0.12f},
-        {"panda_link4", 0.06f, 0.05f, 0.03f}, {"panda_link5", 0.13f, 0.15f, 0.13f},
-        {"panda_link6", 0.06f, 0.00f, 0.02f},
+        {"panda_link0", 0.10f,  0.05f, 0.02f}, {"panda_link1", 0.09f, -0.07f, 0.12f},
+        {"panda_link2", 0.11f,  0.00f, 0.04f}, {"panda_link3", 0.09f, -0.035f, 0.10f},
+        {"panda_link4", 0.09f,  0.03f, 0.05f}, {"panda_link5", 0.09f, -0.105f, 0.10f},
+        {"panda_link6", 0.08f,  0.00f, 0.03f},
     };
     for (const auto& lc : capsule_structure) {
         float cz = lc.center_z;
@@ -989,55 +1073,16 @@ int main(int argc, char* argv[]) {
         static const float TRUNK_RAD[9] = {0.0160f,0.0142f,0.0124f,0.0104f,0.0087f,0.0072f,0.0056f,0.0041f,0.0026f};
 
         for (int i = 0; i < 8; ++i) {
-            Vector3f p0 = TRUNK_NODES[i], p1 = TRUNK_NODES[i+1];
+            Vector3f p0 = treeXform(TRUNK_NODES[i]), p1 = treeXform(TRUNK_NODES[i+1]);
             float r = 0.5f * (TRUNK_RAD[i] + TRUNK_RAD[i+1]);
             float halfLen = 0.5f * (p1 - p0).norm();
             collision_checker_ptr->addObstacleCylinder(r, halfLen, makeCylinderPose(p0, p1));
             cost_evaluator->addRigidCylinder(p0, p1, r);
         }
 
-        static const Vector3f BRANCH_NODES[23][6] = {
-            {{0.7338f,-0.0364f,0.6730f},{0.6963f, 0.0236f,0.6883f},{0.6504f, 0.0901f,0.6923f},{0.6114f, 0.1617f,0.6865f},{0.5648f, 0.2300f,0.7012f},{0.5171f, 0.2968f,0.7215f}},
-            {{0.7341f,-0.0374f,0.6980f},{0.6641f,-0.0716f,0.6774f},{0.6178f,-0.1627f,0.6953f},{0.5486f,-0.2075f,0.6671f},{0.4574f,-0.2419f,0.6056f},{0.3546f,-0.2674f,0.5607f}},
-            {{0.7335f,-0.0382f,0.7231f},{0.7821f, 0.0132f,0.7384f},{0.8349f, 0.0744f,0.7424f},{0.8943f, 0.1302f,0.7365f},{0.9486f, 0.1925f,0.7513f},{1.0013f, 0.2554f,0.7716f}},
-            {{0.7307f,-0.0393f,0.7733f},{0.6198f,-0.0544f,0.7767f},{0.5131f,-0.0478f,0.7733f},{0.4022f,-0.0703f,0.7646f},{0.2957f,-0.1365f,0.7597f},{0.2079f,-0.2281f,0.7597f}},
-            {{0.7328f,-0.0420f,0.8233f},{0.6355f,-0.0015f,0.8288f},{0.5440f, 0.0577f,0.8254f},{0.4381f, 0.0931f,0.8176f},{0.3128f, 0.0886f,0.8117f},{0.1912f, 0.0524f,0.8118f}},
-            {{0.7328f,-0.0353f,0.8973f},{0.7047f,-0.1514f,0.8297f},{0.7241f,-0.2402f,0.7218f},{0.7175f,-0.1885f,0.7896f},{0.7677f,-0.1361f,0.7888f},{0.8158f,-0.0801f,0.8041f}},
-            {{0.7308f,-0.0326f,0.9480f},{0.7244f,-0.0413f,0.9473f},{0.7179f,-0.0500f,0.9470f},{0.7115f,-0.0579f,0.9476f},{0.7043f,-0.0630f,0.9475f},{0.6975f,-0.0660f,0.9466f}},
-            {{0.7296f,-0.0307f,0.9984f},{0.7401f,-0.0973f,0.9858f},{0.7248f,-0.1196f,0.9603f},{0.7172f,-0.1549f,0.9210f},{0.7123f,-0.1910f,0.8752f},{0.7027f,-0.2282f,0.8309f}},
-            {{0.7292f,-0.0291f,1.0235f},{0.7921f,-0.0049f,1.0507f},{0.8722f, 0.0098f,1.0371f},{0.9751f, 0.0207f,1.0386f},{1.0928f,-0.0137f,1.0707f},{1.1828f,-0.0535f,1.1150f}},
-            {{0.7290f,-0.0249f,1.0736f},{0.6835f, 0.0485f,1.0521f},{0.6157f, 0.1149f,1.0971f},{0.5880f, 0.1374f,1.1261f},{0.5669f, 0.0906f,1.0594f},{0.4825f, 0.1128f,1.0263f}},
-            {{0.7140f,-0.0168f,1.1326f},{0.7063f,-0.0522f,1.1151f},{0.6832f,-0.0998f,1.0719f},{0.6702f,-0.1373f,1.0469f},{0.6446f,-0.2074f,1.0120f},{0.6318f,-0.2767f,0.9944f}},
-            {{0.6302f, 0.0038f,1.1993f},{0.6715f,-0.0195f,1.2540f},{0.7072f,-0.0558f,1.2990f},{0.7502f,-0.0902f,1.3270f},{0.7862f,-0.1337f,1.3534f},{0.8044f,-0.1540f,1.4100f}},
-            {{0.6075f, 0.0127f,1.2480f},{0.6125f,-0.0232f,1.2305f},{0.6075f,-0.0759f,1.1874f},{0.6083f,-0.1155f,1.1623f},{0.6088f,-0.1901f,1.1275f},{0.6209f,-0.2595f,1.1099f}},
-            {{0.6106f, 0.0135f,1.2959f},{0.7221f, 0.0449f,1.2733f},{0.8309f, 0.0882f,1.2315f},{0.6704f, 0.0552f,1.2685f},{0.5943f, 0.0756f,1.2557f},{0.5111f, 0.1015f,1.2659f}},
-            {{0.6168f, 0.0154f,1.3664f},{0.5907f, 0.0009f,1.3847f},{0.5715f,-0.0166f,1.3821f},{0.5521f,-0.0261f,1.3871f},{0.5183f,-0.0402f,1.3994f},{0.4936f,-0.0564f,1.4108f}},
-            {{0.7362f, 0.0169f,1.4796f},{0.7435f, 0.0112f,1.4844f},{0.7497f, 0.0056f,1.4866f},{0.7618f,-0.0086f,1.4872f},{0.7768f,-0.0270f,1.4866f},{0.7887f,-0.0363f,1.4830f}},
-            {{0.7381f, 0.0208f,1.5245f},{0.7604f, 0.0407f,1.5428f},{0.7753f, 0.0620f,1.5402f},{0.7922f, 0.0755f,1.5452f},{0.8220f, 0.0966f,1.5576f},{0.8425f, 0.1178f,1.5689f}},
-            {{0.7372f, 0.0236f,1.5489f},{0.7464f, 0.0242f,1.5537f},{0.7548f, 0.0243f,1.5559f},{0.7733f, 0.0219f,1.5565f},{0.7968f, 0.0183f,1.5559f},{0.8118f, 0.0194f,1.5523f}},
-            {{0.7273f, 0.0267f,1.5939f},{0.7264f, 0.0359f,1.5986f},{0.7262f, 0.0443f,1.6009f},{0.7281f, 0.0628f,1.6015f},{0.7311f, 0.0864f,1.6009f},{0.7296f, 0.1014f,1.5973f}},
-            {{0.7033f, 0.0290f,1.6251f},{0.5796f, 0.0899f,1.5926f},{0.3903f, 0.0973f,1.5967f},{0.6138f, 0.0567f,1.5920f},{0.6650f,-0.0006f,1.5778f},{0.7238f,-0.0655f,1.5875f}},
-            {{0.6445f, 0.0335f,1.6729f},{0.6474f, 0.0423f,1.6776f},{0.6506f, 0.0500f,1.6799f},{0.6599f, 0.0662f,1.6805f},{0.6722f, 0.0865f,1.6799f},{0.6769f, 0.1008f,1.6763f}},
-            {{0.6348f, 0.0468f,1.7469f},{0.6327f, 0.0466f,1.7580f},{0.6287f, 0.0453f,1.7690f},{0.6256f, 0.0443f,1.7803f},{0.6220f, 0.0421f,1.7913f},{0.6180f, 0.0392f,1.8021f}},
-            {{0.6317f, 0.0577f,1.8163f},{0.6305f, 0.0596f,1.8166f},{0.6271f, 0.0652f,1.8177f},{0.6237f, 0.0712f,1.8179f},{0.6201f, 0.0770f,1.8179f},{0.6171f, 0.0832f,1.8178f}},
-        };
-        static const float BRANCH_RAD[23][6] = {
-            {0.0061f,0.0059f,0.0053f,0.0049f,0.0042f,0.0036f},{0.0081f,0.0071f,0.0059f,0.0048f,0.0036f,0.0025f},
-            {0.0057f,0.0059f,0.0053f,0.0049f,0.0042f,0.0036f},{0.0058f,0.0058f,0.0053f,0.0046f,0.0040f,0.0033f},
-            {0.0077f,0.0069f,0.0055f,0.0057f,0.0051f,0.0046f},{0.0085f,0.0066f,0.0041f,0.0037f,0.0031f,0.0023f},
-            {0.0050f,0.0053f,0.0044f,0.0036f,0.0028f,0.0023f},{0.0039f,0.0046f,0.0039f,0.0032f,0.0023f,0.0016f},
-            {0.0069f,0.0067f,0.0061f,0.0056f,0.0049f,0.0043f},{0.0040f,0.0054f,0.0048f,0.0045f,0.0040f,0.0035f},
-            {0.0067f,0.0061f,0.0052f,0.0042f,0.0032f,0.0022f},{0.0052f,0.0050f,0.0046f,0.0042f,0.0037f,0.0033f},
-            {0.0065f,0.0061f,0.0052f,0.0042f,0.0032f,0.0022f},{0.0057f,0.0046f,0.0033f,0.0022f,0.0019f,0.0016f},
-            {0.0068f,0.0061f,0.0053f,0.0046f,0.0036f,0.0029f},{0.0051f,0.0052f,0.0045f,0.0036f,0.0027f,0.0020f},
-            {0.0053f,0.0050f,0.0043f,0.0037f,0.0029f,0.0023f},{0.0049f,0.0052f,0.0045f,0.0036f,0.0027f,0.0020f},
-            {0.0052f,0.0047f,0.0041f,0.0033f,0.0024f,0.0018f},{0.0112f,0.0105f,0.0096f,0.0037f,0.0049f,0.0047f},
-            {0.0047f,0.0042f,0.0037f,0.0030f,0.0022f,0.0016f},{0.0044f,0.0039f,0.0035f,0.0030f,0.0026f,0.0021f},
-            {0.0035f,0.0038f,0.0035f,0.0032f,0.0029f,0.0027f},
-        };
-        // Branch index 4 (5th from bottom) is the apple-attached branch.
-        // Make it RIGID — hard collision in Bullet + rigid in SDF (anisotropy skips).
-        const int APPLE_BRANCH_IDX = 4;
+        // 苹果枝 (--apple-branch-idx, 默认 4): rigid — hard collision in Bullet +
+        // rigid in SDF (anisotropy skips); --apple-branch-soft 时转软.
+        const int APPLE_BRANCH_IDX = apple_branch_idx;
         int n_soft = 0, n_rigid = 0;
         for (int b = 0; b < 23; ++b) {
             bool is_apple_branch = (b == APPLE_BRANCH_IDX);
@@ -1046,19 +1091,19 @@ int main(int argc, char* argv[]) {
             // visualize_tree6_simple.py 同算法), 统一半径 0.03。
             std::vector<Vector3f> poly;
             if (tree6_simple) {
-                poly.push_back(BRANCH_NODES[b][0]);
+                poly.push_back(TREE6_BRANCH_NODES[b][0]);
                 for (int i = 1; i < 5; ++i) {
-                    Vector3f d0 = BRANCH_NODES[b][i] - poly.back();
-                    Vector3f d1 = BRANCH_NODES[b][i+1] - BRANCH_NODES[b][i];
+                    Vector3f d0 = TREE6_BRANCH_NODES[b][i] - poly.back();
+                    Vector3f d1 = TREE6_BRANCH_NODES[b][i+1] - TREE6_BRANCH_NODES[b][i];
                     if (d0.norm() < 1e-9f || d1.norm() < 1e-9f) continue;
                     float c = std::max(-1.0f, std::min(1.0f,
                         d0.normalized().dot(d1.normalized())));
                     if (std::acos(c) * 180.0f / static_cast<float>(M_PI) >= 30.0f)
-                        poly.push_back(BRANCH_NODES[b][i]);
+                        poly.push_back(TREE6_BRANCH_NODES[b][i]);
                 }
-                poly.push_back(BRANCH_NODES[b][5]);
+                poly.push_back(TREE6_BRANCH_NODES[b][5]);
             } else {
-                for (int i = 0; i <= 5; ++i) poly.push_back(BRANCH_NODES[b][i]);
+                for (int i = 0; i <= 5; ++i) poly.push_back(TREE6_BRANCH_NODES[b][i]);
             }
 
             // 各段在整枝上的弧长占比 (branch-stiffness 刚度模型用)
@@ -1068,10 +1113,10 @@ int main(int argc, char* argv[]) {
             float arc_total = std::max(1e-6f, arc.back());
 
             for (size_t i = 0; i + 1 < poly.size(); ++i) {
-                Vector3f p0 = poly[i], p1 = poly[i+1];
+                Vector3f p0 = treeXform(poly[i]), p1 = treeXform(poly[i+1]);
                 float r = tree6_simple
                     ? 0.03f * branch_rscale
-                    : 0.5f * (BRANCH_RAD[b][i] + BRANCH_RAD[b][i+1]) * branch_rscale;
+                    : 0.5f * (TREE6_BRANCH_RAD[b][i] + TREE6_BRANCH_RAD[b][i+1]) * branch_rscale;
                 if (is_apple_branch && !apple_branch_soft) {
                     float halfLen = 0.5f * (p1 - p0).norm();
                     collision_checker_ptr->addObstacleCylinder(r, halfLen, makeCylinderPose(p0, p1));
@@ -1244,7 +1289,9 @@ int main(int argc, char* argv[]) {
         cost_evaluator->enablePenetrationGate(
             pen_gate_root_mm * 0.001f, pen_gate_tip_mm * 0.001f,
             scene.apple_pos, /*exempt_radius=*/0.12f);
-        std::cout << "[Setup] PENETRATION GATE ENABLED (hard validity):\n"
+        cost_evaluator->setPenGateRampT0(pen_gate_ramp_t0);  // 0 = 从枝根线性斜坡
+        std::cout << "[Setup] PENETRATION GATE ENABLED (hard validity, ramp_t0="
+                  << pen_gate_ramp_t0 << "):\n"
                   << "        allow(t) = " << pen_gate_root_mm << " mm (root) → "
                   << pen_gate_tip_mm << " mm (tip), apple exempt r = 0.12 m\n";
     }
@@ -1408,6 +1455,11 @@ int main(int argc, char* argv[]) {
     if (pen_steer_enabled) out_dir += "_pensteer";
     if (uni_refuse_enabled) out_dir += "_uni";
     if (nav_field_enabled) out_dir += "_nav";
+    if (apple_branch_idx != 4) out_dir += "_ab" + std::to_string(apple_branch_idx);
+    if (base_raise != 0.0f) {
+        char zb[32]; std::snprintf(zb, sizeof(zb), "_zr%.2f", base_raise);
+        out_dir += zb;
+    }
     if (!label_suffix.empty()) out_dir += "_" + label_suffix;
     mkdir(out_dir.c_str(), 0755);  // ignore EEXIST
     std::cout << "[Setup] Output directory: " << out_dir << "/\n";
@@ -1483,6 +1535,7 @@ int main(int argc, char* argv[]) {
         planner->addExtraSetupTimeMs(voxel_build_ms);
         planner->setGoalBiasProb(method_a_enabled ? 0.15f : 0.0f);  // Method A on/off
         planner->setNumThreads(num_threads);  // Batch RRT (K=1 = serial)
+        planner->setShortcutThreads(num_threads);  // 剪枝复用同一批线程槽位
 
         // Decide start config: priority is starts-file > fixed-start > random
         Config start_config(7);
@@ -1551,6 +1604,9 @@ int main(int argc, char* argv[]) {
                 planners[k]->addExtraSetupTimeMs(voxel_build_ms);
                 planners[k]->setGoalBiasProb(method_a_enabled ? 0.15f : 0.0f);
                 planners[k]->setNumThreads(1);  // each tree runs serial K=1 internally
+                // 竞速后只有赢家做 shortcut, 此时其余核空闲; robot/checker
+                // 的 per-thread 槽位按 num_threads(=K) 分配, 剪枝可全用
+                planners[k]->setShortcutThreads(num_threads);
                 if (!planners[k]->setStart(start_config)) {
                     std::cerr << "ERROR: planner[" << k << "] setStart failed\n";
                 }
@@ -1839,6 +1895,8 @@ int main(int argc, char* argv[]) {
                         {"panda_hand",  Vector3f(0,-0.04f,0.05f), 0.06f},
                     };
                     const auto& cyls2 = cost_evaluator->getCylinders();
+                    double soft_pen_sum = 0.0;   // 软枝穿入深度累加 (有接触样本)
+                    long   soft_pen_cnt = 0;     // 有接触的探针-路点样本数
                     for (size_t i = 0; i < solution.size(); ++i) {
                         robot->setJointValues(solution[i]);
                         bool violated = false;
@@ -1860,6 +1918,10 @@ int main(int argc, char* argv[]) {
                                 float dist = (pp - (cyl.p0 + u * seg)).norm();
                                 float pen = (cyl.radius + pr.r) - dist;  // 体积化
                                 if (pen <= 0.0f) continue;
+                                // 软枝穿透深度指标(与 allow 无关的原始穿入量)
+                                result.max_soft_pen = std::max(result.max_soft_pen, pen);
+                                soft_pen_sum += pen;
+                                ++soft_pen_cnt;
                                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                                 float allow = 0.015f + 0.060f * t_arc;
                                 if (pen > allow) {
@@ -1871,6 +1933,8 @@ int main(int argc, char* argv[]) {
                         }
                         if (violated) ++result.cut_violations;
                     }
+                    result.mean_soft_pen = (soft_pen_cnt > 0)
+                        ? static_cast<float>(soft_pen_sum / soft_pen_cnt) : 0.0f;
                 }
             }
 
@@ -2114,6 +2178,19 @@ int main(int argc, char* argv[]) {
         row("Cycles",          cy, "   ");
         row("Nodes",           nd, "   ");
         row("Grasp tries",     tr, "   ");
+
+        // ---- 软枝(绿枝)穿透深度: 判断机体是否穿绿枝太深 (mm) ----
+        auto msp_v = collect([](const RunResult& r){ return r.max_soft_pen  * 1000.0f; });
+        auto mnp_v = collect([](const RunResult& r){ return r.mean_soft_pen * 1000.0f; });
+        auto msp = stats(msp_v);
+        auto mnp = stats(mnp_v);
+        std::cout << std::setprecision(1);
+        row("Max soft-branch pen",  msp, " mm");
+        row("Mean soft-branch pen", mnp, " mm");
+        int cuts_total = 0;
+        for (const auto& r : all_results) if (r.success) cuts_total += r.cut_violations;
+        std::cout << "  (allow(t) 预算 15→75mm 沿枝; cut_violations 总计 = "
+                  << cuts_total << " —— 超预算的穿透次数)\n";
     }
 
     std::cout << "\n  Results written to: " << out_dir << "/\n"
