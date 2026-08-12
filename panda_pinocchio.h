@@ -74,6 +74,13 @@ public:
 
     void setJointValues(const Config& config) override {
         auto& pt = perThread();
+        // FK 缓存: 同构型重复调用直接返回。碰撞检测的 ~11 个 link FK 回调
+        // 都以同一构型调本函数, 只有第一次需要真正算 FK; 构型未变时
+        // jacobians_ready 也保持有效, 不重置。
+        if (pt.fk_valid && pt.current_config.size() == config.size() &&
+            (pt.current_config.array() == config.array()).all()) {
+            return;
+        }
         pt.current_config = config;
         pt.jacobians_ready = false;
 
@@ -85,6 +92,7 @@ public:
 
         pinocchio::forwardKinematics(model_, pt.data, q);
         pinocchio::updateFramePlacements(model_, pt.data);
+        pt.fk_valid = true;
     }
 
     void prepareJacobians(float /*unused*/ = 0.0f) override {
@@ -242,6 +250,8 @@ private:
         Eigen::MatrixXd  jacobian_cache;
         Eigen::MatrixXd  tmp_J_6d;
         bool             jacobians_ready = false;
+        // current_config 初始为 Zero 但从未跑过 FK, 不能只比构型判缓存命中
+        bool             fk_valid = false;
     };
 
     pinocchio::Model model_;

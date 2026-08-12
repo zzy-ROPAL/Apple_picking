@@ -138,6 +138,12 @@ public:
     void setNumThreads(int n) { num_threads_ = (n > 1) ? n : 1; }
     int  getNumThreads() const { return num_threads_; }
 
+    // shortcut 剪枝的并行度 (与 num_threads_ 独立: OR-parallel 模式下每树
+    // 内部串行 num_threads_=1, 但竞速结束后赢家剪枝时其余核已空闲, 可用
+    // robot/collision checker 的全部 per-thread 槽位)。n 不得超过
+    // robot->setNumThreads / BulletCollisionChecker 构造时的线程数。
+    void setShortcutThreads(int n) { shortcut_threads_ = (n > 1) ? n : 1; }
+
     // ---- OR-Parallel external stop signal ----
     // When set, the planning loop polls this flag and exits early when true.
     // Used by OR-Parallel mode to cancel losing trees once any tree finds a solution.
@@ -381,6 +387,7 @@ private:
 
     // Batch RRT
     int num_threads_ = 1;
+    int shortcut_threads_ = 1;   // shortcut 剪枝并行度 (见 setShortcutThreads)
 
     // OR-Parallel external stop flag (nullable, owned by caller)
     std::atomic<bool>* external_stop_flag_ = nullptr;

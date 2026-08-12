@@ -253,14 +253,21 @@ public:
                 float p_reject = (x >= 0.0f)
                     ? 1.0f / (1.0f + std::exp(-x))
                     : std::exp(x) / (1.0f + std::exp(x));
+                // thread_local: isPathValid 在 OR-parallel 竞速与并行 shortcut
+                // 中被多线程并发调用, 共享成员 RNG 是数据竞争
+                static thread_local std::mt19937 rng{std::random_device{}()};
                 std::uniform_real_distribution<float> u(0.0f, 1.0f);
-                if (u(edge_rng_) < p_reject) {
+                if (u(rng) < p_reject) {
                     er_rejects_++;
                     return false;
                 }
             }
         }
         // Step 2 (expensive, ~300-700 μs): geometric collision check.
+        // DCD 去重: 终点 q2 在此查一次, 中点在递归中各查一次 (q1 由调用方
+        // 保证有效: 树节点/上一路点)。旧版递归叶子会把每个中点作为子段
+        // 终点重复检查第二遍 —— 约一半碰撞检测在重验已证有效的构型。
+        if (!isConfigValid(q2)) return false;
         return recursivePathCheck(q1, q2, 0);
     }
 
@@ -346,26 +353,21 @@ private:
     mutable unsigned long long pen_gate_checks_  = 0;
     mutable unsigned long long pen_gate_rejects_ = 0;
 
-    // Private RNG for the probabilistic accept/reject decision. Seeded with
-    // a fixed value so soft rejection is deterministic per CSpaceSampled
-    // instance; if you want per-trial variability, reseed externally.
-    mutable std::mt19937 edge_rng_{0xC0FFEEu};
+    // (概率拒绝的 RNG 已改为 isPathValid 内的 thread_local —— 多线程
+    //  并发调用下共享成员 RNG 是数据竞争; 种子沿用 random_device 惯例)
 
     /**
      * 递归路径碰撞检测
+     * 前置条件: q1、q2 均已被检查有效 (isPathValid 负责 q2, 调用方保证 q1)。
+     * 每个中点只在生成处检查一次, 基本情况无需再查端点 —— 避免旧版
+     * 叶子重复检查中点造成的 ~50% 冗余碰撞检测。检查的构型集合不变。
      */
     bool recursivePathCheck(const Config& q1, const Config& q2, int depth) {
         float dist = calcDist(q1, q2, /*force_disable_weights=*/true);
-        
-        // 基本情况 1: 步长已经足够小
-        if (dist <= sampling_size_dcd_) {
-            return isConfigValid(q2); 
-        }
-        
-        // 基本情况 2: 达到最大深度 (此时应强制检测终点)
-        if (depth >= RECURSION_MAX_DEPTH) {
-            return isConfigValid(q2);
-        }
+
+        // 基本情况: 步长足够小或达到最大深度, 两端点均已检查过
+        if (dist <= sampling_size_dcd_) return true;
+        if (depth >= RECURSION_MAX_DEPTH) return true;
 
         Config q_mid = interpolate(q1, q2, 0.5f);
         if (!isConfigValid(q_mid)) return false;

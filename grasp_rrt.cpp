@@ -999,6 +999,12 @@ std::vector<Config> GraspRrt::shortcutSolutionPath(
 
     // 贪心"最远可直连"扫描:对每个 i 从路径末端向前找最远的 j 使
     // (i,j) 直连有效,成功则删除中间路点;反复扫描直到无改进。
+    //
+    // 并行化: 固定 i 时各候选 j 的分段检查相互独立。从末端起按块
+    // (chunk = 2×线程数) 并行评估, 取块内最大的有效 j —— 与串行
+    // "从末端向前找第一个有效 j" 结果一致 (块内更大的 j 都已检查),
+    // 但失败前缀的扫描摊到空闲核上。
+    const int nt = shortcut_threads_;
     bool improved = true;
     int round = 0;
     while (improved && round++ < max_rounds) {
@@ -1006,10 +1012,35 @@ std::vector<Config> GraspRrt::shortcutSolutionPath(
         size_t i = 0;
         while (i + 2 < path.size()) {
             size_t found = i;
-            for (size_t j = path.size() - 1; j > i + 1; --j) {
-                if (segmentValidPiecewise(path[i], path[j])) {
-                    found = j;
-                    break;
+            const size_t j_lo = i + 2;            // 候选 j > i+1
+            const size_t j_hi = path.size() - 1;
+            if (nt <= 1) {
+                for (size_t j = j_hi; j > i + 1; --j) {
+                    if (segmentValidPiecewise(path[i], path[j])) {
+                        found = j;
+                        break;
+                    }
+                }
+            } else {
+                const size_t chunk = static_cast<size_t>(2 * nt);
+                size_t hi = j_hi;
+                while (found == i) {
+                    const size_t lo = (hi >= j_lo + chunk - 1) ? hi - chunk + 1
+                                                               : j_lo;
+                    const int n = static_cast<int>(hi - lo + 1);
+                    std::vector<char> ok(n, 0);
+#ifdef _OPENMP
+                    #pragma omp parallel for num_threads(nt) schedule(dynamic)
+#endif
+                    for (int k = 0; k < n; ++k) {
+                        ok[k] = segmentValidPiecewise(path[i], path[lo + k])
+                                    ? 1 : 0;
+                    }
+                    for (int k = n - 1; k >= 0; --k) {
+                        if (ok[k]) { found = lo + k; break; }
+                    }
+                    if (lo == j_lo) break;
+                    hi = lo - 1;
                 }
             }
             if (found > i + 1) {
