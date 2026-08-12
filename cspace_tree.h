@@ -115,7 +115,8 @@ public:
         float out_dist_sq = 0;
         nanoflann::KNNResultSet<float> result(1);
         result.init(&out_idx, &out_dist_sq);
-        kdtree_->findNeighbors(result, query.data(), nanoflann::SearchParams());
+        // nanoflann 新版本把 SearchParams 更名为 SearchParameters (系统装的是新版)
+        kdtree_->findNeighbors(result, query.data(), nanoflann::SearchParameters());
 
         return nodes_[out_idx];
     }
