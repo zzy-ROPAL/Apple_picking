@@ -122,7 +122,7 @@ public:
     // ---- 软枝穿透闸门 (penetration gate) ----
     //
     // 把 benchmark 事后指标 cut_violations 的同一判据装进有效性层:
-    //   pen = (r_枝 + r_探针) − dist_轴 ≤ allow(t) = root + (tip−root)·t
+    //   pen = (r_枝 + r_探针) − dist_轴 ≤ allow(t)  (斜坡见 penAllowAt)
     // 探针集与该指标一致 (link3…hand 共 9 个体积化探针)。豁免球
     // (exempt_center, exempt_radius) 内的接触不计 —— 嵌枝苹果的终端
     // 抓取固有接触。allow 单位: 米。
@@ -153,6 +153,25 @@ public:
         }
     }
 
+    // allow(t): 许可穿透斜坡。根区平台 [0, ramp_t0] 一律取根部值,
+    // 斜坡只覆盖 [ramp_t0, 1] —— 即枝的前 1/4 (默认) 整段按根部刚度
+    // 对待, 后 3/4 线性放宽到梢部许可 (用户 8-09 参数化)。
+    // 唯一的 allow(t) 定义: 闸门/steering/severity/nav 过路费共用,
+    // 各层判据不脱节。
+    float penAllowAt(float t_arc) const {
+        float u = (t_arc - pen_gate_ramp_t0_)
+                / std::max(1e-3f, 1.0f - pen_gate_ramp_t0_);
+        if (u < 0.0f) u = 0.0f;
+        if (u > 1.0f) u = 1.0f;
+        return pen_gate_allow_root_
+             + (pen_gate_allow_tip_ - pen_gate_allow_root_) * u;
+    }
+
+    // 斜坡起点 (根区平台宽度, 弧长占比)。0 = 旧行为 (全枝线性)。
+    void setPenGateRampT0(float t0) {
+        pen_gate_ramp_t0_ = std::min(0.95f, std::max(0.0f, t0));
+    }
+
     // 闸门判定。恒真当未启用。FK 走 per-thread 机器人状态, 与
     // computeEdgeAxialScore 相同的并行安全模式。
     bool isPenetrationAllowed(const Eigen::VectorXf& q) const override {
@@ -177,8 +196,7 @@ public:
                 float pen = (cyl.radius + pr.r) - dist;
                 if (pen <= 0.0f) continue;
                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
-                float allow = pen_gate_allow_root_
-                    + (pen_gate_allow_tip_ - pen_gate_allow_root_) * t_arc;
+                float allow = penAllowAt(t_arc);
                 // 轴心硬禁区:探针中心永不进入轴线 axis_clear 内 ——
                 // allow 封顶为 (R+r−clear),枝梢也不许"贴轴穿过"。
                 // 确定性位置规则(接受概率恒 0),概率滤波给不了这种保证。
@@ -232,8 +250,7 @@ public:
                 if (dist - surf > margin) continue;        // 不在接触邻域
                 float pen = surf - dist;                   // 可为负 (未接触)
                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
-                float allow = pen_gate_allow_root_
-                    + (pen_gate_allow_tip_ - pen_gate_allow_root_) * t_arc;
+                float allow = penAllowAt(t_arc);
                 float slack = allow - std::max(pen, 0.0f);
                 if (slack < 0.0f) slack = 0.0f;
 
@@ -288,8 +305,7 @@ public:
                 if (dist - surf > margin) continue;
                 float pen = surf - dist;
                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
-                float allow = pen_gate_allow_root_
-                    + (pen_gate_allow_tip_ - pen_gate_allow_root_) * t_arc;
+                float allow = penAllowAt(t_arc);
                 float slack = allow - std::max(pen, 0.0f);
                 if (slack < 0.0f) slack = 0.0f;
 
@@ -1962,8 +1978,7 @@ public:
                         if (pen <= 0.0f) continue;
                         if (cyl.exclude_from_aniso) { m = -1.0f; break; }  // 刚性: 不可通行
                         float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
-                        float allow = pen_gate_allow_root_
-                            + (pen_gate_allow_tip_ - pen_gate_allow_root_) * t_arc;
+                        float allow = penAllowAt(t_arc);
                         if (pen > allow) { m = -1.0f; break; }             // 闸门禁核
                         float stiff = branchStiffness(t_arc, 3.0f, 0.5f) / 3.0f;
                         m += nav_toll_gain_ * stiff * (pen / std::max(allow, 1e-3f));
@@ -2089,8 +2104,9 @@ private:
     // ---- 软枝穿透闸门状态 ----
     struct PenProbe { int fid; Eigen::Vector3f off; float r; };
     bool                  pen_gate_enabled_    = false;
-    float                 pen_gate_allow_root_ = 0.015f;  // allow(t=0), m
-    float                 pen_gate_allow_tip_  = 0.075f;  // allow(t=1), m
+    float                 pen_gate_allow_root_ = 0.015f;  // allow 根部值, m
+    float                 pen_gate_allow_tip_  = 0.050f;  // allow(t=1), m
+    float                 pen_gate_ramp_t0_    = 0.25f;   // 斜坡起点 (根区平台宽)
     Eigen::Vector3f       pen_gate_exempt_center_ = Eigen::Vector3f::Zero();
     float                 pen_gate_exempt_r2_  = 0.0144f; // 0.12² m²
     float                 pen_gate_axis_clear_ = 0.01f;   // 轴心硬禁区半径 (m)
@@ -2134,8 +2150,7 @@ private:
         float surf_dist = dist - surf;                    // <0 = 已穿透
         if (surf_dist >= uni_env_) return false;          // 包络外
         float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
-        float allow = pen_gate_allow_root_
-            + (pen_gate_allow_tip_ - pen_gate_allow_root_) * t_arc;
+        float allow = penAllowAt(t_arc);
         // 与闸门一致的轴心硬禁区封顶(转向/评分与有效性判据不脱节)
         float allow_cap = surf - pen_gate_axis_clear_ * (1.0f - t_arc);
         if (allow > allow_cap) allow = allow_cap;
