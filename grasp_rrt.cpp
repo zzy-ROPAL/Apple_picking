@@ -12,7 +12,7 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// 构造函数
+// Constructor
 // ============================================================================
 
 GraspRrt::GraspRrt(std::shared_ptr<CSpaceSampled> cspace,
@@ -32,7 +32,7 @@ GraspRrt::GraspRrt(std::shared_ptr<CSpaceSampled> cspace,
       cycles_(0),
       last_added_id_(-1),
       col_checks_overall_(0) {
-    // 同步 CSpaceSampled 的 DCD 参数
+    // Sync the DCD parameters into CSpaceSampled
     cspace_->setSamplingSize(config_.sampling_size_paths);
     cspace_->setSamplingSizeDCD(config_.sampling_size_dcd);
 
@@ -40,7 +40,7 @@ GraspRrt::GraspRrt(std::shared_ptr<CSpaceSampled> cspace,
 }
 
 // ============================================================================
-// setStart — 对应 Python GraspRrt.setStart
+// setStart — counterpart of the Python GraspRrt.setStart
 // ============================================================================
 
 bool GraspRrt::setStart(const Config& start_config) {
@@ -49,12 +49,12 @@ bool GraspRrt::setStart(const Config& start_config) {
         return false;
     }
 
-    // 初始化树
+    // Initialize the tree
     tree_ = std::make_unique<CSpaceTree>(cspace_.get());
     start_node_ = tree_->appendNode(start_config, -1);
     start_node_->setStatus(0);
 
-    // 处理起始节点 (缓存 TCP 位姿)
+    // Process the start node (cache its TCP pose)
     processNode(start_node_);
 
     if (verbose_) {
@@ -64,7 +64,7 @@ bool GraspRrt::setStart(const Config& start_config) {
 }
 
 // ============================================================================
-// reset — 对应 Python GraspRrt.reset
+// reset — counterpart of the Python GraspRrt.reset
 // ============================================================================
 
 void GraspRrt::reset() {
@@ -88,7 +88,7 @@ void GraspRrt::reset() {
 }
 
 // ============================================================================
-// init — 对应 Python GraspRrt.init
+// init — counterpart of the Python GraspRrt.init
 // ============================================================================
 
 bool GraspRrt::init() {
@@ -122,7 +122,7 @@ bool GraspRrt::init() {
     cached_shell_target_     = Vector3f::Zero();
     shell_resample_counter_  = 0;
 
-    // 初始化接近方向离散球面
+    // Initialize the discretized approach-direction sphere
     pose_sphere_ = std::make_unique<ApproachDiscretization>();
     pose_sphere_->setGlobalPose(target_object_->getGlobalPose());
     target_object_position_ = target_object_->getPosition();
@@ -137,7 +137,7 @@ bool GraspRrt::init() {
 }
 
 // ============================================================================
-// plan — 核心主循环 (对应 Python GraspRrt.plan)
+// plan — the core main loop (counterpart of the Python GraspRrt.plan)
 // ============================================================================
 
 bool GraspRrt::plan(bool quiet) {
@@ -159,7 +159,7 @@ bool GraspRrt::plan(bool quiet) {
             stop_loop = true;
         }
 
-        // 超时检查
+        // Timeout check
         auto t_now = std::chrono::high_resolution_clock::now();
         float elapsed_ms = std::chrono::duration<float, std::milli>(t_now - t_start).count();
         if (elapsed_ms > config_.planning_timeout_ms) {
@@ -172,7 +172,7 @@ bool GraspRrt::plan(bool quiet) {
     performance_.planning_time_ms =
         std::chrono::duration<float, std::milli>(t_end - t_start).count();
 
-    // 计算 RRT 建树时间
+    // Compute the RRT tree-building time
     performance_.rrt_time_ms =
         performance_.planning_time_ms - performance_.move_toward_grasp_poses_time_ms;
     performance_.move_toward_grasp_poses_time_ms -= performance_.score_grasp_time_ms;
@@ -193,7 +193,7 @@ bool GraspRrt::plan(bool quiet) {
 }
 
 // ============================================================================
-// doPlanningCycle — 单轮规划 (对应 Python doPlanningCycle)
+// doPlanningCycle — a single planning round (counterpart of the Python doPlanningCycle)
 // ============================================================================
 
 bool GraspRrt::doPlanningCycle() {
@@ -207,7 +207,7 @@ bool GraspRrt::doPlanningCycle() {
     float r = randFloat01();
 
     if (r <= config_.probab_grasp_hypothesis) {
-        // ===== 策略 A: 概率触发终端抓取下探 (Terminal Grasp) =====
+        // ===== Strategy A: probabilistically triggered terminal grasp descent =====
         do_normal_connect = false;
         MoveArmResult grasp_status = connectRandomGraspPositionJacobian();
 
@@ -238,7 +238,7 @@ bool GraspRrt::doPlanningCycle() {
     }
 
     if (do_normal_connect) {
-        // ===== 阶段一：VF-RRT 树扩展（含 goal-biased sampling） =====
+        // ===== Stage one: VF-RRT tree extension (with goal-biased sampling) =====
         Config rand_config;
         float r2 = randFloat01();
         if (r2 < goal_bias_prob_) {
@@ -264,7 +264,7 @@ bool GraspRrt::doPlanningCycle() {
 }
 
 // ============================================================================
-// maybeResampleShellAttractor — 主线程串行调用
+// maybeResampleShellAttractor — called serially from the main thread
 // ============================================================================
 void GraspRrt::maybeResampleShellAttractor() {
     if (!config_.use_shell_attractor) return;
@@ -299,9 +299,9 @@ void GraspRrt::maybeResampleShellAttractor() {
 }
 
 // ============================================================================
-// doPlanningCycleBatch — Batch RRT 主循环
-// 主线程预采 K 个 q_rand → K 路并行做 extend compute → 主线程串行 commit.
-// Grasp hypothesis 分支沿用串行路径 (不在并行段内).
+// doPlanningCycleBatch — Batch RRT main loop
+// The main thread pre-samples K q_rand values -> K parallel extend computations -> serial commit on the main thread.
+// The grasp-hypothesis branch stays on the serial path (outside the parallel section).
 // ============================================================================
 bool GraspRrt::doPlanningCycleBatch(int K) {
     if (!planner_initialized_) return false;
@@ -310,8 +310,8 @@ bool GraspRrt::doPlanningCycleBatch(int K) {
     int col_checks_start = cspace_->getCollisionCheckCount();
     maybeResampleShellAttractor();
 
-    // 1) Grasp hypothesis 分支 (串行) - 与 doPlanningCycle 保持一致.
-    //    用主线程 RNG 决定是否触发, 触发则单独走一次抓取尝试, 不做 batch extend.
+    // 1) Grasp-hypothesis branch (serial) — consistent with doPlanningCycle.
+    //    The main-thread RNG decides whether to trigger; if so, one grasp attempt runs alone with no batch extend.
     float r = randFloat01();
     if (r <= config_.probab_grasp_hypothesis) {
         MoveArmResult grasp_status = connectRandomGraspPositionJacobian();
@@ -397,7 +397,7 @@ bool GraspRrt::doPlanningCycleBatch(int K) {
 }
 
 // ============================================================================
-// VF-RRT 核心: 计算矢量力场 (斥力 + 引力)
+// VF-RRT core: compute the vector force field (repulsion + attraction)
 // ============================================================================
 Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                                      const Config& motion_dir) {
@@ -431,8 +431,8 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
     }
     if (rep_vector.norm() > 1e-6f) rep_vector.normalize();
 
-    // 2. 硬质障碍物斥力 + 旋涡 (树干 + 额外障碍物)
-    // 注: 在 batch RRT 下, 跨线程共享 cached_J_T_ 会产生 race; 改为 per-call 局部变量.
+    // 2. Rigid-obstacle repulsion + vortex (trunk + additional obstacles)
+    // Note: under batch RRT, sharing cached_J_T_ across threads is a race; use a per-call local instead.
     auto panda_robot = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
     if (panda_robot && !panda_robot->isJacobiansReady()) {
         robot_->prepareJacobians();
@@ -446,8 +446,8 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
 
     Config hard_trunk_rep_vector = Eigen::VectorXf::Zero(dimension_);
     Config vortex_vector = Eigen::VectorXf::Zero(dimension_);
-    Config soft_stiff_vector = Eigen::VectorXf::Zero(dimension_);  // 软枝刚度场
-    float  bs_act = 0.0f;   // 最深接触的激活度 ∈ [0,1](轴心主导用)
+    Config soft_stiff_vector = Eigen::VectorXf::Zero(dimension_);  // soft-branch stiffness field
+    float  bs_act = 0.0f;   // activation of the deepest contact, in [0,1] (used for axis dominance)
 
     // Per-link trunk repulsion: check every major link, not just TCP
     {
@@ -459,9 +459,9 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
         static int fid_l7 = robot_->getFrameId("panda_link7");
         static int fid_lh = robot_->getFrameId("panda_hand");
 
-        // radius = 该处机体近似半径(与 SDF 球模型一致)。软枝刚度场用
-        // "体表距离"(dist − radius)衡量深度 —— 质心距轴 6cm 而机体半径
-        // 6cm 时,机体已在碾压枝条,点距离会把深度低估整整一个体半径。
+        // radius = the approximate body radius here (consistent with the SDF sphere model).
+        // The stiffness field measures depth by SURFACE distance (dist - radius): with the
+        // centroid 6 cm from the axis and a body radius of 6 cm the body is already crushing
         struct TrunkPoint { int fid; Vector3f offset; float radius; };
         TrunkPoint trunk_points[] = {
             {fid_l2, Vector3f(0,0,0),     0.08f},
@@ -473,17 +473,17 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
             {fid_lh, Vector3f(0,0,0.08f), 0.06f}
         };
 
-        // ---- 泛化:遍历全部 rigid 圆柱,每段用真实轴向 ----
-        // 原实现只针对树干且硬编码竖直轴 (0.7,0)——对 tree6 倾斜树干仅是
-        // 近似,对刚性苹果枝(水平)完全无覆盖:引力场把搜索直拽进刚性
-        // 枝、无切向绕行(start 3 卡死成因之一)。现遍历 SDF 中全部
-        // rigid 圆柱(exclude_from_aniso=true:树干各段 + tree6 刚性
-        // 苹果枝):
-        //   斥力 = 径向(点到线段最近点方向),1/d²
-        //   旋涡 = axis_unit × radial(绕该段真实轴的切向),1.5× 权重
-        // 退化圆柱(p0==p1,如 overhead 球)跳过——其斥力仍由
-        // setHardObstacle 单独提供,与旧版一致。标准场景的竖直树干在
-        // 新公式下方向与旧版相同(axis=ẑ 时二者等价),历史行为保持。
+        // ---- Generalization: iterate over all rigid cylinders, each with its true axis ----
+        // The original implementation handled only the trunk with a hardcoded vertical axis
+        // (0.7,0) — merely an approximation for tree6's tilted trunk, and no coverage at all
+        // for the rigid (horizontal) apple branch: the attraction field dragged the search
+        // straight into it with no tangential detour (one cause of start 3 getting stuck).
+        // Now every rigid cylinder in the SDF is traversed (exclude_from_aniso=true:
+        // trunk segments + tree6's rigid apple branch):
+        //   repulsion = radial (toward the closest point on the segment), 1/d^2
+        //   vortex    = axis_unit x radial (tangential around the true axis), weight 1.5x
+        // Degenerate cylinders (p0==p1, e.g. the overhead sphere) are skipped — their repulsion
+        // still comes from setHardObstacle. For a vertical trunk the new formula matches the old.
         constexpr float rigid_trigger = 0.20f;
         auto sdf_eval_vf = std::dynamic_pointer_cast<SdfCostEvaluator>(
             cspace_->getCostEvaluator());
@@ -496,12 +496,12 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                            + pose.block<3,3>(0,0) * pt.offset;
 
                 for (const auto& cyl : cyls) {
-                    if (cyl.axis_unit.squaredNorm() < 0.25f) continue; // 退化跳过
+                    if (cyl.axis_unit.squaredNorm() < 0.25f) continue; // skip degenerate
 
-                    // ---- 软枝刚度场(branch stiffness,可选) ----
-                    // force ∝ stiffness(t)·depth:根部/深处强推,梢部弱推。
-                    // 深度激活度 bs_act_ 抬升该项在 VF 合成中的权重直至
-                    // 轴心主导(> 引力),见合成处注释。
+                    // ---- Soft-branch stiffness field (branch stiffness, optional) ----
+                    // force ~ stiffness(t)*depth: push hard at the root / deep inside, softly at the tip.
+                    // The depth activation bs_act_ raises this term's weight in the VF blend
+                    // until the axis dominates (> attraction); see the note at the blending site.
                     if (!cyl.exclude_from_aniso) {
                         if (!config_.branch_stiffness_enabled) continue;
                         Vector3f seg = cyl.p1 - cyl.p0;
@@ -512,7 +512,7 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                             : 0.0f;
                         Vector3f radial = p - (cyl.p0 + u * seg);
                         float dist = radial.norm();
-                        // 体积化:从机体表面起算(dist − 体半径),而非质心
+                        // Volumetric: measured from the body surface (dist - body radius), not the centroid
                         float dist_eff = std::max(0.0f, dist - pt.radius);
                         float shell = cyl.radius + config_.bs_shell;
                         if (dist_eff >= shell || dist <= 1e-4f) continue;
@@ -520,7 +520,7 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                         float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                         float stiff = SdfCostEvaluator::branchStiffness(
                             t_arc, config_.bs_k_root, config_.bs_k_tip);
-                        // depth ∈ (0,1]: 体表在壳层外缘 0 → 体表贴轴心 1
+                        // depth in (0,1]: 0 when the surface is at the shell's outer edge, 1 when it touches the axis
                         float depth = (shell - dist_eff) / shell;
                         float act = std::min(1.0f,
                             stiff * depth / std::max(1e-3f, config_.bs_k_root));
@@ -535,7 +535,7 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                         continue;
                     }
 
-                    // ---- rigid 圆柱:斥力 + 旋涡(真实轴向) ----
+                    // ---- Rigid cylinder: repulsion + vortex (true axis) ----
                     Vector3f seg = cyl.p1 - cyl.p0;
                     float seg_sq = seg.squaredNorm();
                     float t = (seg_sq > 1e-9f)
@@ -611,28 +611,28 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
         }
     }
 
-    // 3. 引力场 — applied to wrist region (link6, link7, hand) + TCP
+    // 3. Attraction field — applied to wrist region (link6, link7, hand) + TCP
     //
-    // 两种模式 (由 config_.use_shell_attractor 切换):
-    //   A. 球冠随机采样 (use_shell_attractor=true):
-    //      球壳半径 = target_radius + offset, 球冠高度 = cap_height
-    //      每 shell_attractor_resample_period 个 cycle 在球冠上均匀重新采样
-    //   B. 固定单点 (use_shell_attractor=false):
-    //      引力源固定在苹果下方 8cm
+    // Two modes (selected by config_.use_shell_attractor):
+    //   A. Random sampling on a spherical cap (use_shell_attractor=true):
+    //      shell radius = target_radius + offset, cap height = cap_height
+    //      resampled uniformly on the cap every shell_attractor_resample_period cycles
+    //   B. Fixed single point (use_shell_attractor=false):
+    //      the attractor sits 8 cm below the apple
     Vector3f virtual_target;
     if (config_.use_shell_attractor) {
-        // 注: shell 重采样逻辑已移出. 主线程在每个 cycle/batch 入口处通过
-        // maybeResampleShellAttractor() 决定是否更新 cached_shell_target_.
-        // 这里只做只读使用 (并行安全).
+        // Note: the shell resampling logic moved out. At each cycle/batch entry the main
+        // thread decides via maybeResampleShellAttractor() whether to update cached_shell_target_.
+        // Here it is only read (parallel-safe).
         if (cached_shell_target_.norm() < 1e-9f) {
-            // Fallback: 第一次调用且 main 还没采过, 退到固定单点
+            // Fallback: first call and main has not sampled yet — use the fixed point
             virtual_target = target_object_position_;
             virtual_target.z() -= 0.08f;
         } else {
             virtual_target = cached_shell_target_;
         }
     } else {
-        // 固定单点 (原始设计): 苹果下方 8cm
+        // Fixed single point (original design): 8 cm below the apple
         virtual_target = target_object_position_;
         virtual_target.z() -= 0.08f;
     }
@@ -648,8 +648,8 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
             {fid_link7_a, Vector3f(0,0,0.05f), 0.6f},
             {fid_hand_a,  Vector3f(0,0,0.08f), 1.0f},  // ~TCP
         };
-        // Nav field 混合吸引(见 types.h 注释):远场走洪泛下坡,
-        // 近场回退随机球冠点直线;切换用测地距离(smoothstep 过渡)。
+        // Nav-field blended attraction (see the note in types.h): the far field follows the
+        // flood downhill, the near field falls back to a straight line toward a random cap point;
         auto sdf_nav = config_.nav_field_enabled
             ? std::dynamic_pointer_cast<SdfCostEvaluator>(
                   cspace_->getCostEvaluator())
@@ -668,12 +668,12 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                         float s = (dnav - config_.nav_switch_dist)
                                 / std::max(1e-3f, config_.nav_blend_band);
                         s = std::max(0.0f, std::min(1.0f, s));
-                        float w = s * s * (3.0f - 2.0f * s);   // 1=远场洪泛
+                        float w = s * s * (3.0f - 2.0f * s);   // 1 = far-field flood
                         Vector3f blend = w * ndir + (1.0f - w) * dir;
                         if (blend.norm() > 1e-6f) dir = blend.normalized();
                     }
                 }
-                // dnav = ∞(场外/不可达)→ 保持直线回退
+                // dnav = infinity (outside the field / unreachable) -> keep the straight-line fallback
             }
             Eigen::VectorXf e_a = Eigen::VectorXf::Zero(6);
             e_a.head<3>() = dir * ap.weight;
@@ -683,10 +683,10 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
         if (att_vector.norm() > 1e-6f) att_vector.normalize();
     }
 
-    // 4. 加权融合
-    // 软枝刚度项权重:随最深接触激活度 0 → bs_weight_max(默认 6.0,
-    // 超过引力权重 4.0)。浅接触时只是普通斥力补充;贴近枝轴心时净场
-    // 必然向外 —— "轴心不可占据"。
+    // 4. Weighted blend
+    // Weight of the soft-branch stiffness term: rises with the deepest contact's activation
+    // from 0 to bs_weight_max (default 6.0, above the attraction weight 4.0). At shallow
+    // contact it merely supplements the repulsion; near the branch axis the net field
     float w_stiff = bs_act * config_.bs_weight_max;
     vf = 1.2f * rep_vector + w_stiff * soft_stiff_vector +
          2.5f * hard_trunk_rep_vector + 2.0f * vortex_vector +
@@ -697,19 +697,19 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
 }
 
 // ============================================================================
-// computeAdaptiveStep — 根据 TCP 到障碍物的距离自适应步长
-//   远 → 大步（快速覆盖），近 → 小步（避免冲过去）
+// computeAdaptiveStep — step size adapted to the TCP distance to obstacles
+//   far -> long steps (fast coverage), near -> short steps (avoid overshooting)
 // ============================================================================
 static float computeAdaptiveStep(float dist_to_obstacle, float base_step) {
-    // SDF 内部为负 → 已在障碍内（异常情况），用最小步
+    // Negative inside the SDF -> already inside an obstacle (abnormal); use the smallest step
     if (dist_to_obstacle <= 0.0f) return base_step * 0.4f;
 
-    // 分段映射：dist (m) → step ratio
-    // > 0.20m  : 2.4 倍（远，大胆走）
-    // 0.10-0.20: 1.6 倍
-    // 0.05-0.10: 1.0 倍（默认）
-    // 0.02-0.05: 0.6 倍
-    // < 0.02m  : 0.4 倍（极近，谨慎）
+    // Piecewise map: dist (m) -> step ratio
+    // > 0.20 m : 2.4x (far, move boldly)
+    // 0.10-0.20: 1.6x
+    // 0.05-0.10: 1.0x (default)
+    // 0.02-0.05: 0.6x
+    // < 0.02 m : 0.4x (very close, be careful)
     float ratio;
     if      (dist_to_obstacle > 0.20f) ratio = 2.4f;
     else if (dist_to_obstacle > 0.10f) ratio = 1.6f;
@@ -720,7 +720,7 @@ static float computeAdaptiveStep(float dist_to_obstacle, float base_step) {
 }
 
 // ============================================================================
-// getOrComputeEEJacobian — 缓存节点的末端雅可比
+// getOrComputeEEJacobian — cached end-effector Jacobian per node
 // ============================================================================
 // Returns the 3×7 EE Jacobian at the given node configuration, cached by
 // node_id. On cache miss, computes via PandaPinocchioRobot::computeSphere
@@ -754,11 +754,11 @@ MatrixXf GraspRrt::getOrComputeEEJacobian(int node_id, const Config& q) {
 }
 
 // ============================================================================
-// extendVFRRT — Lazy VF-RRT: 无碰撞检测扩展，路径验证延迟到找到抓取后
+// extendVFRRT — VF-RRT extension primitive (eager: every edge is validated on the spot)
 // ============================================================================
 // Pure-compute part of extendVFRRT.
-// 只读 tree_/cspace_/robot_, 不写 tree_/performance_/last_added_id_.
-// 可在多线程并行调用 (前提: Phase 1+2 已就绪).
+// Reads tree_/cspace_/robot_ only; never writes tree_/performance_/last_added_id_.
+// Safe to call from multiple threads (precondition: phases 1+2 are ready).
 GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     ExtendCandidate cand;
 
@@ -776,8 +776,8 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     if (q_rand_dir.norm() > 1e-6f) q_rand_dir.normalize();
 
     auto t_start_vf = std::chrono::high_resolution_clock::now();
-    // q_rand_dir 是已经 normalize 过的扩展方向, 作为 motion_dir 传给 VF
-    // (Option A 的轴向 drag 需要它; K_ax=0 时此参数被忽略).
+    // q_rand_dir is the already-normalized extension direction, passed to the VF as motion_dir
+    // (Option A's axial drag needs it; the parameter is ignored when K_ax=0).
     Config vf_dir = computeVectorField(q_near, nn, q_rand_dir);
     auto t_end_vf = std::chrono::high_resolution_clock::now();
     cand.vf_time_ms = std::chrono::duration<float, std::milli>(t_end_vf - t_start_vf).count();
@@ -793,10 +793,10 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     }
     if (q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
 
-    // 注:此处原有 sample steering(角度锥限幅)已整体删除,实现亦不再
-    // 保留。其职责由下方 unified steering(提议层投影,按损伤预算而非
-    // 角度)完全覆盖:全臂 9 探针 × 全部软枝逐对取 max,无 argmax/无
-    // K 近邻,结构性无振荡。历史实现见 git 提交 fee46a1。
+    // Note: the sample steering that used to sit here (angle-cone cap) has been removed
+    // entirely, implementation included. Its role is fully covered by the unified steering
+    // below (proposal-layer projection driven by the damage budget rather than by angle):
+    // 9 whole-arm probes x all soft branches, pairwise max, no argmax and no K-nearest,
 
 #if 0  // ================== STICKY WINNER — DISABLED ======================
     // Superseded by the structure-tensor edge refuse (--edge-refuse-tensor).
@@ -850,9 +850,9 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
         }
     }
 
-    // ---- Depth steering / Unified steering(提议层,见 types.h 注释) ----
-    // 在真实步长已知后、成边之前投影提议方向:unified 同时管内压与轴滑
-    // (剩余 ≈ 环向缠绕);depth steering 只管内压。二者互斥,unified 优先。
+    // ---- Depth steering / Unified steering (proposal layer, see the note in types.h) ----
+    // Project the proposed direction once the real step size is known and before the edge is
+    // formed: unified handles inward pressure and axial slip together (leaving ~ hoop motion);
     if ((config_.uni_refuse_enabled || config_.pen_steer_enabled) &&
         q_step_dir.norm() > 1e-6f) {
         auto sdf_eval_ds = std::dynamic_pointer_cast<SdfCostEvaluator>(
@@ -944,7 +944,7 @@ ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
 }
 
 // ============================================================================
-// shortcutSolutionPath — 方法 1:score-aware shortcutting(见 grasp_rrt.h)
+// shortcutSolutionPath — Method 1: score-aware shortcutting (see grasp_rrt.h)
 // ============================================================================
 
 bool GraspRrt::segmentValidPiecewise(const Config& a, const Config& b) {
@@ -965,13 +965,13 @@ std::vector<Config> GraspRrt::shortcutSolutionPath(
     std::vector<Config> path = in;
     if (path.size() < 3) return path;
 
-    // 贪心"最远可直连"扫描:对每个 i 从路径末端向前找最远的 j 使
-    // (i,j) 直连有效,成功则删除中间路点;反复扫描直到无改进。
+    // Greedy "farthest direct connection" scan: for each i, search backward from the end of
+    // the path for the farthest j whose direct (i,j) connection is valid; on success drop the
     //
-    // 并行化: 固定 i 时各候选 j 的分段检查相互独立。从末端起按块
-    // (chunk = 2×线程数) 并行评估, 取块内最大的有效 j —— 与串行
-    // "从末端向前找第一个有效 j" 结果一致 (块内更大的 j 都已检查),
-    // 但失败前缀的扫描摊到空闲核上。
+    // Parallelization: for a fixed i, the per-segment checks of the candidate j values are
+    // independent. Starting from the end, evaluate in chunks (chunk = 2 x thread count) and
+    // take the largest valid j in the chunk — identical to the serial "first valid j scanning
+    // backward from the end", while the failing prefix is spread across idle cores.
     const int nt = shortcut_threads_;
     bool improved = true;
     int round = 0;
@@ -980,7 +980,7 @@ std::vector<Config> GraspRrt::shortcutSolutionPath(
         size_t i = 0;
         while (i + 2 < path.size()) {
             size_t found = i;
-            const size_t j_lo = i + 2;            // 候选 j > i+1
+            const size_t j_lo = i + 2;            // candidates j > i+1
             const size_t j_hi = path.size() - 1;
             if (nt <= 1) {
                 for (size_t j = j_hi; j > i + 1; --j) {
@@ -1019,9 +1019,9 @@ std::vector<Config> GraspRrt::shortcutSolutionPath(
         }
     }
 
-    // 重新按规划粒度加密:剪枝后可能只剩几个路点,而各向异性指标
-    // 逐路点采样穿入深度,过疏会漏检接触、虚低指标。加密不改变
-    // 几何(仍是同一折线),只恢复采样密度与回放平滑度。
+    // Re-densify at planning granularity: after pruning only a few waypoints may remain,
+    // while the anisotropy metrics sample penetration depth per waypoint — too sparse and
+    // contacts are missed, understating the metric. Densifying does not change the geometry
     std::vector<Config> dense;
     dense.push_back(path.front());
     for (size_t i = 0; i + 1 < path.size(); ++i) {
@@ -1036,7 +1036,7 @@ std::vector<Config> GraspRrt::shortcutSolutionPath(
 }
 
 // ============================================================================
-// validateSolutionPath — Lazy 碰撞验证: 找到抓取后才检查完整路径
+// validateSolutionPath — lazy collision validation: check the full path only after a grasp is found
 // ============================================================================
 bool GraspRrt::validateSolutionPath(CSpaceNodePtr goal_node) {
     std::vector<Config> path;
@@ -1063,49 +1063,49 @@ bool GraspRrt::validateSolutionPath(CSpaceNodePtr goal_node) {
 
 // ============================================================================
 // connectRandomGraspPositionJacobian
-// 对应 Python GraspRrt.connectRandomGraspPositionJacobian
+// Counterpart of the Python GraspRrt.connectRandomGraspPositionJacobian
 // ============================================================================
 
 MoveArmResult GraspRrt::connectRandomGraspPositionJacobian() {
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    // 1. 从离散球面中获取采样方向均匀的节点
+    // 1. Get a node with uniformly sampled direction from the discretized sphere
     CSpaceNodePtr nn_node = pose_sphere_->getGoodRatedNode();
     if (!nn_node) {
         if (verbose_) std::cout << "[GraspRrt] No good rated node in pose sphere\n";
-        // 没节点可挑就直接 TRAPPED，不计入 face stats（face_id == -1）
+        // No node to pick: TRAPPED immediately, not counted in the face stats (face_id == -1)
         n_grasp_trapped_++;
         return MoveArmResult::TRAPPED;
     }
     int face_id = pose_sphere_->getLastSelectedFace();
 
-    // 2. 在物体表面计算抓取目标位姿
+    // 2. Compute the grasp target pose on the object surface
     auto t_pose_start = std::chrono::high_resolution_clock::now();
     bool pose_ok = false;
     Matrix4f goal_pose = calculateGlobalGraspPose(nn_node->getConfiguration(), pose_ok);
     auto t_pose_end = std::chrono::high_resolution_clock::now();
     performance_.pose_calc_ms += std::chrono::duration<float, std::milli>(t_pose_end - t_pose_start).count();
     if (!pose_ok) {
-        // 把 pose 计算失败也算作该面的一次失败
+        // A failed pose computation also counts as a failure for that face
         pose_sphere_->recordGraspAttempt(face_id, /*success=*/false);
         tryDisableFace(face_id);
         n_grasp_error_++;
         return MoveArmResult::ERROR;
     }
 
-    // 3. 从该节点出发, 向抓取位姿迈步
+    // 3. Step from that node toward the grasp pose
     MoveArmResult res = moveTowardsGoal(nn_node, goal_pose);
 
-    // 4. 累加结果计数 (Group B metrics)
+    // 4. Accumulate result counters (Group B metrics)
     switch (res) {
         case MoveArmResult::GOAL_REACHED:           n_grasp_goal_reached_++; break;
         case MoveArmResult::GRASPABLE_POSE_REACHED: n_grasp_pose_reached_++; break;
         case MoveArmResult::TRAPPED:                n_grasp_trapped_++;      break;
         case MoveArmResult::ERROR:                  n_grasp_error_++;        break;
-        default: break;  // FATAL_ERROR 不计入
+        default: break;  // FATAL_ERROR is not counted
     }
 
-    // 5. 更新面统计 + 触发禁用
+    // 5. Update face statistics and trigger disabling
     bool attempt_success = (res == MoveArmResult::GOAL_REACHED) ||
                            (res == MoveArmResult::GRASPABLE_POSE_REACHED);
     pose_sphere_->recordGraspAttempt(face_id, attempt_success);
@@ -1127,7 +1127,7 @@ MoveArmResult GraspRrt::connectRandomGraspPositionJacobian() {
 void GraspRrt::dumpTree(const std::string& filepath) {
     if (!tree_) return;
 
-    // 收集解路径上的节点 id (沿 parent 走到根)
+    // Collect the node ids on the solution path (walk parents up to the root)
     std::unordered_set<int> path_ids;
     if (goal_node_) {
         auto cur = goal_node_;
@@ -1210,7 +1210,7 @@ void GraspRrt::tryDisableFace(int face_id) {
 }
 
 // ============================================================================
-// calculateGlobalGraspPose — 对应 Python calculateGlobalGraspPose
+// calculateGlobalGraspPose — counterpart of the Python calculateGlobalGraspPose
 // ============================================================================
 
 Matrix4f GraspRrt::calculateGlobalGraspPose(const Config& config, bool& success) {
@@ -1219,7 +1219,7 @@ Matrix4f GraspRrt::calculateGlobalGraspPose(const Config& config, bool& success)
     robot_->setJointValues(config);
     Matrix4f gcp_pose = robot_->getGCPGlobalPose();
 
-    // 获取物体表面最近点
+    // Get the closest point on the object surface
     Vector3f gcp_pos = gcp_pose.block<3,1>(0, 3);
     Vector3f P1 = target_object_->getClosestPoint(gcp_pos);
 
@@ -1232,7 +1232,7 @@ Matrix4f GraspRrt::calculateGlobalGraspPose(const Config& config, bool& success)
         return Matrix4f::Identity(); // success remains false
     }
 
-    // 在 GCP 局部坐标系中计算 P1 的方向
+    // Compute the direction of P1 in the GCP local frame
     Matrix4f gcp_inv = gcp_pose.inverse();
     Eigen::Vector4f P1_h;
     P1_h << P1, 1.0f;
@@ -1246,10 +1246,10 @@ Matrix4f GraspRrt::calculateGlobalGraspPose(const Config& config, bool& success)
     }
     vec_target_local /= length;
 
-    // Z 轴 = GCP 的默认接近方向
+    // Z axis = the GCP's default approach direction
     Vector3f vec_z(0.0f, 0.0f, 1.0f);
 
-    // 求旋转: 把 Z 轴旋转到指向目标的方向
+    // Find the rotation that turns the Z axis toward the target direction
     float dot = std::max(-1.0f, std::min(1.0f, vec_z.dot(vec_target_local)));
     float angle = std::acos(dot);
     Vector3f rot_axis = vec_z.cross(vec_target_local);
@@ -1261,16 +1261,16 @@ Matrix4f GraspRrt::calculateGlobalGraspPose(const Config& config, bool& success)
         rot_matrix = axisAngleToMatrix4(rot_axis, angle);
     }
 
-    // 转换到全局坐标
+    // Convert to global coordinates
     Matrix4f goal_pose = gcp_pose * rot_matrix;
-    goal_pose.block<3,1>(0, 3) = P1; // 目标位置设为物体表面点
+    goal_pose.block<3,1>(0, 3) = P1; // target position set to the point on the object surface
 
     success = true;
     return goal_pose;
 }
 
 // ============================================================================
-// moveTowardsGoal — 对应 Python moveTowardsGoal
+// moveTowardsGoal — counterpart of the Python moveTowardsGoal
 // ============================================================================
 
 MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
@@ -1279,7 +1279,7 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
 
     auto last_extend_node = start_node;
 
-    // 当前 TCP 到目标的笛卡尔距离
+    // Current Cartesian distance from the TCP to the goal
     Matrix4f current_tcp = Matrix4f::Identity();
     auto it = map_config_tcp_.find(last_extend_node->getId());
     if (it != map_config_tcp_.end()) current_tcp = it->second;
@@ -1288,18 +1288,18 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
     float last_dist = 0.0f;
 
     for (int loop = 0; loop < config_.move_towards_goal_max_loops; ++loop) {
-        // 计算工作空间采样步
+        // Compute the workspace sampling step
         auto [res, tmp_config] = createWorkspaceSamplingStepFromNode(
             target_pose, last_extend_node);
 
-        // ---- 处理步进结果 ----
+        // ---- Handle the step result ----
 
         if (res == MoveArmResult::ERROR || res == MoveArmResult::FATAL_ERROR) {
             return res;
         }
 
         if (res == MoveArmResult::COLLISION_ENVIRONMENT) {
-            // 碰撞 → 尝试在最后有效配置处抓取
+            // Collision -> try to grasp at the last valid configuration
             float score = calculateGraspScore(
                 last_extend_node->getConfiguration(),
                 last_extend_node->getId(), true);
@@ -1315,7 +1315,7 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
         }
 
         if (res == MoveArmResult::MOVED_ONE_STEP) {
-            // 检查路径有效性
+            // Check path validity
             auto t_start_col = std::chrono::high_resolution_clock::now();
             bool is_valid = cspace_->isPathValid(last_extend_node->getConfiguration(), tmp_config);
             auto t_end_col = std::chrono::high_resolution_clock::now();
@@ -1328,7 +1328,7 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
                 return MoveArmResult::COLLISION_ENVIRONMENT;
             }
 
-            // 添加到 RRT 树
+            // Add to the RRT tree
             auto [success, new_id] = tree_->appendPath(last_extend_node, tmp_config);
             if (!success) return MoveArmResult::ERROR;
             last_added_id_ = new_id;
@@ -1336,7 +1336,7 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
             processNodes(last_extend_node->getId(), last_added_id_);
 
             last_extend_node = tree_->getNode(last_added_id_);
-            last_extend_node->setStatus(2); // 标记为 moveArm 创建
+            last_extend_node->setStatus(2); // mark as created by moveArm
 
             last_dist = dist;
             auto tcp_it = map_config_tcp_.find(last_extend_node->getId());
@@ -1344,7 +1344,7 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
                                 ? tcp_it->second : Matrix4f::Identity();
             dist = cartesianPoseDiff(tcp_pose, target_pose);
 
-            // 检查是否陷入 (trapped)
+            // Check whether we are trapped
             if ((dist - last_dist) > 2.0f * config_.cart_sampling_pos_step_size) {
                 if (verbose_) {
                     std::cout << "[GraspRrt] Trapped: last=" << last_dist
@@ -1359,7 +1359,7 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
             return MoveArmResult::TRAPPED;
         }
 
-        // 检查是否到达目标
+        // Check whether the goal has been reached
         if (dist <= config_.max_dist_goal_reached) {
             if (verbose_) {
                 std::cout << "[GraspRrt] Grasp goal reached, dist=" << dist << "\n";
@@ -1384,27 +1384,27 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
 }
 
 // ============================================================================
-// createWorkspaceSamplingStep — 对应 Python createWorkSpaceSamplingStep
+// createWorkspaceSamplingStep — counterpart of the Python createWorkSpaceSamplingStep
 // ============================================================================
 
 std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
     const Matrix4f& current_pose, const Matrix4f& goal_pose) {
-    // 计算 delta
+    // Compute the delta
     Matrix4f delta_pose = goal_pose * current_pose.inverse();
     delta_pose.block<3,1>(0, 3) = goal_pose.block<3,1>(0, 3) - current_pose.block<3,1>(0, 3);
 
-    // ---- Finger-first steering(纯引导,见 types.h 注释) ----
-    // 侧向先触会把自由苹果拨走;这里在下探每步:
-    //   (a) 把爪口轴转向苹果(提前对准,改变收敛顺序:先转后到);
-    //   (b) 未对准时软性放慢朝苹果的前进分量(给 (a) 转身时间)。
-    // 全程平滑权重、无拒绝 —— 最坏情况只是多走几步,不会失败。
+    // ---- Finger-first steering (pure guidance, see the note in types.h) ----
+    // A sideways first touch sweeps a free apple away; at every descent step this:
+    //   (a) turns the gripper axis toward the apple (aligning early: rotate first, then arrive);
+    //   (b) softly slows the component advancing toward the apple while misaligned (giving (a) time to turn).
+    // Smooth weights throughout and no rejection — the worst case is a few extra steps, never a failure.
     if (config_.finger_first_steering) {
         Vector3f p_palm = current_pose.block<3,1>(0, 3);
-        Vector3f z_g    = current_pose.block<3,1>(0, 2);   // 手爪接近轴
+        Vector3f z_g    = current_pose.block<3,1>(0, 2);   // gripper approach axis
         Vector3f to_apple = target_object_position_ - p_palm;
         float d = to_apple.norm();
         if (d > 1e-6f && d < config_.ff_far && z_g.norm() > 1e-6f) {
-            // 平滑激活权重 w(d): ff_far→ff_near 从 0 升到 1
+            // Smooth activation weight w(d): rises from 0 to 1 between ff_far and ff_near
             float s = (config_.ff_far - d)
                     / std::max(1e-6f, config_.ff_far - config_.ff_near);
             s = std::max(0.0f, std::min(1.0f, s));
@@ -1414,7 +1414,7 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
             float cos_phi = std::max(-1.0f, std::min(1.0f, z_g.dot(u)));
             float phi = std::acos(cos_phi);
 
-            // (a) 旋转偏置:Δω = w·gain·φ,绕 (ẑ_g × u)
+            // (a) rotation bias: d_omega = w*gain*phi, about (z_g x u)
             Vector3f rot_axis = z_g.cross(u);
             float axis_norm = rot_axis.norm();
             if (axis_norm > 1e-6f && phi > 1e-3f) {
@@ -1424,7 +1424,7 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                     bias.toRotationMatrix() * delta_pose.block<3,3>(0, 0);
             }
 
-            // (b) 前进软刹车:缩放位置增量里朝苹果的分量(仅在靠近时)
+            // (b) advance soft-brake: scale the component of the position increment toward the apple (only when close)
             Vector3f dp = delta_pose.block<3,1>(0, 3);
             float adv = dp.dot(u);
             if (adv > 0.0f) {
@@ -1438,11 +1438,11 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
         }
     }
 
-    // ---- Branch stiffness 下探偏置(与 VF 同款刚度模型) ----
-    // 下探不走 VF,单独加偏置:手部点在软枝壳层内时,把位置增量朝
-    // "刚度加权径向"方向弯折 —— 根部/深处强推,梢部弱推。按到苹果
-    // 距离渐隐(bs_descent_fade_r):终端漏斗内抓取位姿说了算,保证
-    // 嵌在枝上的苹果仍可达。纯引导,无拒绝。
+    // ---- Branch-stiffness descent bias (same stiffness model as the VF) ----
+    // The descent does not go through the VF, so the bias is added separately: while the hand
+    // point is inside a soft-branch shell, bend the position increment toward the
+    // "stiffness-weighted radial" direction — push hard at the root / deep, softly at the tip.
+    // Faded by distance to the apple (bs_descent_fade_r). Pure guidance, no rejection.
     if (config_.branch_stiffness_enabled) {
         auto sdf_eval_bs = std::dynamic_pointer_cast<SdfCostEvaluator>(
             cspace_->getCostEvaluator());
@@ -1455,7 +1455,7 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                 Vector3f push = Vector3f::Zero();
                 float act = 0.0f;
                 for (const auto& cyl : sdf_eval_bs->getCylinders()) {
-                    if (cyl.exclude_from_aniso) continue;               // 仅软枝
+                    if (cyl.exclude_from_aniso) continue;               // soft branches only
                     if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                     Vector3f seg = cyl.p1 - cyl.p0;
                     float seg_sq = seg.squaredNorm();
@@ -1465,7 +1465,7 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                         : 0.0f;
                     Vector3f radial = p_ee - (cyl.p0 + u * seg);
                     float dist = radial.norm();
-                    // 体积化:手部体半径 0.06,从体表起算深度
+                    // Volumetric: hand body radius 0.06, depth measured from the body surface
                     float dist_eff = std::max(0.0f, dist - 0.06f);
                     float shell = cyl.radius + config_.bs_shell;
                     if (dist_eff >= shell || dist <= 1e-4f) continue;
@@ -1481,7 +1481,7 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                 Vector3f dp = delta_pose.block<3,1>(0, 3);
                 float dpn = dp.norm();
                 if (pn > 1e-6f && dpn > 1e-9f && act > 0.0f) {
-                    // 方向弯折,幅值保持:最坏情况只是绕行,不会停滞
+                    // Bend the direction, keep the magnitude: the worst case is a detour, never a stall
                     Vector3f bent = dp + fade * config_.bs_descent_gain
                                        * act * dpn * (push / pn);
                     float bn = bent.norm();
@@ -1492,9 +1492,9 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
         }
     }
 
-    // ---- Depth / Unified steering 下探版(提议层) ----
-    // 手部探针的预算夹持,取代盲目下压;臂上探针仍由闸门在
-    // isPathValid 里兜底。苹果豁免球内接触不计 (方法内部处理)。
+    // ---- Depth / Unified steering, descent variant (proposal layer) ----
+    // Budget clamping on the hand probes, replacing blind pressing down; the arm probes are
+    // still backed by the gate inside isPathValid. Contacts inside the apple exemption sphere are ignored.
     if (config_.uni_refuse_enabled || config_.pen_steer_enabled) {
         auto sdf_eval_ps = std::dynamic_pointer_cast<SdfCostEvaluator>(
             cspace_->getCostEvaluator());
@@ -1508,7 +1508,7 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
         }
     }
 
-    // 限制步长
+    // Clamp the step size
     delta_pose = limitWorkspaceStep(delta_pose);
 
     return moveArmDiffKin(delta_pose);
@@ -1525,37 +1525,37 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStepFromNode(
 }
 
 // ============================================================================
-// moveArmDiffKin — 对应 Python moveArmDiffKin
-// 单步微分逆运动学: J⁺ · e → dθ
+// moveArmDiffKin — counterpart of the Python moveArmDiffKin
+// One differential IK step: J+ * e -> dtheta
 // ============================================================================
 
 std::pair<MoveArmResult, Config> GraspRrt::moveArmDiffKin(const Matrix4f& delta_pose) {
-    // 获取当前关节值
+    // Get the current joint values
     Config start_config = robot_->getJointValues();
 
-    // 构建 6D 误差向量: [平移(3) | 旋转(3)]
+    // Build the 6D error vector: [translation(3) | rotation(3)]
     Eigen::VectorXf e(6);
     e.head<3>() = delta_pose.block<3,1>(0, 3);
 
-    // 从旋转矩阵提取轴角作为旋转误差
+    // Extract axis-angle from the rotation matrix as the rotation error
     Vector3f axis;
     float angle;
     rotationToAxisAngle(delta_pose.block<3,3>(0, 0), axis, angle);
     e.tail<3>() = axis * angle;
 
-    // Jacobian 伪逆
+    // Jacobian pseudoinverse
     MatrixXf J_pinv = computePseudoInverseJacobian();
     Eigen::VectorXf d_theta = J_pinv * e;
 
-    // 新的关节配置
+    // The new joint configuration
     Config new_config = start_config + d_theta.head(dimension_).cast<float>();
 
-    // 关节边界检查
+    // Joint-limit check
     if (!cspace_->isInBoundary(new_config)) {
         return {MoveArmResult::JOINT_BOUNDARY_VIOLATION, new_config};
     }
 
-    // 碰撞检查
+    // Collision check
     auto t_start_col = std::chrono::high_resolution_clock::now();
     bool is_free = cspace_->isCollisionFree(new_config);
     auto t_end_col = std::chrono::high_resolution_clock::now();
@@ -1571,14 +1571,14 @@ std::pair<MoveArmResult, Config> GraspRrt::moveArmDiffKin(const Matrix4f& delta_
 }
 
 // ============================================================================
-// limitWorkspaceStep — 对应 Python limitWorkspaceStep
+// limitWorkspaceStep — counterpart of the Python limitWorkspaceStep
 // ============================================================================
 
 Matrix4f GraspRrt::limitWorkspaceStep(const Matrix4f& delta_pose) {
     Vector3f pos_part = delta_pose.block<3,1>(0, 3);
     float dist_pos = pos_part.norm();
 
-    // 从旋转矩阵提取旋转角
+    // Extract the rotation angle from the rotation matrix
     Vector3f axis;
     float angle;
     rotationToAxisAngle(delta_pose.block<3,3>(0, 0), axis, angle);
@@ -1596,7 +1596,7 @@ Matrix4f GraspRrt::limitWorkspaceStep(const Matrix4f& delta_pose) {
         if (dist_ori > config_.cart_sampling_ori_step_size) {
             factor_ori = config_.cart_sampling_ori_step_size / dist_ori;
         }
-        // 取较小的缩放因子 (保持位姿同步)
+        // Take the smaller scale factor (keeps position and orientation in sync)
         float factor = std::min(factor_pos, factor_ori);
         factor_pos = factor;
         factor_ori = factor;
@@ -1608,7 +1608,7 @@ Matrix4f GraspRrt::limitWorkspaceStep(const Matrix4f& delta_pose) {
 }
 
 // ============================================================================
-// calculateGraspScore — 对应 Python calculateGraspScore
+// calculateGraspScore — counterpart of the Python calculateGraspScore
 // ============================================================================
 
 float GraspRrt::calculateGraspScore(const Config& config, int node_id,
@@ -1618,11 +1618,11 @@ float GraspRrt::calculateGraspScore(const Config& config, int node_id,
 
     robot_->setJointValues(config);
 
-    // 闭合手指, 获取接触点
+    // Close the fingers and collect the contact points
     auto contacts = eef_->closeActors();
     eef_->openActors();
 
-    // 接触点数量检查
+    // Contact-count check
     if (static_cast<int>(contacts.size()) < config_.min_grasp_contacts) {
         if (verbose_) {
             std::cout << "[GraspRrt] Low contacts (" << contacts.size()
@@ -1634,11 +1634,11 @@ float GraspRrt::calculateGraspScore(const Config& config, int node_id,
         return 0.0f;
     }
 
-    // 计算 TCP 到物体的距离
+    // Compute the TCP-to-object distance
     Vector3f gcp_pos = robot_->getGCPGlobalPose().block<3,1>(0, 3);
     float dist_to_target = target_object_->calculateDistance(gcp_pos);
 
-    // 使用 quality_measure 打分
+    // Score with quality_measure
     quality_measure_->setContactPoints(contacts);
     quality_measure_->calculateGraspQuality();
     float score = quality_measure_->getGraspQuality();
@@ -1649,7 +1649,7 @@ float GraspRrt::calculateGraspScore(const Config& config, int node_id,
 
     if (!is_force_closure) score = 0.0f;
 
-    // 存储结果
+    // Store the result
     if (store_on_success && score > 0.0f) {
         GraspInfo info;
         info.distance_to_object = dist_to_target;
@@ -1672,7 +1672,7 @@ float GraspRrt::calculateGraspScore(const Config& config, int node_id,
 }
 
 // ============================================================================
-// processNode / processNodes — 对应 Python processNode / processNodes
+// processNode / processNodes — counterparts of the Python processNode / processNodes
 // ============================================================================
 
 bool GraspRrt::processNode(CSpaceNodePtr node) {
@@ -1702,8 +1702,8 @@ bool GraspRrt::processNode(CSpaceNodePtr node) {
         closest_below_node_id_ = node->getId();
     }
 
-    // 下探候选门:默认欧氏阈值;nav field 启用时改用测地行程 —— 苹果
-    // 正上方的悬停节点欧氏近而测地远,不再从那里刷下探尝试。
+    // Descent candidate gate: Euclidean threshold by default; with the nav field enabled it
+    // switches to geodesic travel — a hovering node straight above the apple is Euclidean-near
     bool near_enough = dist2 < config_.try_grasps_distance2;
     if (config_.nav_field_enabled) {
         auto sdf_nav_pn = std::dynamic_pointer_cast<SdfCostEvaluator>(
@@ -1763,7 +1763,7 @@ bool GraspRrt::processNodes(int start_id, int end_id) {
 }
 
 // ============================================================================
-// createSolution — 对应 Python Rrt.createSolution
+// createSolution — counterpart of the Python Rrt.createSolution
 // ============================================================================
 
 bool GraspRrt::createSolution(bool quiet) {
@@ -1799,8 +1799,8 @@ bool GraspRrt::createSolution(bool quiet) {
 }
 
 // ============================================================================
-// computePseudoInverseJacobian — 带 DLS 阻尼的 Jacobian 伪逆
-// 对应 Python _compute_pseudo_inverse_jacobian
+// computePseudoInverseJacobian — Jacobian pseudoinverse with DLS damping
+// Counterpart of the Python _compute_pseudo_inverse_jacobian
 // ============================================================================
 
 MatrixXf GraspRrt::computePseudoInverseJacobian() {
@@ -1809,7 +1809,7 @@ MatrixXf GraspRrt::computePseudoInverseJacobian() {
     float damping_factor = 0.03f;
     float svd_threshold = 1e-4f;
 
-    // SVD 分解: J = U Σ V^T
+    // SVD decomposition: J = U S V^T
     Eigen::JacobiSVD<MatrixXf> svd(J, Eigen::ComputeThinU | Eigen::ComputeThinV);
     Eigen::VectorXf S = svd.singularValues();
     Eigen::VectorXf S_inv = Eigen::VectorXf::Zero(S.size());
@@ -1818,7 +1818,7 @@ MatrixXf GraspRrt::computePseudoInverseJacobian() {
         if (S(i) > svd_threshold) {
             S_inv(i) = 1.0f / S(i);
         } else {
-            // Levenberg-Marquardt 阻尼
+            // Levenberg-Marquardt damping
             S_inv(i) = S(i) / (S(i) * S(i) + damping_factor * damping_factor);
         }
     }
@@ -1829,7 +1829,7 @@ MatrixXf GraspRrt::computePseudoInverseJacobian() {
 }
 
 // ============================================================================
-// 结果获取
+// Result access
 // ============================================================================
 
 std::vector<GraspInfo> GraspRrt::getGraspResults() const {
@@ -1843,7 +1843,7 @@ int GraspRrt::getGraspResultCount() const {
 }
 
 // ============================================================================
-// 工具函数
+// Utility functions
 // ============================================================================
 
 float GraspRrt::cartesianPoseDiff(const Matrix4f& p1, const Matrix4f& p2) {
@@ -1854,7 +1854,7 @@ float GraspRrt::cartesianPoseDiff(const Matrix4f& p1, const Matrix4f& p2) {
     float angle;
     rotationToAxisAngle(R_diff, axis, angle);
 
-    return pos_diff + std::abs(angle) * 3.0f; // 位置 + 加权角度
+    return pos_diff + std::abs(angle) * 3.0f; // position + weighted angle
 }
 
 Matrix4f GraspRrt::axisAngleToMatrix4(const Vector3f& axis, float angle) {

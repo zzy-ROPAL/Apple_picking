@@ -1,21 +1,21 @@
 /**
- * example_grasp_rrt.cpp — GraspRRT 示例: Panda 机器人抓取苹果 (穿过树枝)
+ * example_grasp_rrt.cpp — GraspRRT example: a Panda robot grasping an apple (through branches)
  *
- * 场景 (来自 tree_model.py):
- *   - Panda 7-DOF 机器人手臂 (Pinocchio FK/Jacobian)
- *   - 树干 (不可穿透圆柱体)
- *   - 树枝 (可穿透, 但在此 example 中简化为障碍物)
- *   - 苹果 (球形抓取目标)
+ * Scene (from tree_model.py):
+ *   - Panda 7-DOF robot arm (Pinocchio FK/Jacobian)
+ *   - trunk (impenetrable cylinder)
+ *   - branches (penetrable, but simplified to obstacles in this example)
+ *   - apple (spherical grasp target)
  *
- * 编译:
+ * Build:
  *   cd grasp_rrt_framework/build
  *   cmake .. && make -j$(nproc)
  *   ./example_grasp_rrt [path_to_panda.urdf]
  *
- * 默认 URDF 路径搜索:
- *   1. 命令行参数
- *   2. 环境变量 PANDA_URDF
- *   3. pybullet_data 常见路径
+ * Default URDF search order:
+ *   1. command-line argument
+ *   2. environment variable PANDA_URDF
+ *   3. common pybullet_data paths
  */
 
 #include <iostream>
@@ -25,13 +25,13 @@
 #include <fstream>
 #include <sstream>
 
-// GraspRRT 框架
+// GraspRRT framework
 #include "types.h"
 #include "cspace_sampled.h"
 #include "cspace_tree.h"
 #include "grasp_rrt.h"
 
-// 具体实现
+// Concrete implementations
 #include "panda_pinocchio.h"
 #include "bullet_collision_checker.h"
 #include "simple_end_effector.h"
@@ -45,11 +45,11 @@
 using namespace grasp_rrt;
 
 // ============================================================================
-// URDF 路径查找
+// URDF path lookup
 // ============================================================================
 
 std::string findPandaUrdf(int argc, char* argv[]) {
-    // 1. 命令行参数
+    // 1. command-line argument
     if (argc > 1) {
         std::string path = argv[1];
         std::ifstream f(path);
@@ -57,14 +57,14 @@ std::string findPandaUrdf(int argc, char* argv[]) {
         std::cerr << "WARNING: URDF not found at: " << path << "\n";
     }
 
-    // 2. 环境变量
+    // 2. environment variable
     const char* env = std::getenv("PANDA_URDF");
     if (env) {
         std::ifstream f(env);
         if (f.good()) return std::string(env);
     }
 
-    // 3. 常见路径
+    // 3. common paths
     std::vector<std::string> search_paths = {
         // pybullet_data (pip install)
         "/usr/local/lib/python3.10/dist-packages/pybullet_data/franka_panda/panda.urdf",
@@ -92,24 +92,24 @@ std::string findPandaUrdf(int argc, char* argv[]) {
 }
 
 // ============================================================================
-// 场景参数 (对应 tree_model.py)
+// Scene parameters (mirroring tree_model.py)
 // ============================================================================
 
 struct SceneConfig {
-    // 树干中心位置 (往后退一点，给树冠留出空间)
+    // Trunk center position (pushed back a little to leave room for the canopy)
     Vector3f trunk_center = Vector3f(0.7f, 0.0f, 0.75f);
     float trunk_height = 1.5f;
     float trunk_radius = 0.08f;
 
-    // 苹果正上方的硬质障碍物 (树干属性, 不可穿过)
+    // Rigid obstacle directly above the apple (trunk-like, impenetrable)
     struct OverheadObstacle {
-        Vector3f center  = Vector3f(0.45f, 0.0f, 0.91f); // 苹果(0.45,0,0.80)正上方
-        float    radius  = 0.08f;   // 遮挡半径 8cm，略大于苹果(4cm)，强制机器人从侧方进入
-        float    half_h  = 0.04f;   // 半高 4cm，总高 8cm (底部 z=0.87，距苹果顶部 ~3cm)
+        Vector3f center  = Vector3f(0.45f, 0.0f, 0.91f); // directly above the apple (0.45,0,0.80)
+        float    radius  = 0.08f;   // 8 cm occluder radius, slightly larger than the apple (4 cm), forcing a side approach
+        float    half_h  = 0.04f;   // half-height 4 cm, total 8 cm (bottom at z=0.87, ~3 cm above the apple top)
     } overhead;
 
-    // 树枝(叶子)参数: 添加密集的树冠
-    // 树枝长度缩短，方向朝向机器人 (angle ≈ PI)
+    // Branch (foliage) parameters: build a dense canopy
+    // Branches are shortened and oriented toward the robot (angle ~ PI)
     struct BranchInfo {
         float h;
         float angle;
@@ -117,15 +117,15 @@ struct SceneConfig {
         float radius = 0.03f;
     };
     std::vector<BranchInfo> branches = {
-        // 下层树叶 (阻挡手腕向下)
+        // Lower foliage layer (blocks the wrist from below)
         {0.65f, 3.1415f, 0.35f, 0.03f}, {0.65f, 2.6f, 0.3f, 0.03f}, {0.65f, 3.68f, 0.3f, 0.03f},
-        // 中层树叶，将苹果包裹在中间
+        // Middle foliage layer, wrapping the apple
         {0.80f, 2.7f, 0.35f, 0.03f}, {0.80f, 3.58f, 0.35f, 0.03f}, {0.80f, 2.1f, 0.3f, 0.03f}, {0.80f, 4.18f, 0.3f, 0.03f},
-        // 上层树叶 (压迫上方空间)
+        // Upper foliage layer (squeezes the space above)
         {0.95f, 3.1415f, 0.4f, 0.03f}, {0.95f, 2.6f, 0.3f, 0.03f}, {0.95f, 3.68f, 0.3f, 0.03f}
     };
 
-    // 苹果: 放在密集的树枝中间
+    // Apple: placed in the middle of the dense branches
     float apple_radius = 0.04f;
     Vector3f apple_pos = Vector3f(0.45f, 0.0f, 0.80f);
 
@@ -137,17 +137,17 @@ struct SceneConfig {
 };
 
 // ============================================================================
-// 场景布局导出 (给 Isaac Sim 对齐用)
+// Scene-layout export (for aligning with Isaac Sim)
 // ============================================================================
-// 把 Bullet 侧作为基准场景, 导出所有几何到 scene_layout.json。
-// 全部坐标在**机器人基座 frame**(本场景中机器人基座即世界原点):
-// Isaac 侧不要动机器人(FK 标定已验证过它), 只把树/苹果摆到这些相对位姿。
+// The Bullet side is the reference scene; export all geometry to scene_layout.json.
+// All coordinates are in the ROBOT BASE frame (which is the world origin in this scene):
+// on the Isaac side do not move the robot (FK calibration validated it), only place the tree/apple at these relative poses.
 static void exportSceneLayout(const SceneConfig& scene,
                               const Config& start_config,
                               const std::string& out_path = "scene_layout.json") {
     std::ofstream f(out_path);
     if (!f.is_open()) {
-        std::cerr << "[Warn] 无法写出场景布局: " << out_path << "\n";
+        std::cerr << "[Warn] cannot write scene layout: " << out_path << "\n";
         return;
     }
     auto vec3 = [](const Vector3f& v) {
@@ -157,25 +157,25 @@ static void exportSceneLayout(const SceneConfig& scene,
     };
 
     f << "{\n";
-    f << "  \"comment\": \"所有坐标在机器人基座 frame, 单位米/弧度; 圆柱以两端点 p0/p1 + 半径表示\",\n";
-    f << "  \"robot_base_note\": \"机器人基座在原点, Isaac 侧保持机器人不动, 移动树来对齐\",\n";
+    f << "  \"comment\": \"all coordinates are in the robot base frame, units meters/radians; cylinders are given as endpoints p0/p1 plus radius\",\n";
+    f << "  \"robot_base_note\": \"the robot base is at the origin; on the Isaac side keep the robot fixed and move the tree to align\",\n";
     f << "  \"start_config\": [";
     for (int i = 0; i < start_config.size(); ++i)
         f << start_config[i] << (i + 1 < start_config.size() ? ", " : "");
     f << "],\n";
 
-    // 树干 (硬障碍, 碰到 = FAIL)
+    // Trunk (rigid obstacle, contact = FAIL)
     Vector3f t0 = scene.trunk_center - Vector3f(0, 0, scene.trunk_height / 2.0f);
     Vector3f t1 = scene.trunk_center + Vector3f(0, 0, scene.trunk_height / 2.0f);
     f << "  \"trunk\": {\"p0\": " << vec3(t0) << ", \"p1\": " << vec3(t1)
       << ", \"radius\": " << scene.trunk_radius << ", \"class\": \"hard\"},\n";
 
-    // 苹果上方硬障碍 (在硬碰撞检测里是球体, half_h 未使用)
+    // Rigid obstacle above the apple (a sphere in the hard collision check; half_h unused)
     f << "  \"overhead_obstacle\": {\"center\": " << vec3(scene.overhead.center)
       << ", \"radius\": " << scene.overhead.radius << ", \"shape\": \"sphere\""
       << ", \"class\": \"hard\"},\n";
 
-    // 树冠枝条 (可穿透软障碍, 允许推开) —— 端点计算与 SDF 导入完全一致
+    // Canopy branches (penetrable soft obstacles, may be pushed aside) — endpoints computed exactly as for the SDF import
     f << "  \"branches\": [\n";
     for (size_t i = 0; i < scene.branches.size(); ++i) {
         const auto& br = scene.branches[i];
@@ -192,7 +192,7 @@ static void exportSceneLayout(const SceneConfig& scene,
     }
     f << "  ],\n";
 
-    // 苹果 (目标)
+    // Apple (target)
     f << "  \"apple\": {\"center\": " << vec3(scene.apple_pos)
       << ", \"radius\": " << scene.apple_radius << "}\n";
     f << "}\n";
@@ -208,18 +208,18 @@ int main(int argc, char* argv[]) {
               << "  GraspRRT Example: Panda Picking Apple Through Tree\n"
               << "======================================================\n\n";
 
-    // ---- 1. 查找 URDF ----
+    // ---- 1. Locate the URDF ----
     std::string urdf_path = findPandaUrdf(argc, argv);
     if (urdf_path.empty()) return 1;
 
-    // ---- 2. 场景配置 ----
+    // ---- 2. Scene configuration ----
     SceneConfig scene;
 
-    // ---- 3. 加载 Panda 机器人 (Pinocchio) ----
+    // ---- 3. Load the Panda robot (Pinocchio) ----
     std::cout << "[Setup] Loading Panda robot...\n";
     auto robot = std::make_shared<PandaPinocchioRobot>(urdf_path, "panda_hand");
 
-    // DEBUG: 打印连杆之间的相对位置，确定偏移方向
+    // DEBUG: print relative link positions to confirm the offset direction
     robot->setJointValues(Config::Zero(7));
     std::vector<std::string> debug_links = {"panda_link2", "panda_link3", "panda_link4", "panda_link5", "panda_link6", "panda_link7", "panda_hand"};
     std::cout << "\n[Debug] Link Relative Offsets (Checking for sphere placement):\n";
@@ -231,65 +231,65 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "\n";
 
-    // 获取关节极限
+    // Fetch joint limits
     auto [joint_lower, joint_upper] = robot->getJointLimits();
     std::cout << "[Setup] Joint limits:\n"
               << "  Lower: " << joint_lower.transpose() << "\n"
               << "  Upper: " << joint_upper.transpose() << "\n";
 
-    // ---- 4. 创建配置空间 ----
+    // ---- 4. Create the configuration space ----
     std::cout << "[Setup] Creating C-Space (7-DOF)...\n";
     auto collision_checker_ptr = std::make_shared<BulletCollisionChecker>(robot);
     auto cspace = std::make_shared<CSpaceSampled>(7, collision_checker_ptr);
     cspace->setBoundaries(joint_lower, joint_upper);
 
-    // ---- 5. 设置碰撞场景 (Bullet3) ----
+    // ---- 5. Set up the collision scene (Bullet3) ----
     std::cout << "[Setup] Building collision scene...\n";
 
-    // 5a. 树干 (硬障碍物 - 必须避开)
+    // 5a. Trunk (rigid obstacle - must be avoided)
     Matrix4f trunk_pose = Matrix4f::Identity();
     trunk_pose.block<3,1>(0, 3) = scene.trunk_center;
     collision_checker_ptr->addObstacleCylinder(scene.trunk_radius, scene.trunk_height / 2.0f, trunk_pose);
 
-    // 5a-2. 苹果正上方的硬质障碍物 (不可穿透球体)
+    // 5a-2. Rigid obstacle directly above the apple (impenetrable sphere)
     collision_checker_ptr->addObstacleSphere(scene.overhead.radius, scene.overhead.center);
     std::cout << "  Overhead hard obstacle (SPHERE): center=["
               << scene.overhead.center.transpose() << "]"
               << "  r=" << scene.overhead.radius << "m\n";
 
-    // 5b. 树冠/树叶 (柔性/可穿透区域 - 不加入硬碰撞检测)
+    // 5b. Canopy/foliage (compliant/penetrable region - not added to hard collision checking)
     std::cout << "  (Note: " << scene.branches.size() 
               << " canopy branches exist in scene but act as permeable leaves, so they are not added to hard collision checker.)\n";
 
-    // 5c. 机器人碰撞体 —— 胶囊体填充法 (Capsule Approximation)
-    // 胶囊体 = 圆柱 + 两端半球，完美贴合连杆形状，无间隙死角。
-    // 每条连杆只需 1 个胶囊体，碰撞速度与球体相当。
+    // 5c. Robot collision bodies — capsule approximation
+    // A capsule = cylinder + two hemispherical caps: hugs the link shape with no gaps.
+    // One capsule per link suffices, and it is about as fast as spheres.
     //
-    // 参数说明:
-    //   center_z: 胶囊中心在连杆局部坐标系中的 Z 偏移
-    //   half_h:   胶囊圆柱部分的半高 (两端半球不算在内)
-    //   radius:   胶囊半径
+    // Parameters:
+    //   center_z: Z offset of the capsule center in the link's local frame
+    //   half_h:   half-height of the capsule's cylindrical part (caps excluded)
+    //   radius:   capsule radius
     struct LinkCapsule {
         std::string name;
         float radius;
-        float center_z;   // 胶囊中心相对于连杆原点的 Z 偏移
-        float half_h;     // 圆柱半高
+        float center_z;   // Z offset of the capsule center relative to the link origin
+        float half_h;     // cylinder half-height
     };
 
-    // 基于 Panda URDF 几何的胶囊参数 (+Z 为连杆伸展方向)
-    // 注意：panda_link7（法兰）由下方的锥台体单独建模，不在此列表中
+    // Capsule parameters derived from the Panda URDF geometry (+Z is the link extension direction)
+    // Note: panda_link7 (the flange) is modeled separately below as a truncated cone and is not in this list
     std::vector<LinkCapsule> capsule_structure = {
         {"panda_link0", 0.10f, 0.05f,  0.02f},
         {"panda_link1", 0.08f, 0.15f,  0.12f},
         {"panda_link2", 0.07f, 0.00f,  0.02f},
         {"panda_link3", 0.06f, 0.15f,  0.12f},
         {"panda_link4", 0.06f, 0.05f,  0.03f},
-        // Link5 在 8cm 半径下仍观察到 ~5.7cm 穿透 (vs overhead sphere)，
-        // 真实电机外壳更宽，扩大到 13cm 保证安全余量
+        // Link5 still showed ~5.7 cm penetration at an 8 cm radius (vs the overhead sphere);
+        // the real motor housing is wider, so it is enlarged to 13 cm for safety margin
         {"panda_link5", 0.13f, 0.15f,  0.13f},
         {"panda_link6", 0.06f, 0.00f,  0.02f},
-        // panda_link7 单独建模（见下方锥台体）
-        // panda_hand 单独建模（由于夹爪有手指且很宽，用包围盒建模）
+        // panda_link7 modeled separately (truncated cone below)
+        // panda_hand modeled separately (the gripper has fingers and is very wide, so a bounding box is used)
     };
 
     for (const auto& lc : capsule_structure) {
@@ -303,10 +303,10 @@ int main(int argc, char* argv[]) {
         collision_checker_ptr->addRobotLinkCapsule(lc.radius, lc.half_h, fk_func, lc.name);
     }
 
-    // panda_link7 (法兰) 特殊建模：梯形截面锥台体
-    //   底面(靠 link6 侧, z=0)  : r = 0.040m  (Panda 法兰直径约 80mm)
-    //   顶面(靠 hand 侧, z=0.035): r = 0.030m  (收窄端约 55-60mm)
-    //   锥台中心在 z = 0.0175m 处
+    // panda_link7 (flange) special model: trapezoidal-section truncated cone
+    //   bottom face (link6 side, z=0)   : r = 0.040 m  (the Panda flange is about 80 mm across)
+    //   top face (hand side, z=0.035)   : r = 0.030 m  (the narrowed end is about 55-60 mm)
+    //   the cone center sits at z = 0.0175 m
     {
         float flange_center_z = 0.0175f;
         auto fk_flange = [robot, flange_center_z](const Config& config) -> Matrix4f {
@@ -315,43 +315,43 @@ int main(int argc, char* argv[]) {
             pose.block<3,1>(0,3) += pose.block<3,3>(0,0) * Vector3f(0, 0, flange_center_z);
             return pose;
         };
-        // 真实的 Panda 法兰：底端直径约 88mm (r=44mm), 顶端直径约 60mm (r=30mm), 总厚度约 36mm
+        // The real Panda flange: bottom about 88 mm across (r=44 mm), top about 60 mm (r=30 mm), total thickness about 36 mm
         collision_checker_ptr->addRobotLinkFrustum(0.044f, 0.030f, 0.0180f,
                                                     fk_flange, "panda_link7_frustum");
     }
 
-    // panda_link7 过渡段胶囊：填补锥台顶端(z≈0.036m)与 panda_hand 胶囊底端(z≈0.057m)之间的空隙
-    // 这段腕部连接轴没有任何碰撞体覆盖，是视觉碰撞的根本原因。
+    // panda_link7 transition capsule: fills the gap between the cone top (z~0.036 m) and the panda_hand capsule bottom (z~0.057 m)
+    // This wrist connecting shaft had no collision body at all, which was the root cause of the visual interpenetration.
     {
-        float shaft_center_z = 0.053f; // 胶囊中心：z = 0.036～0.070m 的中点
+        float shaft_center_z = 0.053f; // capsule center: midpoint of z = 0.036 to 0.070 m
         auto fk_shaft = [robot, shaft_center_z](const Config& config) -> Matrix4f {
             robot->setJointValues(config);
             Matrix4f pose = robot->getFramePose("panda_link7");
             pose.block<3,1>(0,3) += pose.block<3,3>(0,0) * Vector3f(0, 0, shaft_center_z);
             return pose;
         };
-        // 过渡轴半径约 25mm（细轴），覆盖从 z≈0.036 到 z≈0.070m
+        // The transition shaft is about 25 mm in radius (a thin shaft), covering z~0.036 to z~0.070 m
         collision_checker_ptr->addRobotLinkCapsule(0.025f, 0.017f, fk_shaft, "panda_link7_shaft");
     }
 
-    // panda_hand (夹爪) 特殊建模：Box (长方体) 包围盒
-    // 诊断表明手部严重穿透，原因是夹爪有宽大的基座和完全张开的指头，单一胶囊无法覆盖 Y 轴上的宽度。
-    // 我们用一个 8cm x 22cm x 12cm 的 Box 把整个夹爪连同两根指头完全包住。
+    // panda_hand (gripper) special model: an axis-aligned box
+    // Diagnostics showed severe hand interpenetration: the gripper has a wide base and fully opened fingers, which a single capsule cannot cover in Y.
+    // An 8 cm x 22 cm x 12 cm box wraps the whole gripper including both fingers.
     {
-        float hand_center_z = 0.05f; // Box 中心
+        float hand_center_z = 0.05f; // box center
         auto fk_hand = [robot, hand_center_z](const Config& config) -> Matrix4f {
             robot->setJointValues(config);
             Matrix4f pose = robot->getFramePose("panda_hand");
             pose.block<3,1>(0,3) += pose.block<3,3>(0,0) * Vector3f(0, 0, hand_center_z);
             return pose;
         };
-        // Box 的 half_extents=(x, y, z)=(0.04, 0.11, 0.06) 
-        // 对应总尺寸: X(厚度)=8cm, Y(宽度)=22cm, Z(长度)=12cm
+        // Box half_extents=(x, y, z)=(0.04, 0.11, 0.06)
+        // Total size: X (thickness)=8 cm, Y (width)=22 cm, Z (length)=12 cm
         collision_checker_ptr->addRobotLinkBox(Vector3f(0.04f, 0.11f, 0.06f), fk_hand, "panda_hand");
     }
     std::cout << "  Robot links: 7 capsules + 1 frustum + 1 shaft + 1 hand box (total 10 parts).\n";
 
-    // 球体定义仍保留，供 SDF 软代价评估器使用 (SDF 只支持球体查询)
+    // The sphere definitions are kept for the SDF soft-cost evaluator (the SDF only supports sphere queries)
     struct LinkSphere {
         std::string name;
         float radius;
@@ -369,25 +369,25 @@ int main(int argc, char* argv[]) {
         {"panda_hand",  0.06f, {Vector3f(0,0,0), Vector3f(0,0,0.08f), Vector3f(0,0.04f,0.05f), Vector3f(0,-0.04f,0.05f)}}
     };
 
-    // ---- 5d. 配置软碰撞代价评估器 (RRT* 各向异性代价) ----
+    // ---- 5d. Configure the soft-collision cost evaluator (RRT* anisotropic cost) ----
     auto cost_evaluator = std::make_shared<SdfCostEvaluator>(robot, /*voxel_size=*/0.01f);
 
-    // 树干也加入 SDF，使 VF 软斥力场在 0.20m 以外就能感知到树干，
-    // 而不只依赖 grasp_rrt.cpp 里硬编码的 0.20m 触发范围。
-    // btCylinderShapeZ 轴沿 Z，转换为线段: p0/p1 = trunk_center ± half_height * Z
+    // The trunk is added to the SDF as well, so the VF soft repulsion field senses it
+    // beyond 0.20 m instead of relying only on the 0.20 m trigger hardcoded in grasp_rrt.cpp.
+    // btCylinderShapeZ has its axis along Z; as a segment: p0/p1 = trunk_center +- half_height * Z
     {
         Vector3f p0 = scene.trunk_center - Vector3f(0, 0, scene.trunk_height / 2.0f);
         Vector3f p1 = scene.trunk_center + Vector3f(0, 0, scene.trunk_height / 2.0f);
         cost_evaluator->addBranchCylinder(p0, p1, scene.trunk_radius);
     }
 
-    // 导入树冠叶子
+    // Import the canopy foliage
     for (const auto& br : scene.branches) {
         float cos_a = std::cos(br.angle);
         float sin_a = std::sin(br.angle);
 
         Vector3f p0 = scene.trunk_center;
-        p0.z() = br.h; // 高度为绝对高度
+        p0.z() = br.h; // height is absolute
         p0.x() += scene.trunk_radius * cos_a;
         p0.y() += scene.trunk_radius * sin_a;
 
@@ -398,14 +398,14 @@ int main(int argc, char* argv[]) {
     cost_evaluator->addBranchCylinder(
         scene.overhead.center, scene.overhead.center, scene.overhead.radius);
 
-    // 导入机器人节点
+    // Import the robot spheres
     for (const auto& ls : robot_structure) {
         for (const auto& off : ls.offsets) {
             cost_evaluator->addRobotSphere(ls.name, ls.radius, off);
         }
     }
     
-    // 一次性建表：根据所有圆柱几何自动计算包围盒并预计算 SDF 网格
+    // One-shot build: derive the bounding box from all cylinders and precompute the SDF grid
     auto t_voxel_start = std::chrono::high_resolution_clock::now();
     cost_evaluator->buildSdf(/*padding=*/0.40f);
     auto t_voxel_end = std::chrono::high_resolution_clock::now();
@@ -417,43 +417,43 @@ int main(int argc, char* argv[]) {
     std::cout << "  SDF configured: " << scene.branches.size()
               << " branches + overhead obstacle (VF soft repulsion + TrajOpt).\n";
 
-    // ---- 6. 创建目标物体 (苹果) ----
+    // ---- 6. Create the target object (apple) ----
     std::cout << "[Setup] Apple target: pos=" << scene.apple_pos.transpose()
               << ", r=" << scene.apple_radius << "m\n";
     auto target = std::make_shared<SimpleTargetObject>(scene.apple_pos, scene.apple_radius);
 
-    // 5e. 苹果 (Class 3: Goal Obstacle) — 大臂不可穿透，夹爪特赦
+    // 5e. Apple (Class 3: goal obstacle) — impenetrable for the arm, exempt for the gripper
     collision_checker_ptr->addGoalObstacleSphere(scene.apple_radius, scene.apple_pos);
-    // 豁免夹爪连杆 (panda_hand 及两根手指) 对苹果的碰撞检测
+    // Exempt the gripper links (panda_hand and both fingers) from apple collision checking
     collision_checker_ptr->addGoalObstacleExemptLink("panda_hand");
     collision_checker_ptr->addGoalObstacleExemptLink("panda_leftfinger");
     collision_checker_ptr->addGoalObstacleExemptLink("panda_rightfinger");
     std::cout << "  Apple: Registered as CLASS-3 Goal Obstacle (ACM: panda_hand/fingers exempt)\n";
 
-    // ---- 7. 创建末端执行器 (简化平行夹爪) ----
+    // ---- 7. Create the end effector (simplified parallel gripper) ----
     auto eef = std::make_shared<SimpleEndEffector>(robot, target, 0.08f, 0.05f);
 
-    // ---- 8. 创建抓取质量评估器 ----
+    // ---- 8. Create the grasp-quality evaluator ----
     auto quality = std::make_shared<SimpleGraspQuality>(2);
 
-    // ---- 9. 配置 GraspRRT 参数 ----
+    // ---- 9. Configure GraspRRT parameters ----
     GraspRrtConfig config;
     config.max_cycles = std::numeric_limits<int>::max();
     config.extend_step_size = 0.05f;
-    config.probab_grasp_hypothesis = 0.25f;       // 提高到 25% 概率，增加尝试次数
-    config.cart_sampling_pos_step_size = 0.01f;    // 10mm 笛卡尔步长
-    config.cart_sampling_ori_step_size = M_PI / 18; // 10° 旋转步长
+    config.probab_grasp_hypothesis = 0.25f;       // raised to 25% to increase the number of attempts
+    config.cart_sampling_pos_step_size = 0.01f;    // 10 mm Cartesian step
+    config.cart_sampling_ori_step_size = M_PI / 18; // 10 deg rotation step
     config.grasp_quality_min_score = 0.01f;
     config.min_grasp_contacts = 2;
     config.move_towards_goal_max_loops = 200;
-    config.max_dist_goal_reached = 0.02f;          // 2cm 到达阈值
-    config.planning_timeout_ms = 20000.0f;         // 20s 超时
-    // [ADJUST] 扩大抓取感应圈从 10cm 到 15cm，使机器人更容易进入局部 Jacobian 引导阶段
+    config.max_dist_goal_reached = 0.02f;          // 2 cm arrival threshold
+    config.planning_timeout_ms = 20000.0f;         // 20 s timeout
+    // [ADJUST] widen the grasp sensing radius from 10 cm to 15 cm so the robot enters the local Jacobian-guided phase more easily
     config.try_grasps_distance2 = 0.15f * 0.15f;
-    // [BUG FIX] 进一步缩小 DCD 步长至 0.01rad，确保即使是极小障碍物也能在第一级递归中检测到点
+    // [BUG FIX] shrink the DCD step further to 0.01 rad so even tiny obstacles are caught at the first recursion level
     config.sampling_size_dcd = 0.01f;
 
-    // ---- 10. 创建 GraspRRT 规划器 ----
+    // ---- 10. Create the GraspRRT planner ----
     std::cout << "\n[Setup] Creating GraspRRT Planner...\n";
     auto planner = std::make_unique<GraspRrt>(
         cspace, robot, eef, target, quality, config);
@@ -461,7 +461,7 @@ int main(int argc, char* argv[]) {
     planner->setHardObstacle(scene.overhead.center, /*trigger_dist=*/0.15f);
     planner->addExtraSetupTimeMs(voxel_build_ms);  // include SDF voxel build in Setup
 
-    // ---- 11. 设置起始配置 (在 home_pose ± π/4 范围内随机无碰撞) ----
+    // ---- 11. Set the start configuration (random collision-free within home_pose +- pi/4) ----
     auto [q_min, q_max] = robot->getJointLimits();
     Config home = scene.home_pose;
     Config delta = Config::Constant(7, static_cast<float>(M_PI / 4.0));
@@ -482,7 +482,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[Setup] Start config (random, attempts=" << attempts << "): "
               << start_config.transpose() << "\n";
 
-    // 验证起始配置的 FK
+    // Validate the FK of the start configuration
     robot->setJointValues(start_config);
     Matrix4f start_tcp = robot->getGCPGlobalPose();
     std::cout << "[Setup] Start TCP position: "
@@ -490,10 +490,10 @@ int main(int argc, char* argv[]) {
     std::cout << "[Setup] Distance to apple: "
               << (start_tcp.block<3,1>(0,3) - scene.apple_pos).norm() << "m\n\n";
 
-    // 导出场景布局 (树/苹果/起始构型), 供 Isaac Sim 侧对齐场景
+    // Export the scene layout (tree/apple/start configuration) for aligning the Isaac Sim scene
     exportSceneLayout(scene, start_config);
 
-    // ---- 12. 执行规划! ----
+    // ---- 12. Run the planner ----
     std::cout << "============================================\n"
               << "  PLANNING START\n"
               << "============================================\n\n";
@@ -503,7 +503,7 @@ int main(int argc, char* argv[]) {
     auto t_end_rrt = std::chrono::high_resolution_clock::now();
     double rrt_ms = std::chrono::duration<double, std::milli>(t_end_rrt - t_start_rrt).count();
 
-    // ---- 13. 输出结果 ----
+    // ---- 13. Report results ----
     std::cout << "\n============================================\n";
     if (success) {
         std::cout << "  PLANNING SUCCEEDED!\n"
@@ -512,7 +512,7 @@ int main(int argc, char* argv[]) {
         auto solution = planner->getSolution();
         std::cout << "\n  Path: " << solution.size() << " waypoints\n";
 
-        // ---- 保存路径到文件用于可视化 ----
+        // ---- Save the path to a file for visualization ----
         std::string out_path = "grasp_path.csv";
         std::ofstream out_file(out_path);
         if (out_file.is_open()) {
@@ -528,7 +528,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "\n[Error] Could not save path to: " << out_path << "\n";
         }
 
-        // 打印前几个和最后几个路径点
+        // Print the first and last few waypoints
         int show = std::min(5, (int)solution.size());
         std::cout << "\n  First " << show << " waypoints:\n";
         for (int i = 0; i < show; ++i) {
@@ -545,7 +545,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 打印最终 TCP 位置
+        // Print the final TCP position
         robot->setJointValues(solution.back());
         Matrix4f final_tcp = robot->getGCPGlobalPose();
         std::cout << "\n  Final TCP position: "
@@ -553,14 +553,14 @@ int main(int argc, char* argv[]) {
         std::cout << "  Distance to apple: "
                   << (final_tcp.block<3,1>(0,3) - scene.apple_pos).norm() << "m\n";
 
-        // 打印抓取信息
+        // Print grasp information
         auto grasps = planner->getGraspResults();
         if (!grasps.empty()) {
             std::cout << "\n  Best grasp score: " << grasps.back().grasp_score << "\n";
             std::cout << "  Contacts: " << grasps.back().contacts.size() << "\n";
         }
 
-        // ---- 14. 执行 TrajOpt 优化并计时 ----
+        // ---- 14. Run TrajOpt optimization and time it ----
         std::cout << "\n[TrajOpt] Starting SDF-based trajectory optimization...\n";
         auto t_start_trajopt = std::chrono::high_resolution_clock::now();
         
@@ -577,7 +577,7 @@ int main(int argc, char* argv[]) {
                   << "  Total Planning Time   : " << rrt_ms + trajopt_ms << " ms\n"
                   << "============================================\n";
 
-        // 保存优化后的路径
+        // Save the optimized path
         std::string opt_path = "grasp_path_trajopt.csv";
         std::ofstream opt_file(opt_path);
         if (opt_file.is_open()) {

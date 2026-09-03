@@ -11,7 +11,7 @@
 // Usage:
 //   ./measure_trajopt <urdf> <result_dir_1> [result_dir_2 ...]
 // Output: one summary line (means) per directory, plus a per-path CSV (written into the directory
-// trajopt_metrics.csv)。
+// trajopt_metrics.csv).
 
 #include <chrono>
 #include <cmath>
