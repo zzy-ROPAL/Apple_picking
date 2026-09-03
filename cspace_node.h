@@ -34,13 +34,6 @@ public:
     float getCostFromRoot() const { return cost_from_root_; }
     float getEdgeCostToParent() const { return edge_cost_to_parent_; }
 
-    // Sticky-winner state: identifier of the "most dangerous branch" that was
-    // being avoided when this node was created. -1 means no branch was in scope.
-    // Propagates from parent to child; hysteresis at the extension primitive
-    // decides when to switch the winner.
-    int  getWinnerBranchId() const { return winner_branch_id_; }
-    void setWinnerBranchId(int id) { winner_branch_id_ = id; }
-
     // ---- Mutators ----
     void setId(int id) { id_ = id; }
     void setParentId(int pid) { parent_id_ = pid; }
@@ -83,8 +76,6 @@ private:
     
     float  cost_from_root_;       // RRT*: accumulated cost from the root to here
     float  edge_cost_to_parent_;  // RRT*: edge cost to the parent
-
-    int    winner_branch_id_ = -1;  // sticky-winner: id of most-dangerous branch at creation
 
     std::vector<std::shared_ptr<CSpaceNode>> children_;
 };

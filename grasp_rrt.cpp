@@ -80,10 +80,6 @@ void GraspRrt::reset() {
     col_checks_overall_ = 0;
     map_config_tcp_.clear();
     grasps_.clear();
-    {
-        std::lock_guard<std::mutex> lk(ee_jacobian_cache_mutex_);
-        ee_jacobian_cache_.clear();
-    }
     if (tree_) tree_->reset();
 }
 
@@ -379,8 +375,6 @@ bool GraspRrt::doPlanningCycleBatch(int K) {
         auto new_node = tree_->appendNode(c.new_config, nn->getId());
         new_node->setCostFromRoot(cost);
         new_node->setEdgeCostToParent(c.edge_cost);
-        // Sticky-winner: propagate chosen winner branch id (batch RRT path).
-        new_node->setWinnerBranchId(c.chosen_winner_id);
         last_added_id_ = new_node->getId();
         processNode(new_node);
     }
@@ -719,39 +713,6 @@ static float computeAdaptiveStep(float dist_to_obstacle, float base_step) {
     return base_step * ratio;
 }
 
-// ============================================================================
-// getOrComputeEEJacobian — cached end-effector Jacobian per node
-// ============================================================================
-// Returns the 3×7 EE Jacobian at the given node configuration, cached by
-// node_id. On cache miss, computes via PandaPinocchioRobot::computeSphere
-// JacobianDirect (or fallback). Robot state assumed already at q on first
-// computation (caller guarantees this).
-MatrixXf GraspRrt::getOrComputeEEJacobian(int node_id, const Config& q) {
-    {
-        std::lock_guard<std::mutex> lk(ee_jacobian_cache_mutex_);
-        auto it = ee_jacobian_cache_.find(node_id);
-        if (it != ee_jacobian_cache_.end()) return it->second;
-    }
-
-    // Cache miss: compute. Robot must be at q for FK-derived Jacobian.
-    robot_->setJointValues(q);
-    MatrixXf J;
-    auto panda = dynamic_cast<PandaPinocchioRobot*>(robot_.get());
-    Eigen::Vector3f zero_off = Eigen::Vector3f::Zero();
-    if (panda) {
-        int frame_id = robot_->getFrameId("panda_hand");
-        J = panda->computeSphereJacobianDirect(frame_id, zero_off);
-    } else {
-        robot_->prepareJacobians();
-        J = robot_->computeSphereJacobian("panda_hand", zero_off);
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(ee_jacobian_cache_mutex_);
-        ee_jacobian_cache_[node_id] = J;
-    }
-    return J;
-}
 
 // ============================================================================
 // extendVFRRT — VF-RRT extension primitive (eager: every edge is validated on the spot)
@@ -798,47 +759,6 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     // below (proposal-layer projection driven by the damage budget rather than by angle):
     // 9 whole-arm probes x all soft branches, pairwise max, no argmax and no K-nearest,
 
-#if 0  // ================== STICKY WINNER — DISABLED ======================
-    // Superseded by the structure-tensor edge refuse (--edge-refuse-tensor).
-    // Sticky winner applies hysteresis to the argmax branch selection; it
-    // DELAYS the winner flip but cannot remove it (the axis function stays
-    // piecewise-constant), which is why oscillation persisted in the
-    // 10-branch scene. The tensor removes the selection step entirely, so
-    // there is nothing left to be "sticky" about. Kept in-tree (not
-    // deleted) as the Gen-2 ablation record: argmax → argmax+hysteresis →
-    // tensor.
-    // ====================================================================
-    // ---- Sticky-winner selection (shared by sticky-sample-steering and sticky-edge-refuse) ----
-    // Selection + sample-steering bending happen HERE (they shape q_step_dir before the
-    // edge is formed). edge refuse rejection is deferred until after new_config is
-    // known, so it can sub-sample the real edge (see below).
-    int   sticky_winner_id = -1;   // committed winner branch (for edge refuse rejection)
-    if (config_.sticky_sample_steering_enabled || config_.sticky_edge_refuse_enabled) {
-        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
-            cspace_->getCostEvaluator());
-        if (sdf_eval) {
-            const MatrixXf& J_EE = getOrComputeEEJacobian(nn->getId(), q_near);
-            robot_->setJointValues(q_near);
-            int prev_winner = nn->getWinnerBranchId();
-            auto sw = sdf_eval->stickyWinnerSelect(
-                q_near, q_step_dir, J_EE,
-                prev_winner,
-                config_.sticky_envelope,
-                config_.sticky_k,
-                config_.sticky_hysteresis_margin);
-            cand.chosen_winner_id = sw.chosen_id;
-            sticky_winner_id      = sw.chosen_id;
-
-            if (sw.chosen_id >= 0 && config_.sticky_sample_steering_enabled) {
-                // sample-steering-style deterministic bending (before edge is formed).
-                sdf_eval->bendAgainstAxis(
-                    q_step_dir, J_EE, sw.chosen_axis,
-                    config_.sticky_cos_cap);
-                if (q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
-            }
-        }
-    }
-#endif  // ================ END STICKY WINNER (selection) ==================
 
     float step_size = config_.extend_step_size;
     auto evaluator = cspace_->getCostEvaluator();
@@ -869,36 +789,6 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
 
     Config new_config = q_near + q_step_dir * step_size;
 
-#if 0  // ============ STICKY WINNER (deferred rejection) — DISABLED =======
-    // See the note at the selection block above. Tensor-mode edge refuse
-    // performs its rejection inside CSpaceSampled::isPathValid via
-    // computeEdgeAxialScoreTensor — no committed winner exists.
-    // ====================================================================
-    // ---- Sticky-edge refuse rejection (deferred): score the REAL edge -----------
-    // Now that new_config is known, evaluate the winner branch's axial score
-    // over the full edge q_near→new_config using both engagement spheres and
-    // DCD-granularity sub-sampling (catches envelope-entry / mid-edge-axial
-    // that a single q_near Jacobian prediction misses).
-    if (config_.sticky_edge_refuse_enabled && sticky_winner_id >= 0) {
-        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
-            cspace_->getCostEvaluator());
-        if (sdf_eval) {
-            float score = sdf_eval->stickyWinnerEdgeScore(
-                q_near, new_config, sticky_winner_id,
-                config_.sticky_envelope,
-                config_.sampling_size_dcd);
-            float x = config_.sticky_edge_refuse_gain *
-                      (score - config_.sticky_edge_refuse_threshold);
-            float p_reject = (x >= 0.0f)
-                ? 1.0f / (1.0f + std::exp(-x))
-                : std::exp(x) / (1.0f + std::exp(x));
-            if (randFloat01() < p_reject) {
-                // Rejected — return invalid candidate, do not extend.
-                return cand;
-            }
-        }
-    }
-#endif  // ============= END STICKY WINNER (deferred rejection) ============
 
     int col_before = cspace_->getCollisionCheckCount();
     auto t_start_col = std::chrono::high_resolution_clock::now();
@@ -934,9 +824,6 @@ ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
     auto new_node = tree_->appendNode(c.new_config, nn->getId());
     new_node->setCostFromRoot(cost);
     new_node->setEdgeCostToParent(c.edge_cost);
-    // Sticky-winner: propagate the chosen winner branch id onto the new node.
-    // If sticky mode was off, chosen_winner_id is -1 (harmless default).
-    new_node->setWinnerBranchId(c.chosen_winner_id);
     last_added_id_ = new_node->getId();
 
     processNode(new_node);

@@ -70,7 +70,7 @@ public:
     //
     // No branch is ever *selected*, so the score cannot jump when the
     // dominant branch changes — the argmax discontinuity (the oscillation
-    // source) is removed at the root rather than damped (sticky winner).
+    // source) is removed at the root rather than merely damped by hysteresis.
     // Reduces to the single-branch score w * |d . a| when one branch
     // dominates. Default returns 0 for evaluators without branch axes.
     virtual float computeEdgeAxialScoreTensor(

@@ -33,8 +33,8 @@ using namespace grasp_rrt;
 using grasp_rrt::Config;
 using Eigen::Vector3f;
 
-static constexpr float kEnvelope = 0.05f;  // = GraspRrtConfig::sticky_envelope
-static constexpr int   kK        = 3;      // = the benchmark default sticky_k
+static constexpr float kEnvelope = 0.05f;  // = GraspRrtConfig::winner_metric_envelope
+static constexpr int   kK        = 3;      // = the benchmark default --winner-metric-k
 
 struct PathMetrics {
     float total_turn = 0, env_turn = 0;

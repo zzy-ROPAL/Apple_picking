@@ -477,14 +477,10 @@ int main(int argc, char* argv[]) {
     float tree_dist_scale   = 1.0f;    // --tree-dist-scale S: scale the horizontal distance from the tree root to the robot base by S (0.5 = halved, easier to reach). Translates the whole tree.
     int   apple_branch_idx  = 4;       // --apple-branch-idx N: hang the apple on branch N (0-based, tree6 has 23 branches; default 4 = the original apple branch). That branch gets the same special treatment as the original (rigid, or soft with --apple-branch-soft).
     float base_raise        = 0.0f;    // --base-raise F: raise the robot base by F meters (implemented as sinking the whole tree by F in the robot frame; the exported scene json already reflects the sunk coordinates).
-    bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing sticky-winner. Branch A along x̂ above apple, branch B along ẑ in front of apple.
+    bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing branch-selection oscillation. Branch A along x̂ above apple, branch B along ẑ in front of apple.
     bool sparse_long_scene  = false;  // --sparse-long: standard 10-branch scene with wider vertical/angular spacing and ~1.7x longer branches
     bool xgate_scene        = false;  // --xgate: multi-branch scene = V6 rigid A + two CROSSED soft branches (B1 ŷ, B2 x̂) whose 5cm envelopes overlap on the approach corridor. Tests MAX-vs-winner oscillation.
-    bool sticky_edge_refuse_enabled = false;  // --sticky-edge-refuse: enable sticky-winner edge refuse (hysteresis + probabilistic edge refuse using single MAX-scored winner)
-    bool sticky_sample_steering_enabled   = false;  // --sticky-sample-steering: enable sticky-winner F (hysteresis + deterministic direction bending using single MAX-scored winner)
-    float sticky_hysteresis = 1.25f;  // --sticky-hysteresis M: challenger must beat incumbent by this factor to switch
-    int   sticky_k          = 3;      // --sticky-k K: how many nearest non-rigid branches to score at each cycle
-    float sticky_cap_deg    = 30.0f;  // --sticky-cap DEG: sticky-sample-steering min angle off branch axis (deg). 30=cos0.866, 45=0.707, 60=0.5
+    int   winner_metric_k   = 3;      // --winner-metric-k K: how many nearest non-rigid branches the post-hoc winner-switch metric scores
     bool edge_refuse_enabled = false;   // --edge-refuse: enable anisotropic edge refuse (Layer 1)
     bool edge_refuse_tensor  = false;   // --edge-refuse-tensor: structure-tensor aggregation instead of MAX (implies --edge-refuse)
     float edge_refuse_envelope  = 0.05f;
@@ -586,22 +582,23 @@ int main(int argc, char* argv[]) {
         } else if (a == "--xgate") {
             xgate_scene = true;
             diag_scene  = true;   // reuse diag apple/overhead override + geometry gating
-        } else if (a == "--sticky-edge-refuse" || a == "--sticky-sample-steering") {
-            // Sticky winner is disabled: hysteresis only delays the argmax
-            // winner flip, it cannot remove the discontinuity (oscillation
-            // persisted in the 10-branch scene). Superseded by the smooth
-            // structure-tensor aggregation, which has no winner at all.
-            std::cerr << "ERROR: " << a << " is DISABLED (superseded).\n"
-                      << "       Use --edge-refuse-tensor instead.\n";
-            return 1;
-        } else if (a == "--sticky-hysteresis" && i + 1 < argc) {
-            sticky_hysteresis = std::max(1.0f,
-                                  static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--winner-metric-k" && i + 1 < argc) {
+            winner_metric_k = std::max(1, std::atoi(argv[++i]));
         } else if (a == "--sticky-k" && i + 1 < argc) {
-            sticky_k = std::max(1, std::atoi(argv[++i]));
-        } else if (a == "--sticky-cap" && i + 1 < argc) {
-            sticky_cap_deg = std::max(0.0f, std::min(89.0f,
-                                  static_cast<float>(std::atof(argv[++i]))));
+            // Deprecated alias: this K only ever fed the post-hoc winner-switch
+            // metric, which outlived the sticky-winner mechanism itself.
+            std::cerr << "WARN: --sticky-k is deprecated; use --winner-metric-k.\n";
+            winner_metric_k = std::max(1, std::atoi(argv[++i]));
+        } else if (a.rfind("--sticky", 0) == 0) {
+            // The sticky-winner mechanism has been removed. Hysteresis only
+            // delayed the argmax winner flip, it could not remove the
+            // discontinuity (oscillation persisted in the 10-branch scene);
+            // unified refuse drops the winner selection entirely.
+            std::cerr << "ERROR: " << a
+                      << " has been removed — the sticky-winner mechanism is superseded "
+                         "by unified refuse (--uni-refuse). Historical implementation: "
+                         "git commit 7b57a64.\n";
+            return 1;
         } else if (a == "--edge-refuse") {
             edge_refuse_enabled = true;
         } else if (a == "--edge-refuse-tensor") {
@@ -763,8 +760,8 @@ int main(int argc, char* argv[]) {
     //   Branch B: soft, along ŷ, extended 60 cm (y=-0.30 to 0.30) so it
     //             shields the apple — swinging around either end is not
     //             an option. Robot must push through B.
-    // The question the benchmark answers: does baseline push through B
-    // with y-dominant (axial) motion, while sticky-winner enforces
+    // The question the benchmark answers: does the baseline push through B
+    // with y-dominant (axial) motion, while the axial-refuse mechanisms enforce
     // radial (xz-plane) motion through B?
     if (diag_scene) {
         scene.apple_pos = Vector3f(0.42f, -0.20f, 0.95f);
@@ -1021,8 +1018,8 @@ int main(int argc, char* argv[]) {
             // B1 along ŷ and B2 along x̂ cross near (0.33, 0, 1.00). Their 5cm
             // envelopes overlap in a ~10cm blob on the EE approach corridor
             // (Start1 y=+0.19 → apple y=-0.20 must sweep through y≈0). The
-            // perpendicular axes make the MAX-winner flip B1↔B2 as the EE
-            // moves — the oscillation sticky-edge-refuse's hysteresis should suppress.
+            // perpendicular axes make the MAX-winner flip B1<->B2 as the EE
+            // moves — the oscillation the tensor/unified aggregation removes.
             float b_r = 0.04f;
             // B1: soft shield along ŷ, x = 0.33, y ∈ [-0.25, 0.25], z = 1.00
             Vector3f b1_p0(0.33f, -0.25f, 1.00f);
@@ -1277,12 +1274,10 @@ int main(int argc, char* argv[]) {
     // ---- Unified refuse (unified branch-interaction rule, proposal projection + edge-level sigmoid) ----
     // Depends on the pen gate's probes / allow(t) — must come after enablePenetrationGate.
     if (uni_refuse_enabled) {
-        if (edge_refuse_enabled || sticky_edge_refuse_enabled ||
-            pen_steer_enabled) {
+        if (edge_refuse_enabled || pen_steer_enabled) {
             std::cout << "[Setup] WARNING: --uni-refuse supersedes the old edge refuse / "
                          "pen-steer; those switches are ignored\n";
             edge_refuse_enabled = false;
-            sticky_edge_refuse_enabled = false;
             pen_steer_enabled = false;
         }
         // ax_tip 30 -> 8 mm (user clarification 2026-07-28): freedom at the branch tip means
@@ -1372,25 +1367,6 @@ int main(int argc, char* argv[]) {
         std::cout << "[Setup] FINGER-FIRST STEERING ENABLED (align gain="
                   << config.ff_align_gain << ", zone " << config.ff_far
                   << "->" << config.ff_near << " m)\n";
-    }
-    // Sticky-winner variants
-    config.sticky_sample_steering_enabled              = sticky_sample_steering_enabled;
-    config.sticky_edge_refuse_enabled            = sticky_edge_refuse_enabled;
-    config.sticky_hysteresis_margin      = sticky_hysteresis;
-    config.sticky_k                      = sticky_k;
-    config.sticky_cos_cap                = std::cos(sticky_cap_deg * static_cast<float>(M_PI) / 180.0f);
-    if (sticky_sample_steering_enabled) {
-        std::cout << "[Setup] STICKY-F ENABLED (hysteresis margin=" << sticky_hysteresis
-                  << ", K=" << sticky_k << ", cos_cap=" << config.sticky_cos_cap
-                  << ", envelope=" << config.sticky_envelope << ")\n";
-    }
-    if (sticky_edge_refuse_enabled) {
-        std::cout << "[Setup] STICKY-edge refuse ENABLED (hysteresis margin=" << sticky_hysteresis
-                  << ", K=" << sticky_k << ", threshold=" << config.sticky_edge_refuse_threshold
-                  << ", gain=" << config.sticky_edge_refuse_gain << ")\n";
-    }
-    if (sticky_sample_steering_enabled && sticky_edge_refuse_enabled) {
-        std::cerr << "WARN: both --sticky-sample-steering and --sticky-edge-refuse set; sticky-sample-steering takes precedence.\n";
     }
 
     // ---- 9. Output directory ----
@@ -1731,7 +1707,7 @@ int main(int argc, char* argv[]) {
                 for (size_t i = 0; i + 1 < solution.size(); ++i) {
                     int w = sdf_eval->maxWinnerBranchId(
                         solution[i], solution[i+1],
-                        config.sticky_envelope, sticky_k);
+                        config.winner_metric_envelope, winner_metric_k);
                     if (w < 0) continue;   // no branch in envelope on this edge
                     if (prev_winner >= 0 && w != prev_winner) ++switches;
                     ++segs;
@@ -1768,7 +1744,7 @@ int main(int argc, char* argv[]) {
                     // In-envelope? use the winner query as a cheap "near a branch" test
                     int w = sdf_eval->maxWinnerBranchId(
                         solution[i-1], solution[i],
-                        config.sticky_envelope, sticky_k);
+                        config.winner_metric_envelope, winner_metric_k);
                     if (w >= 0) { env_turn += ang_deg; ++env_turns; }
                 }
                 result.path_total_turning_deg = static_cast<float>(total_turn);

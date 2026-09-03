@@ -258,19 +258,12 @@ struct GraspRrtConfig {
     float ff_min_advance        = 0.3f;    // minimum retained fraction of the advance component
 
 
-    // ---- Sticky-winner (Upgrades A and B) ----
-    // Two variants share the same axis-selection logic:
-    //   * sticky-sample-steering   → deterministic sample-steering-style bending on the winner's axis
-    //   * sticky-edge-refuse → probabilistic sigmoid rejection on the winner's score
-    // Both read/write CSpaceNode::winner_branch_id_ for hysteresis.
-    bool  sticky_sample_steering_enabled          = false;
-    bool  sticky_edge_refuse_enabled        = false;
-    float sticky_envelope           = 0.05f;   // 5 cm
-    float sticky_cos_cap            = 0.866f;  // cos(30°) for sample-steering bending
-    float sticky_hysteresis_margin  = 1.25f;   // challenger must beat incumbent by ×margin
-    int   sticky_k                  = 3;       // K nearest branches
-    float sticky_edge_refuse_threshold      = 0.9063f; // sigmoid midpoint (cos 25°)
-    float sticky_edge_refuse_gain           = 20.0f;   // sigmoid steepness
+    // ---- Winner-switch metric (post-hoc instrumentation only) ----
+    // Envelope used by SdfCostEvaluator::maxWinnerBranchId, which answers
+    // "which branch is the most dangerous here" for the Group E3 oscillation
+    // counter (winner_segments / winner_switches / winner_switch_rate) and for
+    // the in-envelope test of the axial metrics. It drives NO planner behavior.
+    float winner_metric_envelope    = 0.05f;   // 5 cm
 };
 
 } // namespace grasp_rrt

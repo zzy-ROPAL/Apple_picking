@@ -176,13 +176,8 @@ private:
         float      vf_time_ms = 0.0f;
         float      collision_time_ms = 0.0f;
         int        col_check_count_delta = 0;
-        int        chosen_winner_id = -1;  // sticky-winner: id to store on new node
     };
     ExtendCandidate extendVFRRTCompute(const Config& target);
-
-    // Get the node's cached EE Jacobian, computing it on first use. Assumes the robot
-    // is already at the node's configuration. Currently used only by the #if 0 sticky-winner block.
-    MatrixXf getOrComputeEEJacobian(int node_id, const Config& q);
 
     // motion_dir: intended extension direction in joint space (e.g., q_rand−q_near).
     // Used by Option A branch anisotropy to apply axial drag. Pass an empty Config()
@@ -341,12 +336,6 @@ private:
     // RRT*
     float best_goal_cost_ = 1e9f;
     std::unordered_map<int, Matrix4f> map_config_tcp_;
-
-    // sample steering: EE Jacobian cache keyed by tree node id.
-    // Populated lazily when a node is used as q_near and the EE is in
-    // envelope. Cleared at the start of each planning run.
-    std::unordered_map<int, MatrixXf> ee_jacobian_cache_;
-    std::mutex ee_jacobian_cache_mutex_;
 
     // Cached target-object position
     Vector3f target_object_position_;
