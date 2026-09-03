@@ -13,8 +13,8 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// ApproachDiscretization — 对应 Python ApproachDiscretization
-// 离散球面: 将接近方向映射到正二十面体面, 保证 RRT 节点的接近方向均匀分布
+// ApproachDiscretization — counterpart of the Python ApproachDiscretization
+// Discrete sphere: maps approach directions onto icosahedron faces so that RRT nodes' approach directions stay uniformly spread
 // ============================================================================
 
 class ApproachDiscretization {
@@ -25,34 +25,34 @@ public:
     };
 
     struct FaceStats {
-        int  attempts  = 0;     // 该面被选中尝试 grasp 的次数
-        int  failures  = 0;     // 失败次数 (TRAPPED + ERROR)
-        bool disabled  = false; // 是否被禁用
+        int  attempts  = 0;     // how many times this face was picked for a grasp attempt
+        int  failures  = 0;     // number of failures (TRAPPED + ERROR)
+        bool disabled  = false; // whether the face is disabled
     };
 
     /**
-     * @param radius 球面半径
-     * @param steps 细分次数 (0 = 基础20面体, 1 = 80面, 2 = 320面...)
+     * @param radius sphere radius
+     * @param steps subdivision count (0 = base icosahedron, 1 = 80 faces, 2 = 320 faces...)
      */
     ApproachDiscretization(float radius = 100.0f, int steps = 0)
         : radius_(radius), steps_(steps),
           global_pose_(Matrix4f::Identity()),
           rng_(std::random_device{}()) {
         generateIcosphere(steps);
-        // 缩放到指定半径
+        // Scale to the requested radius
         for (auto& v : vertices_) v *= radius;
     }
 
-    // ---- 全局位姿 ----
+    // ---- Global pose ----
 
     void setGlobalPose(const Matrix4f& pose) { global_pose_ = pose; }
     const Matrix4f& getGlobalPose() const { return global_pose_; }
 
-    // ---- 球面面 ID 查找 ----
+    // ---- Sphere face-ID lookup ----
 
     /**
-     * 对应 Python getNearestFaceId
-     * 找到球面上离给定位置方向最近的面 ID
+     * Counterpart of the Python getNearestFaceId
+     * Find the id of the face closest to the direction of the given position
      */
     int getNearestFaceId(const Vector3f& pos) const {
         Vector3f center = global_pose_.block<3,1>(0, 3);
@@ -80,11 +80,11 @@ public:
         return best_face;
     }
 
-    // ---- 节点管理 ----
+    // ---- Node management ----
 
     /**
-     * 对应 Python addCSpaceNode
-     * 将 RRT 节点添加到对应球面方向
+     * Counterpart of the Python addCSpaceNode
+     * Add an RRT node to the matching sphere direction
      */
     void addCSpaceNode(const Vector3f& cart_pos, CSpaceNodePtr node) {
         int face_id = getNearestFaceId(cart_pos);
@@ -97,12 +97,12 @@ public:
     }
 
     /**
-     * 从 active 面 (过滤 disabled) 中均匀随机选择一个面, 取出一个节点并移除
+     * Pick a face uniformly at random among the active ones (disabled filtered out), then pop one node from it
      */
     CSpaceNodePtr getGoodRatedNode(int /*loops*/ = 30) {
         if (active_faces_.empty()) return nullptr;
 
-        // 过滤 disabled 面
+        // Filter out disabled faces
         std::vector<int> candidates;
         candidates.reserve(active_faces_.size());
         for (int f : active_faces_) {
@@ -113,7 +113,7 @@ public:
         }
         if (candidates.empty()) return nullptr;
 
-        // 均匀随机选一个 (用 thread-local rng, 多线程安全)
+        // Pick one uniformly at random (thread-local rng, thread-safe)
         std::uniform_int_distribution<int> dist(0, static_cast<int>(candidates.size()) - 1);
         int chosen_face = candidates[dist(threadRng())];
         last_selected_face_ = chosen_face;
@@ -136,12 +136,12 @@ public:
         return node;
     }
 
-    // ---- 面禁用机制 ----
+    // ---- Face-disabling mechanism ----
 
-    /** 上次 getGoodRatedNode 选中的面 ID (-1 表示无效) */
+    /** Id of the face last chosen by getGoodRatedNode (-1 = invalid) */
     int getLastSelectedFace() const { return last_selected_face_; }
 
-    /** 记录某面一次 grasp 尝试结果 */
+    /** Record the outcome of one grasp attempt on a face */
     void recordGraspAttempt(int face_id, bool success) {
         if (face_id < 0) return;
         auto& s = face_stats_[face_id];
@@ -149,7 +149,7 @@ public:
         if (!success) s.failures++;
     }
 
-    /** 禁用某面 (永久) */
+    /** Disable a face (permanently) */
     void disableFace(int face_id) {
         if (face_id < 0) return;
         face_stats_[face_id].disabled = true;
@@ -165,7 +165,7 @@ public:
         return it != face_stats_.end() ? it->second.failures : 0;
     }
 
-    /** 当前未被禁用的 active 面数量 */
+    /** Number of faces currently still active (not disabled) */
     int getActiveFaceCount() const {
         int count = 0;
         for (int f : active_faces_) {
@@ -183,7 +183,7 @@ public:
         return count;
     }
 
-    /** 至少被尝试过一次的面数（attempts > 0） */
+    /** Number of faces tried at least once (attempts > 0) */
     int getFacesWithAttempts() const {
         int count = 0;
         for (const auto& kv : face_stats_) {
@@ -192,7 +192,7 @@ public:
         return count;
     }
 
-    /** 单个面累积的最高失败次数 */
+    /** Highest failure count accumulated on any single face */
     int getMaxFaceFailures() const {
         int max_f = 0;
         for (const auto& kv : face_stats_) {
@@ -201,10 +201,10 @@ public:
         return max_f;
     }
 
-    /** 总三角面数（icosphere subdivision 后的总数） */
+    /** Total number of triangular faces (after icosphere subdivision) */
     int getTotalFaceCount() const { return static_cast<int>(faces_.size()); }
 
-    /** 该面的中心方向（单位向量，从球心指向面中心） */
+    /** Center direction of the face (unit vector from the sphere center toward the face center) */
     Vector3f getFaceDirection(int face_id) const {
         if (face_id < 0 || face_id >= static_cast<int>(faces_.size())) return Vector3f::Zero();
         Vector3f center = (vertices_[faces_[face_id][0]] +
@@ -214,13 +214,13 @@ public:
         return (n > 1e-10f) ? Vector3f(center / n) : Vector3f::Zero();
     }
 
-    /** 该面累计尝试 grasp 次数 */
+    /** Cumulative number of grasp attempts on this face */
     int getAttemptCount(int face_id) const {
         auto it = face_stats_.find(face_id);
         return (it != face_stats_.end()) ? it->second.attempts : 0;
     }
 
-    /** 该面 bucket 里还有多少未消耗节点 */
+    /** How many unconsumed nodes remain in this face's bucket */
     int getNodeCount(int face_id) const {
         auto it = face_to_nodes_.find(face_id);
         return (it != face_to_nodes_.end()) ? it->second.count : 0;
@@ -245,14 +245,14 @@ private:
     std::unordered_map<int, FaceMapping> face_to_nodes_;
     std::vector<int> active_faces_;
 
-    // 面禁用机制
+    // Face-disabling mechanism
     std::unordered_map<int, FaceStats> face_stats_;
     int last_selected_face_ = -1;
 
-    // ---- 正二十面体生成与细分 ----
+    // ---- Icosahedron generation and subdivision ----
 
     void generateIcosphere(int steps) {
-        // 初始正二十面体 12 个顶点
+        // The 12 vertices of the base icosahedron
         float t = (1.0f + std::sqrt(5.0f)) / 2.0f;
         vertices_ = {
             Vector3f(-1, t, 0).normalized(), Vector3f(1, t, 0).normalized(),
@@ -263,7 +263,7 @@ private:
             Vector3f(-t,0,-1).normalized(),  Vector3f(-t,0, 1).normalized()
         };
 
-        // 20 个三角面
+        // The 20 triangular faces
         faces_ = {
             {0,11,5}, {0,5,1}, {0,1,7}, {0,7,10}, {0,10,11},
             {1,5,9},  {5,11,4},{11,10,2},{10,7,6}, {7,1,8},
@@ -271,7 +271,7 @@ private:
             {4,9,5},  {2,4,11},{6,2,10},{8,6,7},  {9,8,1}
         };
 
-        // 细分
+        // Subdivision
         for (int s = 0; s < steps; ++s) {
             std::vector<std::array<int, 3>> new_faces;
             std::map<std::pair<int,int>, int> mid_cache;

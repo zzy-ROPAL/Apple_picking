@@ -12,9 +12,9 @@ namespace grasp_rrt {
 
 // ============================================================================
 // Thread-local RNG utilities
-// 每个线程一份 std::mt19937, 用 thread::id + omp_thread_num 混合作 seed.
-// 调用 rand()/RAND_MAX 在多线程下不可靠 (glibc 是, 但 portable 不保证), 也无法
-// 控制 per-thread 流, 故统一替换.
+// One std::mt19937 per thread, seeded from thread::id mixed with omp_thread_num.
+// rand()/RAND_MAX is not reliable under multithreading (glibc happens to be, but
+// portability does not guarantee it) and gives no control over per-thread streams.
 // ============================================================================
 
 inline std::mt19937& threadRng() {

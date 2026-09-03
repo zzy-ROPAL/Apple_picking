@@ -13,16 +13,16 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// CSpace — 对应 Python CSpace
-// 配置空间基类: 管理关节边界、随机采样、碰撞检测
+// CSpace — counterpart of the Python CSpace
+// Configuration-space base class: joint limits, random sampling, collision checking
 // ============================================================================
 
 class CSpace {
 public:
     /**
-     * @param dimension 配置空间维度 (关节个数)
-     * @param collision_checker 碰撞检测器 (可为 nullptr, 则默认全部无碰撞)
-     * @param seed 随机种子 (0 = 系统随机)
+     * @param dimension configuration-space dimension (number of joints)
+     * @param collision_checker collision checker (may be nullptr — then everything is collision-free)
+     * @param seed random seed (0 = seed from the system)
      */
     CSpace(int dimension,
            std::shared_ptr<CollisionChecker> collision_checker = nullptr,
@@ -39,10 +39,10 @@ public:
 
     virtual ~CSpace() = default;
 
-    // ---- 维度 ----
+    // ---- Dimension ----
     int getDimension() const { return dimension_; }
 
-    // ---- 边界管理 (对应 Python setBoundaries / getBoundaryMin 等) ----
+    // ---- Boundary management (Python setBoundaries / getBoundaryMin etc.) ----
 
     void setBoundaries(const Eigen::VectorXf& bmin, const Eigen::VectorXf& bmax) {
         boundary_min_ = bmin;
@@ -55,7 +55,7 @@ public:
     const Eigen::VectorXf& getBoundaryMinVec() const { return boundary_min_; }
     const Eigen::VectorXf& getBoundaryMaxVec() const { return boundary_max_; }
 
-    // ---- 随机采样 (对应 Python getRandomConfig) ----
+    // ---- Random sampling (Python getRandomConfig) ----
 
     Config getRandomConfig() {
         Config config(dimension_);
@@ -68,7 +68,7 @@ public:
     }
 
     /**
-     * 获取有效的随机配置 (无碰撞 + 满足约束)
+     * Get a valid random configuration (collision-free + constraints satisfied)
      */
     Config getRandomConfigValid(int max_tries = 1000) {
         for (int i = 0; i < max_tries; ++i) {
@@ -79,13 +79,13 @@ public:
     }
 
     /**
-     * 将配置裁剪到边界内 (对应 Python respectBoundaries)
+     * Clamp a configuration into the boundaries (Python respectBoundaries)
      */
     Config respectBoundaries(const Config& config) const {
         return config.cwiseMax(boundary_min_).cwiseMin(boundary_max_);
     }
 
-    // ---- 边界检查 ----
+    // ---- Boundary check ----
 
     bool isInBoundary(const Config& config) const {
         for (int i = 0; i < dimension_; ++i) {
@@ -95,16 +95,16 @@ public:
         return true;
     }
 
-    // ---- 碰撞检测 (对应 Python isCollisionFree) ----
+    // ---- Collision checking (Python isCollisionFree) ----
 
     bool isCollisionFree(const Config& config) {
         performance_collision_checks_++;
         if (collision_checker_)
             return collision_checker_->isCollisionFree(config);
-        return true; // 无碰撞检测器时默认通过
+        return true; // no collision checker: pass by default
     }
 
-    // ---- 约束检查 ----
+    // ---- Constraint check ----
 
     void addConstraint(std::function<bool(const Config&)> constraint) {
         constraints_.push_back(constraint);
@@ -117,8 +117,8 @@ public:
         return true;
     }
 
-    // ---- 综合有效性检查 (对应 Python isConfigValid) ----
-    // virtual: CSpaceSampled 覆盖以追加软枝穿透闸门 (penetration gate)。
+    // ---- Combined validity check (Python isConfigValid) ----
+    // virtual: CSpaceSampled overrides it to append the soft-branch penetration gate.
 
     virtual bool isConfigValid(const Config& config,
                        bool check_borders = true,
@@ -130,13 +130,13 @@ public:
         return true;
     }
 
-    // ---- 路径有效性 (基类只检查终点; CSpaceSampled 覆盖做 DCD) ----
+    // ---- Path validity (base class checks endpoints only; CSpaceSampled overrides with DCD) ----
 
     virtual bool isPathValid(const Config& q1, const Config& q2) {
         return isConfigValid(q2);
     }
 
-    // ---- 距离计算 (对应 Python calcDist) ----
+    // ---- Distance computation (Python calcDist) ----
 
     float calcDist(const Config& c1, const Config& c2,
                    bool force_disable_weights = false) const {
@@ -147,13 +147,13 @@ public:
         return diff.norm();
     }
 
-    // ---- 插值 (对应 Python interpolate) ----
+    // ---- Interpolation (Python interpolate) ----
 
     Config interpolate(const Config& q1, const Config& q2, float t) const {
         return q1 + (q2 - q1) * t;
     }
 
-    // ---- 权重 ----
+    // ---- Weights ----
 
     void setMetricWeights(const Eigen::VectorXf& w) {
         metric_weights_ = w;
@@ -164,7 +164,7 @@ public:
     bool getUseMetricWeights() const { return use_metric_weights_; }
     const Eigen::VectorXf& getMetricWeights() const { return metric_weights_; }
 
-    // ---- 性能统计 ----
+    // ---- Performance statistics ----
 
     int getCollisionCheckCount() const { return performance_collision_checks_; }
     void resetPerformance() {
@@ -172,7 +172,7 @@ public:
         performance_distance_checks_ = 0;
     }
 
-    // ---- 碰撞检测器访问 ----
+    // ---- Collision-checker access ----
     std::shared_ptr<CollisionChecker> getCollisionChecker() const {
         return collision_checker_;
     }
@@ -186,7 +186,7 @@ protected:
     bool use_metric_weights_;
     std::atomic<int> performance_collision_checks_;
     std::atomic<int> performance_distance_checks_;
-    std::mt19937 rng_;  // 保留: 单线程使用 (e.g. 串行 doPlanningCycle); 并行采样用 threadRng()
+    std::mt19937 rng_;  // kept for single-threaded use (e.g. serial doPlanningCycle); parallel sampling uses threadRng()
     std::vector<std::function<bool(const Config&)>> constraints_;
 };
 

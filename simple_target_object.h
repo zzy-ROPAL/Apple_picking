@@ -5,15 +5,15 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// SimpleTargetObject — 球形目标物体的简单实现
-// 适用于苹果等近似球形的抓取目标
+// SimpleTargetObject — simple implementation of a spherical target object
+// Suitable for approximately spherical grasp targets such as apples
 // ============================================================================
 
 class SimpleTargetObject : public TargetObjectInterface {
 public:
     /**
-     * @param position  物体中心位置 (全局坐标)
-     * @param radius    物体半径
+     * @param position  object center position (global frame)
+     * @param radius    object radius
      */
     SimpleTargetObject(const Vector3f& position, float radius = 0.04f)
         : position_(position), radius_(radius) {
@@ -30,7 +30,7 @@ public:
     }
 
     /**
-     * 球面上距离查询点最近的点
+     * Closest point on the sphere surface to the query point
      */
     Vector3f getClosestPoint(const Vector3f& query_pos) const override {
         Vector3f dir = query_pos - position_;
@@ -42,13 +42,13 @@ public:
     }
 
     /**
-     * 到球面的距离 (如果在球内则返回负值)
+     * Distance to the sphere surface (negative if inside the sphere)
      */
     float calculateDistance(const Vector3f& pos) const override {
         return (pos - position_).norm() - radius_;
     }
 
-    // ---- 修改 ----
+    // ---- Mutators ----
     void setPosition(const Vector3f& p) {
         position_ = p;
         pose_.block<3,1>(0, 3) = p;

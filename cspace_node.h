@@ -7,8 +7,8 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// CSpaceNode — 对应 Python CSpaceNode
-// RRT 树中的一个节点, 存储关节配置向量
+// CSpaceNode — counterpart of the Python CSpaceNode
+// A single node of the RRT tree, storing a joint configuration vector
 // ============================================================================
 
 class CSpaceNode {
@@ -22,7 +22,7 @@ public:
           status_(0), obstacle_distance_(-1.0f), dyn_dom_radius_(0.0f),
           cost_from_root_(0.0f), edge_cost_to_parent_(0.0f) {}
 
-    // ---- 访问器 ----
+    // ---- Accessors ----
     int getId() const { return id_; }
     int getParentId() const { return parent_id_; }
     const Config& getConfiguration() const { return configuration_; }
@@ -41,11 +41,11 @@ public:
     int  getWinnerBranchId() const { return winner_branch_id_; }
     void setWinnerBranchId(int id) { winner_branch_id_ = id; }
 
-    // ---- 修改器 ----
+    // ---- Mutators ----
     void setId(int id) { id_ = id; }
     void setParentId(int pid) { parent_id_ = pid; }
     void setConfiguration(const Config& c) { configuration_ = c; }
-    void setStatus(int s) { status_ = s; }             // 0=普通, 2=由moveArm创建
+    void setStatus(int s) { status_ = s; }             // 0=normal, 2=created by moveArm
     void setObstacleDistance(float d) { obstacle_distance_ = d; }
     
     void setCostFromRoot(float c) { cost_from_root_ = c; }
@@ -64,7 +64,7 @@ public:
         }
     }
 
-    // ---- 距离计算 ----
+    // ---- Distance computation ----
     float distanceTo(const Config& other) const {
         return (configuration_ - other).norm();
     }
@@ -75,14 +75,14 @@ public:
 
 private:
     int    id_;
-    int    parent_id_;            // -1 表示根节点
-    Config configuration_;        // 关节配置向量
-    int    status_;               // 0=普通, 2=由moveArm创建
-    float  obstacle_distance_;    // 到障碍物的工作空间距离
-    float  dyn_dom_radius_;       // 动态域 RRT 的半径
+    int    parent_id_;            // -1 marks the root node
+    Config configuration_;        // joint configuration vector
+    int    status_;               // 0=normal, 2=created by moveArm
+    float  obstacle_distance_;    // workspace distance to the nearest obstacle
+    float  dyn_dom_radius_;       // radius for dynamic-domain RRT
     
-    float  cost_from_root_;       // RRT*: 从根节点到这里的总累计代价
-    float  edge_cost_to_parent_;  // RRT*: 与父节点的边代价
+    float  cost_from_root_;       // RRT*: accumulated cost from the root to here
+    float  edge_cost_to_parent_;  // RRT*: edge cost to the parent
 
     int    winner_branch_id_ = -1;  // sticky-winner: id of most-dangerous branch at creation
 

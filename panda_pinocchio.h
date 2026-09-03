@@ -20,8 +20,8 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// PandaPinocchioRobot — 基于 Pinocchio 的 Panda 机器人实现 (per-thread state)
-// Model 共享只读, Data 等 mutable 状态按线程独立持有.
+// PandaPinocchioRobot — Pinocchio-based Panda robot implementation (per-thread state)
+// Model is shared read-only; Data and other mutable state are held per thread.
 // ============================================================================
 
 class PandaPinocchioRobot : public RobotInterface {
@@ -48,11 +48,11 @@ public:
                   << model_.nframes << " frames, "
                   << "EE frame: " << ee_frame_name << " (id=" << ee_frame_id_ << ")\n";
 
-        // 默认 1 个线程
+        // Default: 1 thread
         setNumThreads(1);
     }
 
-    // ---- 并行支持 ----
+    // ---- Parallelism support ----
 
     void setNumThreads(int N) override {
         N = std::max(1, N);
@@ -70,13 +70,13 @@ public:
         num_threads_ = N;
     }
 
-    // ---- RobotInterface 实现 ----
+    // ---- RobotInterface implementation ----
 
     void setJointValues(const Config& config) override {
         auto& pt = perThread();
-        // FK 缓存: 同构型重复调用直接返回。碰撞检测的 ~11 个 link FK 回调
-        // 都以同一构型调本函数, 只有第一次需要真正算 FK; 构型未变时
-        // jacobians_ready 也保持有效, 不重置。
+        // FK cache: repeated calls at the same configuration return immediately.
+        // The ~11 per-link FK callbacks of collision checking all hit this function at
+        // the same q; only the first needs real FK, and jacobians_ready stays valid.
         if (pt.fk_valid && pt.current_config.size() == config.size() &&
             (pt.current_config.array() == config.array()).all()) {
             return;
@@ -184,7 +184,7 @@ public:
              - cross_mat * pt.tmp_J_6d.bottomRows(3).leftCols(dimension_).cast<float>();
     }
 
-    // ---- 额外方法 ----
+    // ---- Additional methods ----
 
     int getFrameId(const std::string& frame_name) const override {
         return static_cast<int>(model_.getFrameId(frame_name));
@@ -250,7 +250,7 @@ private:
         Eigen::MatrixXd  jacobian_cache;
         Eigen::MatrixXd  tmp_J_6d;
         bool             jacobians_ready = false;
-        // current_config 初始为 Zero 但从未跑过 FK, 不能只比构型判缓存命中
+        // current_config starts at Zero but FK never ran — configuration equality alone is not a cache hit
         bool             fk_valid = false;
     };
 
@@ -259,7 +259,7 @@ private:
     int              dimension_;
     std::string      ee_frame_name_;
 
-    // 必须 mutable: const 方法 (如 getFramePose) 也要拿到自己线程的 data
+    // Must be mutable: const methods (e.g. getFramePose) also need their own thread's data
     mutable std::vector<PerThread> per_thread_;
     int num_threads_ = 1;
 

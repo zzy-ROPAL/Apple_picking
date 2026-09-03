@@ -1,6 +1,6 @@
-// probe_dump.cpp — 打印穿透闸门 9 探针在给定构型下的世界坐标
-// 用途:与 Python (pybullet FK) 交叉验证 frame 约定。
-// 用法:./probe_dump <urdf> "q1,q2,...,q7"
+// probe_dump.cpp — print the world coordinates of the 9 penetration-gate probes
+// Purpose: cross-validate frame conventions against Python (pybullet FK).
+// Usage:   ./probe_dump <urdf> "q1,q2,...,q7"
 
 #include <iostream>
 #include <sstream>

@@ -5,8 +5,8 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// CollisionChecker — 碰撞检测抽象接口
-// 用户需要继承并实现 (例如用 Bullet Physics)
+// CollisionChecker — abstract collision-detection interface
+// Users subclass and implement it (e.g. with Bullet Physics)
 // ============================================================================
 
 class CollisionChecker {
@@ -14,13 +14,13 @@ public:
     virtual ~CollisionChecker() = default;
 
     /**
-     * 检测给定关节配置是否无碰撞
+     * Test whether the given joint configuration is collision-free
      */
     virtual bool isCollisionFree(const Config& config) const = 0;
 
     /**
-     * 检测两个配置之间的路径是否无碰撞 (可选覆盖)
-     * 默认实现: 线性插值采样检测
+     * Test whether the path between two configurations is collision-free (optional override)
+     * Default implementation: sampled linear interpolation
      */
     virtual bool isPathCollisionFree(const Config& c1, const Config& c2,
                                      int num_samples = 10) const {

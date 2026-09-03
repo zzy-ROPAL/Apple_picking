@@ -19,22 +19,22 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// GraspRrt — 对应 Python GraspRrt (继承自 Rrt)
-// 核心规划器: 在 RRT 探索的同时生成并评估抓取假设
+// GraspRrt — counterpart of the Python GraspRrt (derived from Rrt)
+// Core planner: generates and scores grasp hypotheses while the RRT explores
 //
-// 参考论文: "Integrated Grasp and Motion Planning"
+// Reference paper: "Integrated Grasp and Motion Planning"
 //           N. Vahrenkamp, M. Do, T. Asfour, R. Dillmann, ICRA 2010
 // ============================================================================
 
 class GraspRrt {
 public:
     /**
-     * @param cspace        配置空间 (带 DCD 碰撞检测)
-     * @param robot         机器人接口 (FK/IK/Jacobian)
-     * @param eef           末端执行器接口 (夹爪控制)
-     * @param target        目标物体接口
-     * @param quality       抓取质量评估器
-     * @param config        算法参数
+     * @param cspace        configuration space (with DCD collision checking)
+     * @param robot         robot interface (FK/IK/Jacobian)
+     * @param eef           end-effector interface (gripper control)
+     * @param target        target-object interface
+     * @param quality       grasp-quality evaluator
+     * @param config        algorithm parameters
      */
     GraspRrt(std::shared_ptr<CSpaceSampled> cspace,
              std::shared_ptr<RobotInterface> robot,
@@ -45,13 +45,13 @@ public:
 
     ~GraspRrt() = default;
 
-    // ---- 配置 ----
+    // ---- Configuration ----
 
     void setConfig(const GraspRrtConfig& cfg) { config_ = cfg; }
     const GraspRrtConfig& getConfig() const { return config_; }
     void setVerbose(bool v) { verbose_ = v; }
 
-    // ---- 额外硬质障碍物 ----
+    // ---- Additional rigid obstacles ----
 
     void setHardObstacle(const Vector3f& pos, float trigger_dist = 0.20f) {
         hard_obstacle_pos_     = pos;
@@ -60,36 +60,36 @@ public:
     }
     void clearHardObstacle() { hard_obstacle_enabled_ = false; }
 
-    // ---- 起点设置 ----
+    // ---- Start configuration ----
 
     /**
-     * 设置起始配置 (对应 Python GraspRrt.setStart)
-     * 注意: GraspRRT 不需要外部设置 goal — goal 在规划过程中自动采样
+     * Set the start configuration (counterpart of the Python GraspRrt.setStart)
+     * Note: GraspRRT needs no externally set goal — goals are sampled during planning
      */
     bool setStart(const Config& start_config);
 
-    // ---- 主规划接口 ----
+    // ---- Main planning interface ----
 
     /**
-     * 执行 GraspRRT 规划 (对应 Python GraspRrt.plan)
-     * 阻塞式, 成功返回 true
+     * Run GraspRRT planning (counterpart of the Python GraspRrt.plan)
+     * Blocking; returns true on success
      */
     bool plan(bool quiet = false);
 
-    // ---- 结果获取 ----
+    // ---- Result access ----
 
     ConfigPath getSolution() const { return solution_; }
 
     // ------------------------------------------------------------------
-    // 方法 1:score-aware shortcutting(捷径剪枝,非 TrajOpt)
+    // Method 1: score-aware shortcutting (path pruning, NOT TrajOpt)
     //
-    // 对解路径反复尝试"跳过中间路点直连":仅当直连段按规划粒度
-    // (extend_step_size 分段)逐段通过与建树完全相同的有效性检查
-    // (DCD 碰撞 + edge refuse 拒绝)时才替换。无代价函数、无梯度、
-    // 无变形 —— 纯剪枝,最终路径的每条边都通过了规划器自己的检查,
-    // 方法保证(受监控球不沿枝轴向穿行)在构造上保持。
-    // 目标:消除 rejection 高压下的 detour-and-retry 徘徊尾巴
-    // (振荡长尾),而不动打分/拒绝机制本身。
+    // Repeatedly tries to "skip intermediate waypoints and connect directly" on the
+    // solution path. A direct connection replaces the detour only if, split at planning
+    // granularity (extend_step_size), every sub-segment passes exactly the same validity
+    // checks used while growing the tree (DCD collision + edge-refuse rejection). No cost
+    // function, no gradient, no deformation — pure pruning, so every edge of the final
+    // path passed the planner's own checks and the method guarantee (monitored spheres
+    // never travel along a branch axis) is preserved by construction.
     // ------------------------------------------------------------------
     std::vector<Config> shortcutSolutionPath(const std::vector<Config>& path,
                                              int max_rounds = 20);
@@ -112,14 +112,14 @@ public:
     }
 
     /**
-     * 将整棵 RRT 树 dump 到 CSV，用于离线可视化树生长过程
-     * 字段: node_id,parent_id,j0..j6,tcp_x,tcp_y,tcp_z,in_pose_sphere,on_solution_path
+     * Dump the whole RRT tree to CSV for offline visualization of tree growth
+     * Fields: node_id,parent_id,j0..j6,tcp_x,tcp_y,tcp_z,in_pose_sphere,on_solution_path
      */
     void dumpTree(const std::string& filepath);
 
     /**
-     * 将 pose_sphere 的每个 face 的统计 dump 到 CSV
-     * 字段: face_id,attempts,failures,disabled,node_count,dir_x,dir_y,dir_z
+     * Dump per-face statistics of pose_sphere to CSV
+     * Fields: face_id,attempts,failures,disabled,node_count,dir_x,dir_y,dir_z
      */
     void dumpFaceStats(const std::string& filepath);
 
@@ -132,16 +132,16 @@ public:
 
     // ---- Batch RRT (parallel extend, serial commit) ----
     //
-    // 设置每轮规划用多少个线程做扩展. 1 = 退化为串行 (默认).
-    // 调用前提: robot_ / cspace_ 的 collision checker 必须已配置好对应的
-    // per-thread 状态 (PandaPinocchioRobot::setNumThreads, BulletCollisionChecker(num_threads)).
+    // Set how many threads each planning round uses for extension. 1 = serial (default).
+    // Precondition: the collision checker of robot_ / cspace_ must already have the
+    // matching per-thread state (PandaPinocchioRobot::setNumThreads, BulletCollisionChecker(num_threads)).
     void setNumThreads(int n) { num_threads_ = (n > 1) ? n : 1; }
     int  getNumThreads() const { return num_threads_; }
 
-    // shortcut 剪枝的并行度 (与 num_threads_ 独立: OR-parallel 模式下每树
-    // 内部串行 num_threads_=1, 但竞速结束后赢家剪枝时其余核已空闲, 可用
-    // robot/collision checker 的全部 per-thread 槽位)。n 不得超过
-    // robot->setNumThreads / BulletCollisionChecker 构造时的线程数。
+    // Parallelism of shortcut pruning (independent of num_threads_: under OR-parallel each
+    // tree runs serially with num_threads_=1, but once the race is over the other cores are
+    // idle while the winner is pruned, so all per-thread slots of the robot / collision
+    // checker can be used). n must not exceed the thread count passed at construction.
     void setShortcutThreads(int n) { shortcut_threads_ = (n > 1) ? n : 1; }
 
     // ---- OR-Parallel external stop signal ----
@@ -149,24 +149,24 @@ public:
     // Used by OR-Parallel mode to cancel losing trees once any tree finds a solution.
     void setExternalStopFlag(std::atomic<bool>* f) { external_stop_flag_ = f; }
 
-    // ---- 重置 ----
+    // ---- Reset ----
 
     void reset();
 
 private:
-    // ---- 初始化 (对应 Python GraspRrt.init) ----
+    // ---- Initialization (counterpart of the Python GraspRrt.init) ----
     bool init();
 
-    // ---- 单轮规划循环 (对应 Python doPlanningCycle) ----
+    // ---- Single planning round (counterpart of the Python doPlanningCycle) ----
     bool doPlanningCycle();
     bool doPlanningCycleBatch(int K);
 
-    // ---- 扩展方法 ----
+    // ---- Extension methods ----
 
     ExtensionResult extendVFRRT(const Config& target);
 
-    // Batch-friendly: 只做计算 (NN/VF/collision), 不写 tree/perf 计数.
-    // 返回的 candidate 由主线程串行 commit.
+    // Batch-friendly: pure computation (NN/VF/collision), never writes tree/perf counters.
+    // The returned candidate is committed serially by the main thread.
     struct ExtendCandidate {
         bool       valid = false;
         int        nn_id = -1;
@@ -180,8 +180,8 @@ private:
     };
     ExtendCandidate extendVFRRTCompute(const Config& target);
 
-    // 取节点的缓存末端雅可比,首次使用时计算。假定机器人当前已处于该
-    // 节点构型。当前仅 #if 0 的 sticky-winner 块使用。
+    // Get the node's cached EE Jacobian, computing it on first use. Assumes the robot
+    // is already at the node's configuration. Currently used only by the #if 0 sticky-winner block.
     MatrixXf getOrComputeEEJacobian(int node_id, const Config& q);
 
     // motion_dir: intended extension direction in joint space (e.g., q_rand−q_near).
@@ -190,137 +190,137 @@ private:
     Config computeVectorField(const Config& q, CSpaceNodePtr nn,
                               const Config& motion_dir = Config());
 
-    // Shell attractor: 在主线程根据 shell_resample_counter_/period 判定是否
-    // 重新采样 cached_shell_target_. computeVectorField 仅做只读使用.
+    // Shell attractor: the main thread decides from shell_resample_counter_/period whether
+    // to resample cached_shell_target_. computeVectorField only reads it.
     void maybeResampleShellAttractor();
 
-    // ---- 路径验证 (Lazy collision check) ----
+    // ---- Path validation (lazy collision check) ----
     bool validateSolutionPath(CSpaceNodePtr goal_node);
 
-    // shortcutSolutionPath 的分段有效性检查:把 [a,b] 按
-    // extend_step_size 切成小段,逐段调 cspace_->isPathValid
-    // (= DCD + edge refuse,与建树同粒度、同语义)。
+    // Per-segment validity check used by shortcutSolutionPath: split [a,b] into
+    // extend_step_size pieces and call cspace_->isPathValid on each
+    // (= DCD + edge refuse, same granularity and semantics as tree growth).
     bool segmentValidPiecewise(const Config& a, const Config& b);
 
-    // ---- 抓取方向引导 ----
+    // ---- Grasp-direction guidance ----
 
     /**
-     * 对应 Python connectRandomGraspPositionJacobian
-     * 从 pose_sphere 选节点, 计算抓取位姿, Jacobian 引导步进
+     * Counterpart of the Python connectRandomGraspPositionJacobian
+     * Pick a node from pose_sphere, compute the grasp pose, step under Jacobian guidance
      */
     MoveArmResult connectRandomGraspPositionJacobian();
 
     /**
-     * 根据当前面的失败统计 + 保护机制，决定是否禁用某个 face
+     * Decide from the face's failure statistics plus the safeguard whether to disable it
      */
     void tryDisableFace(int face_id);
 
     /**
-     * 对应 Python calculateGlobalGraspPose
-     * 在物体表面生成候选抓取位姿
+     * Counterpart of the Python calculateGlobalGraspPose
+     * Generate candidate grasp poses on the object surface
      */
     Matrix4f calculateGlobalGraspPose(const Config& config, bool& success);
 
-    // ---- Jacobian 引导步进 ----
+    // ---- Jacobian-guided stepping ----
 
     /**
-     * 对应 Python moveTowardsGoal
-     * 从 startNode 迭代用 DiffIK 向 targetPose 迈步
+     * Counterpart of the Python moveTowardsGoal
+     * Iteratively step from startNode toward targetPose using DiffIK
      */
     MoveArmResult moveTowardsGoal(CSpaceNodePtr start_node,
                                    const Matrix4f& target_pose);
 
     /**
-     * 对应 Python createWorkSpaceSamplingStep
-     * 计算当前 → 目标的 delta, 限制步长, DiffIK 转关节增量
+     * Counterpart of the Python createWorkSpaceSamplingStep
+     * Compute the current -> goal delta, clamp the step, convert to joint increments via DiffIK
      */
     std::pair<MoveArmResult, Config> createWorkspaceSamplingStep(
         const Matrix4f& current_pose, const Matrix4f& target_pose);
 
     /**
-     * 对应 Python createWorkSpaceSamplingStepFromNode
+     * Counterpart of the Python createWorkSpaceSamplingStepFromNode
      */
     std::pair<MoveArmResult, Config> createWorkspaceSamplingStepFromNode(
         const Matrix4f& goal_pose, CSpaceNodePtr extend_node);
 
     /**
-     * 对应 Python moveArmDiffKin
-     * 单步微分逆运动学: J⁺ · e → dθ
+     * Counterpart of the Python moveArmDiffKin
+     * One differential IK step: J+ * e -> dtheta
      */
     std::pair<MoveArmResult, Config> moveArmDiffKin(const Matrix4f& delta_pose);
 
     /**
-     * 对应 Python limitWorkspaceStep
-     * 限制笛卡尔步长不超过预设最大值
+     * Counterpart of the Python limitWorkspaceStep
+     * Clamp the Cartesian step to a preset maximum
      */
     Matrix4f limitWorkspaceStep(const Matrix4f& delta_pose);
 
-    // ---- 抓取评分 ----
+    // ---- Grasp scoring ----
 
     /**
-     * 对应 Python calculateGraspScore
-     * 闭合夹爪 → 检测接触 → Force Closure 打分
+     * Counterpart of the Python calculateGraspScore
+     * Close the gripper -> detect contacts -> force-closure scoring
      */
     float calculateGraspScore(const Config& config, int node_id,
                               bool store_on_success = false);
 
-    // ---- 节点处理 ----
+    // ---- Node processing ----
 
-    /** 对应 Python processNode: 缓存 TCP 位姿, 注册到 pose_sphere */
+    /** Counterpart of the Python processNode: cache the TCP pose, register into pose_sphere */
     bool processNode(CSpaceNodePtr node);
 
-    /** Method A: 用 closest_below 节点 + 抖动产生 target */
+    /** Method A: build a target from the closest_below node plus jitter */
     Config sampleGoalBiased();
 
-    /** 对应 Python processNodes: 处理路径上每个节点 */
+    /** Counterpart of the Python processNodes: process every node on the path */
     bool processNodes(int start_id, int end_id);
 
-    // ---- 解路径构造 ----
+    // ---- Solution-path construction ----
 
     bool createSolution(bool quiet = false);
 
-    // ---- Jacobian 伪逆 (带阻尼) ----
+    // ---- Jacobian pseudoinverse (damped) ----
 
     MatrixXf computePseudoInverseJacobian();
 
-    // ---- 工具函数 ----
+    // ---- Utility functions ----
 
-    /** 笛卡尔位姿距离 (位置 + 加权角度) */
+    /** Cartesian pose distance (position + weighted angle) */
     static float cartesianPoseDiff(const Matrix4f& p1, const Matrix4f& p2);
 
-    /** 轴角 → 4x4 齐次矩阵 */
+    /** Axis-angle -> 4x4 homogeneous matrix */
     static Matrix4f axisAngleToMatrix4(const Vector3f& axis, float angle);
 
-    /** 从旋转矩阵提取轴角 */
+    /** Extract axis-angle from a rotation matrix */
     static void rotationToAxisAngle(const Eigen::Matrix3f& R,
                                      Vector3f& axis, float& angle);
 
-    /** 打印 */
+    /** Printing */
     void printPerformanceResults() const;
     void printGraspInfo(const GraspInfo& info) const;
 
-    // ======== 成员变量 ========
+    // ======== Member variables ========
 
-    // 核心组件
+    // Core components
     std::shared_ptr<CSpaceSampled>         cspace_;
     std::shared_ptr<RobotInterface>        robot_;
     std::shared_ptr<EndEffectorInterface>  eef_;
     std::shared_ptr<TargetObjectInterface>  target_object_;
     std::shared_ptr<GraspQualityInterface>  quality_measure_;
 
-    // RRT 树
+    // RRT tree
     std::unique_ptr<CSpaceTree> tree_;
     CSpaceNodePtr start_node_;
     CSpaceNodePtr goal_node_;
 
-    // 接近方向离散球面
+    // Discretized approach-direction sphere
     std::unique_ptr<ApproachDiscretization> pose_sphere_;
 
-    // 配置
+    // Configuration
     GraspRrtConfig config_;
     int dimension_;
 
-    // 状态
+    // State
     bool planner_initialized_;
     bool found_solution_;
     bool stop_search_;
@@ -329,12 +329,12 @@ private:
     int  last_added_id_;
     int  col_checks_overall_;
 
-    // 额外硬质障碍物
+    // Additional rigid obstacles
     Vector3f hard_obstacle_pos_     = Vector3f::Zero();
     float    hard_obstacle_trigger_ = 0.20f;
     bool     hard_obstacle_enabled_ = false;
 
-    // 缓存的 J_T (7×6)
+    // Cached J_T (7x6)
     MatrixXf cached_J_T_;
     bool     cached_J_T_valid_ = false;
 
@@ -348,17 +348,17 @@ private:
     std::unordered_map<int, MatrixXf> ee_jacobian_cache_;
     std::mutex ee_jacobian_cache_mutex_;
 
-    // 目标物体位置缓存
+    // Cached target-object position
     Vector3f target_object_position_;
 
-    // 抓取结果
+    // Grasp results
     std::vector<GraspInfo> grasps_;
     std::mutex grasp_mutex_;
 
-    // 解路径
+    // Solution path
     ConfigPath solution_;
 
-    // 性能统计
+    // Performance statistics
     GraspPlanningPerformance performance_;
     float extra_setup_time_ms_ = 0.0f;  // SDF voxel build, etc. (added in init)
 
@@ -380,7 +380,7 @@ private:
 
     // Batch RRT
     int num_threads_ = 1;
-    int shortcut_threads_ = 1;   // shortcut 剪枝并行度 (见 setShortcutThreads)
+    int shortcut_threads_ = 1;   // parallelism of shortcut pruning (see setShortcutThreads)
 
     // OR-Parallel external stop flag (nullable, owned by caller)
     std::atomic<bool>* external_stop_flag_ = nullptr;

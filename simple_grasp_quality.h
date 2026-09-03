@@ -7,15 +7,15 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// SimpleGraspQuality — 简化的抓取质量评估
+// SimpleGraspQuality — simplified grasp-quality evaluation
 //
-// 使用几何启发式代替完整的力封闭 (Force Closure) 分析:
-//   1. 接触点数量 >= 最小值
-//   2. 接触法线对称性 (两侧夹紧)
-//   3. 接触力分布均匀性
+// Uses geometric heuristics in place of a full force-closure analysis:
+//   1. Number of contact points >= minimum
+//   2. Contact-normal symmetry (clamping from both sides)
+//   3. Uniformity of the contact-force distribution
 //
-// 这是一个近似实现, 足以验证 GraspRRT 流程。
-// 如需真实力封闭分析, 可用 GraspIt! 或自行实现凸包算法。
+// This is an approximation, sufficient to validate the GraspRRT pipeline.
+// For real force-closure analysis, use GraspIt! or implement a convex-hull method.
 // ============================================================================
 
 class SimpleGraspQuality : public GraspQualityInterface {
@@ -23,7 +23,7 @@ public:
     SimpleGraspQuality() : score_(0.0f), valid_(false), min_contacts_(2) {}
 
     /**
-     * @param min_contacts 最少接触点数
+     * @param min_contacts minimum number of contact points
      */
     explicit SimpleGraspQuality(int min_contacts)
         : score_(0.0f), valid_(false), min_contacts_(min_contacts) {}
@@ -39,19 +39,19 @@ public:
         int n = static_cast<int>(contacts_.size());
         if (n < min_contacts_) return;
 
-        // ---- 评分组件 ----
+        // ---- Score components ----
 
-        // 1. 接触点数量评分 (越多越好, 上限 6 个)
+        // 1. Contact-count score (more is better, capped at 6)
         float count_score = std::min(1.0f, static_cast<float>(n) / 6.0f);
 
-        // 2. 法线对称性评分
-        //    好的抓取: 有来自不同方向的法线 (对握)
+        // 2. Normal-symmetry score
+        //    A good grasp: normals coming from opposing directions (antipodal)
         float symmetry_score = computeNormalSymmetry();
 
-        // 3. 接触分布评分 (接触点不要都集中在一个点)
+        // 3. Contact-spread score (contacts should not all cluster at one point)
         float spread_score = computeContactSpread();
 
-        // 4. 力的合理性 (所有接触力 > 0)
+        // 4. Force plausibility (all contact forces > 0)
         float force_score = 1.0f;
         for (const auto& c : contacts_) {
             if (c.force <= 0.0f) {
@@ -59,13 +59,13 @@ public:
             }
         }
 
-        // 综合评分 (加权平均)
+        // Combined score (weighted average)
         score_ = 0.3f * count_score +
                  0.4f * symmetry_score +
                  0.2f * spread_score +
                  0.1f * force_score;
 
-        // 力封闭判定: 对称性 > 0.3 且有足够接触点
+        // Force-closure verdict: symmetry > 0.3 and enough contact points
         valid_ = (symmetry_score > 0.3f && n >= min_contacts_);
     }
 
@@ -84,7 +84,7 @@ private:
     int min_contacts_;
 
     /**
-     * 计算法线对称性: 好的 antipodal grasp 应有近似相反的法线对
+     * Compute normal symmetry: a good antipodal grasp has near-opposite normal pairs
      */
     float computeNormalSymmetry() const {
         if (contacts_.size() < 2) return 0.0f;
@@ -92,7 +92,7 @@ private:
         float best_antisym = 0.0f;
         for (size_t i = 0; i < contacts_.size(); ++i) {
             for (size_t j = i + 1; j < contacts_.size(); ++j) {
-                // 两个法线的反对称程度: -n1·n2 越大越好 (理想值 = 1)
+                // Antisymmetry of the two normals: larger -n1*n2 is better (ideal = 1)
                 float dot = -contacts_[i].normal.dot(contacts_[j].normal);
                 if (dot > best_antisym) {
                     best_antisym = dot;
@@ -103,12 +103,12 @@ private:
     }
 
     /**
-     * 计算接触点的空间分布
+     * Compute the spatial spread of the contact points
      */
     float computeContactSpread() const {
         if (contacts_.size() < 2) return 0.0f;
 
-        // 计算接触点的最大跨度
+        // Compute the maximum span across contact points
         float max_dist = 0.0f;
         for (size_t i = 0; i < contacts_.size(); ++i) {
             for (size_t j = i + 1; j < contacts_.size(); ++j) {
@@ -117,7 +117,7 @@ private:
             }
         }
 
-        // 归一化 (假设 5cm 以上的跨度是理想的)
+        // Normalize (a span of 5 cm or more is assumed ideal)
         return std::min(1.0f, max_dist / 0.05f);
     }
 };

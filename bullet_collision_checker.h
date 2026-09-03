@@ -21,18 +21,18 @@
 namespace grasp_rrt {
 
 // ============================================================================
-// BulletCollisionChecker — 基于 Bullet3 的碰撞检测器 (per-thread world)
+// BulletCollisionChecker — Bullet3-based collision checker (per-thread world)
 //
-// 线程模型:
-//   构造时传入 num_threads，内部为每个线程持有一份独立的:
+// Threading model:
+//   num_threads is passed at construction; one independent copy per thread of:
 //     - btCollisionWorld + dispatcher + broadphase + config
-//     - 每个 link / obstacle / goal 的 btCollisionObject (存 transform 状态)
-//   共享 (只读) 的部分:
-//     - btCollisionShape (几何体)
-//     - FK 回调、连杆名、Goal 豁免前缀
+//     - a btCollisionObject per link / obstacle / goal (holds the transform state)
+//   Shared (read-only):
+//     - btCollisionShape (the geometry)
+//     - FK callback, link names, goal-exemption prefixes
 //
-//   isCollisionFree() 用 omp_get_thread_num() 选择自己那份 world。
-//   num_threads=1 时行为与单线程版完全一致。
+//   isCollisionFree() picks its own world via omp_get_thread_num().
+//   With num_threads=1 the behavior is identical to the single-threaded version.
 // ============================================================================
 
 class BulletCollisionChecker : public CollisionChecker {
@@ -53,7 +53,7 @@ public:
     }
 
     ~BulletCollisionChecker() {
-        // 先把所有 collision object 从各 world 里取出并 delete
+        // First remove every collision object from all worlds and delete them
         for (auto& w : worlds_) {
             for (auto* obj : w.robot_objs) {
                 w.world->removeCollisionObject(obj);
@@ -68,11 +68,11 @@ public:
                 delete obj;
             }
         }
-        // 然后 delete 共享的 shape (每个只 delete 一次)
+        // Then delete the shared shapes (each deleted exactly once)
         for (auto* s : all_shapes_) delete s;
     }
 
-    // ---- 注册机器人连杆碰撞体 ----
+    // ---- Register robot link collision bodies ----
 
     void addRobotLink(btCollisionShape* shape,
                       std::function<Matrix4f(const Config&)> fk_func,
@@ -133,7 +133,7 @@ public:
                      fk_func, name);
     }
 
-    // ---- 注册障碍物 (Class 1) ----
+    // ---- Register obstacles (Class 1) ----
 
     void addObstacle(btCollisionShape* shape, const Matrix4f& pose) {
         all_shapes_.push_back(shape);
@@ -157,7 +157,7 @@ public:
         addObstacle(new btCylinderShapeZ(btVector3(radius, radius, half_height)), pose);
     }
 
-    // ---- 注册目标物体 (Class 3) ----
+    // ---- Register the target object (Class 3) ----
 
     void addGoalObstacle(btCollisionShape* shape, const Matrix4f& pose) {
         all_shapes_.push_back(shape);
@@ -181,7 +181,7 @@ public:
         goal_exempt_link_prefixes_.push_back(link_name_prefix);
     }
 
-    // ---- CollisionChecker 接口 ----
+    // ---- CollisionChecker interface ----
 
     bool isCollisionFree(const Config& config) const override {
         collision_count_.fetch_add(1, std::memory_order_relaxed);
@@ -189,17 +189,17 @@ public:
         const int tid = getThreadId();
         const auto& w = worlds_[tid];
 
-        // 1. 更新该线程 world 的机器人连杆位姿
+        // 1. Update this thread's world with the robot link poses
         for (size_t i = 0; i < w.robot_objs.size(); ++i) {
             Matrix4f link_pose = link_fk_functions_[i](config);
             btTransform tr = eigenToBullet(link_pose);
             w.robot_objs[i]->setWorldTransform(tr);
         }
 
-        // 2. 执行碰撞检测
+        // 2. Run collision detection
         w.world->performDiscreteCollisionDetection();
 
-        // 3. 检查 contact manifolds
+        // 3. Inspect the contact manifolds
         int num_manifolds = w.dispatcher->getNumManifolds();
         for (int i = 0; i < num_manifolds; ++i) {
             auto* manifold = w.dispatcher->getManifoldByIndexInternal(i);
@@ -214,7 +214,7 @@ public:
             bool is_obstacle0 = isObstacleObject(w, body0);
             bool is_obstacle1 = isObstacleObject(w, body1);
 
-            // 机器人 - 障碍物 (Class 1)
+            // robot - obstacle (Class 1)
             if ((is_robot0 && is_obstacle1) || (is_robot1 && is_obstacle0)) {
                 for (int j = 0; j < num_contacts; ++j) {
                     if (manifold->getContactPoint(j).getDistance() < 0.01f) {
@@ -223,7 +223,7 @@ public:
                 }
             }
 
-            // 机器人 - 目标物体 (Class 3) — 带豁免
+            // robot - target object (Class 3) — with exemption
             bool is_goal0 = isGoalObstacleObject(w, body0);
             bool is_goal1 = isGoalObstacleObject(w, body1);
             if ((is_robot0 && is_goal1) || (is_robot1 && is_goal0)) {
@@ -238,7 +238,7 @@ public:
                 }
             }
 
-            // 自碰撞 (可选)
+            // self-collision (optional)
             if (check_self_collision_ && is_robot0 && is_robot1) {
                 int idx0 = getRobotObjectIndex(w, body0);
                 int idx1 = getRobotObjectIndex(w, body1);
@@ -255,7 +255,7 @@ public:
         return true;
     }
 
-    // ---- 配置 ----
+    // ---- Configuration ----
 
     void enableSelfCollisionCheck(bool enable) { check_self_collision_ = enable; }
     int getCollisionCheckCount() const {
@@ -282,23 +282,23 @@ private:
     bool                            check_self_collision_ = false;
     int                             num_threads_;
 
-    // Per-thread Bullet 状态
+    // Per-thread Bullet state
     std::vector<ThreadWorld> worlds_;
 
-    // 共享几何体 (每个 shape 只 delete 一次)
+    // Shared geometry (each shape deleted exactly once)
     std::vector<btCollisionShape*> all_shapes_;
 
-    // 共享元数据
+    // Shared metadata
     std::vector<std::function<Matrix4f(const Config&)>> link_fk_functions_;
     std::vector<std::string>                            link_names_;
     std::vector<std::string>                            goal_exempt_link_prefixes_;
 
-    // ---- 辅助 ----
+    // ---- Helpers ----
 
     int getThreadId() const {
 #ifdef _OPENMP
         int tid = omp_get_thread_num();
-        if (tid >= num_threads_) tid = 0;  // 兜底
+        if (tid >= num_threads_) tid = 0;  // fallback
         return tid;
 #else
         return 0;

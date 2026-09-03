@@ -1,16 +1,16 @@
-// measure_trajopt.cpp — 离线测量 TrajOpt 前后的路径指标
+// measure_trajopt.cpp — measure path metrics before and after TrajOpt, offline
 //
-// 背景:benchmark 里 SdfTrajOptimizer::optimize() 的结果只计时、不保存也不
-// 测量(benchmark_grasp_rrt.cpp:1552)。本工具读取已保存的原始 RRT 路径
-// (grasp_path_XX.csv),在同一 sparse-long 场景下离线跑一遍 TrajOpt,
-// 对**同一条路径**成对比较优化前 / 后的:
-//   - E4 平滑度:总转角、包络内转角、反转次数(>90° 转弯)
-//   - E1 各向异性:axial_contact_fraction(全臂)与 _ee(hand+link6)
-// 成对比较不受"无随机种子"的影响 —— 路径本身是固定输入。
+// Background: in the benchmark, the result of SdfTrajOptimizer::optimize() is only
+// timed, never stored or measured (benchmark_grasp_rrt.cpp:1552). This tool reads
+// already-saved raw RRT paths (grasp_path_XX.csv), re-runs TrajOpt offline in the
+// same sparse-long scene, and compares, on the SAME path, before vs after:
+//   - E4 smoothness: total turning, in-envelope turning, reversals (>90 deg turns)
+//   - E1 anisotropy: axial_contact_fraction (whole arm) and _ee (hand+link6)
+// The paired comparison is immune to the "no random seed" issue — the path is a fixed input.
 //
-// 用法:
-//   ./measure_trajopt <urdf> <结果目录1> [结果目录2 ...]
-// 输出:每个目录一行汇总(均值),外加逐路径 CSV(写到目录内
+// Usage:
+//   ./measure_trajopt <urdf> <result_dir_1> [result_dir_2 ...]
+// Output: one summary line (means) per directory, plus a per-path CSV (written into the directory
 // trajopt_metrics.csv)。
 
 #include <chrono>
@@ -34,12 +34,12 @@ using grasp_rrt::Config;
 using Eigen::Vector3f;
 
 static constexpr float kEnvelope = 0.05f;  // = GraspRrtConfig::sticky_envelope
-static constexpr int   kK        = 3;      // = benchmark 默认 sticky_k
+static constexpr int   kK        = 3;      // = the benchmark default sticky_k
 
 struct PathMetrics {
     float total_turn = 0, env_turn = 0;
     int   reversals = 0, env_segs = 0;
-    float axial = -1.0f, axial_ee = -1.0f;  // -1 = 无接触
+    float axial = -1.0f, axial_ee = -1.0f;  // -1 = no contact
     int   n_wp = 0;
 };
 
@@ -50,7 +50,7 @@ static PathMetrics measure(const std::vector<Config>& path,
     m.n_wp = static_cast<int>(path.size());
     if (path.size() < 2) return m;
 
-    // E1: 各向异性(与 benchmark 的 Group E 完全同式)
+    // E1: anisotropy (formula identical to the benchmark's Group E)
     double ax = 0, tot = 0, ax_ee = 0, tot_ee = 0;
     for (size_t i = 0; i + 1 < path.size(); ++i) {
         Config v = path[i + 1] - path[i];
@@ -62,7 +62,7 @@ static PathMetrics measure(const std::vector<Config>& path,
     if (tot    > 1e-9) m.axial    = static_cast<float>(ax / tot);
     if (tot_ee > 1e-9) m.axial_ee = static_cast<float>(ax_ee / tot_ee);
 
-    // E4: EE 路径平滑度(与 benchmark 同式)
+    // E4: EE path smoothness (same formula as the benchmark)
     std::vector<Vector3f> ee(path.size());
     for (size_t i = 0; i < path.size(); ++i) {
         robot->setJointValues(path[i]);
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
     }
     std::string urdf = argv[1];
 
-    // ---- 场景:与 benchmark 的 --sparse-long 完全一致 ----
+    // ---- Scene: identical to the benchmark's --sparse-long ----
     auto robot = std::make_shared<PandaPinocchioRobot>(urdf, "panda_hand");
     auto sdf   = std::make_shared<SdfCostEvaluator>(robot, 0.01f);
 
@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
             << "reversals_raw,reversals_opt,axial_raw,axial_opt,"
             << "axial_ee_raw,axial_ee_opt,trajopt_ms\n";
 
-        // 汇总累加器(axial 均值排除 -1 无接触路径,与 benchmark 口径一致)
+        // Summary accumulators (the axial mean excludes -1 no-contact paths, matching the benchmark)
         double s_et_r = 0, s_et_o = 0, s_tt_r = 0, s_tt_o = 0, s_ms = 0;
         double s_rv_r = 0, s_rv_o = 0;
         double s_ax_r = 0, s_ax_o = 0, s_ae_r = 0, s_ae_o = 0;

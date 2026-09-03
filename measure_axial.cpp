@@ -1,12 +1,12 @@
-// measure_axial.cpp — 在已保存路径上离线重算 axial 指标
+// measure_axial.cpp — recompute axial metrics offline on already-saved paths
 //
-// 用途:axial_ee 已改为跟随规划目标球集(erSphereActive)。本工具对
-// 历史 grasp_path_XX.csv 成对重算,不需要重跑 benchmark(避免无种子
-// 噪声)。场景 = --sparse-long(与 sl4x10 实验一致)。
+// Purpose: axial_ee now follows the planner's target sphere set (erSphereActive).
+// This tool recomputes the pair of metrics on historical grasp_path_XX.csv files
+// without re-running the benchmark (avoiding unseeded noise). Scene = --sparse-long
 //
-// 用法:
+// Usage:
 //   ./measure_axial <urdf> <dir1> <links1> [<dir2> <links2> ...]
-// links 形如 "panda_link7:0,panda_link5:2";"-" 表示默认(hand+link6)。
+// links looks like "panda_link7:0,panda_link5:2"; "-" means default (hand+link6).
 
 #include <cmath>
 #include <cstdio>
@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     auto robot = std::make_shared<PandaPinocchioRobot>(argv[1], "panda_hand");
     auto sdf   = std::make_shared<SdfCostEvaluator>(robot, 0.01f);
 
-    // ---- 场景:与 benchmark --sparse-long 一致 ----
+    // ---- Scene: identical to benchmark --sparse-long ----
     Vector3f trunk_c(0.7f, 0.0f, 0.75f);
     sdf->addRigidCylinder(trunk_c - Vector3f(0,0,0.75f),
                           trunk_c + Vector3f(0,0,0.75f), 0.08f);

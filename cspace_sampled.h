@@ -80,25 +80,25 @@ public:
         return 0.0f;
     }
 
-    // ---- 软枝穿透闸门 (penetration gate, 硬有效性约束) ----
+    // ---- Soft-branch penetration gate (hard validity constraint) ----
     //
-    // 判定构型 q 下机体探针对软枝的穿透深度是否全部在许可范围内:
-    //   pen = (r_枝 + r_体) − dist_轴  ≤  allow(t) = root + (tip−root)·t
-    // t = 接触点在枝上的弧长占比 (0 根 1 梢) —— 根部几乎不许挤压
-    // (会折断), 梢部可大幅拨开。与 benchmark 的 cut_violations 事后
-    // 指标同一判据, 但装进有效性层: 违规构型直接无效, 等价于撞到
-    // 刚体。苹果近旁豁免球内的接触不计 (嵌枝苹果的终端抓取固有)。
+    // Decide whether, at configuration q, every body-probe penetration into a soft branch
+    //   pen = (r_branch + r_body) - dist_axis  <=  allow(t) = root + (tip-root)*t
+    // stays within its allowance. t = arc-length fraction along the branch (0 root,
+    // 1 tip): near the root almost nothing may be squeezed (it snaps), near the tip
+    // the branch may be pushed aside. Same criterion as the benchmark's cut_violations
+    // metric, but in the validity layer. Contacts inside the apple exemption sphere are ignored.
     //
-    // true = 通过 (或闸门未启用)。默认恒真, SdfCostEvaluator 覆盖。
+    // true = passed (or gate disabled). Always true by default; SdfCostEvaluator overrides.
     virtual bool isPenetrationAllowed(const Eigen::VectorXf& /*q*/) const {
         return true;
     }
 
-    // ---- Unified refuse 的边级 severity ----
-    // 整条边 q1→q2 上 (探针, 软枝) 对的最大 severity(内压/深度预算 +
-    // G·轴滑/滑移预算)。>1 = 越权。0 = 未启用 / 无接触邻域。
-    // CSpaceSampled 以 sigmoid(gain·(score−threshold)) 概率拒绝,
-    // threshold 取 1(预算刚好用满时 50/50)。SdfCostEvaluator 覆盖。
+    // ---- Edge-level severity for unified refuse ----
+    // Maximum severity over all (probe, soft branch) pairs along the whole edge q1->q2
+    // (inward pressure / depth budget + G * axial slip / slip budget). >1 = over budget.
+    // 0 = disabled / no contact neighborhood. CSpaceSampled rejects with probability
+    // sigmoid(gain*(score-threshold)), threshold = 1 (50/50 exactly at full budget).
     virtual float computeEdgeUnifiedSeverity(
         const Eigen::VectorXf& /*q1*/,
         const Eigen::VectorXf& /*q2*/) const {
@@ -107,11 +107,11 @@ public:
 };
 
 // ============================================================================
-// CSpaceSampled — 对应 Python CSpaceSampled
-// 在 CSpace 基础上增加:
-//   - 离散碰撞检测 (DCD): isPathValid 沿路径递归检测中间点
-//   - 路径创建: 生成中间路径点
-//   - 边缘代价计算: 计算联合空间距离和软代价积分
+// CSpaceSampled — counterpart of the Python CSpaceSampled
+// Adds on top of CSpace:
+//   - discrete collision detection (DCD): isPathValid recursively checks midpoints
+//   - path creation: generates intermediate waypoints
+//   - edge cost computation: joint-space distance plus the soft-cost integral
 // ============================================================================
 
 class CSpaceSampled : public CSpace {
@@ -145,7 +145,7 @@ public:
         return calcDist(q1, q2);
     }
 
-    // ---- 步长配置 ----
+    // ---- Step-size configuration ----
 
     void setSamplingSize(float s) { sampling_size_paths_ = s; }
     void setSamplingSizeDCD(float s) { sampling_size_dcd_ = s; }
@@ -180,8 +180,8 @@ public:
     // computeEdgeAxialScoreTensor). Same sigmoid, same threshold/gain —
     // only the score function changes.
     void setEdgeRefuseTensorMode(bool on)    { edge_refuse_tensor_mode_ = on; }
-    // Unified 模式: score = computeEdgeUnifiedSeverity, threshold 语义变为
-    // "severity 预算占用" (默认 1.0), 其余 sigmoid 管线复用。
+    // Unified mode: score = computeEdgeUnifiedSeverity; threshold now means
+    // "fraction of severity budget used" (default 1.0), the rest of the sigmoid pipeline is reused.
     void setEdgeRefuseUnifiedMode(bool on)   { edge_refuse_unified_mode_ = on; }
     bool  getEdgeRefuseEnabled() const       { return edge_refuse_enabled_; }
     float getEdgeRefuseEnvelope() const      { return edge_refuse_envelope_; }
@@ -190,12 +190,12 @@ public:
     int   getEdgeRefuseK() const             { return edge_refuse_k_; }
     bool  getEdgeRefuseTensorMode() const    { return edge_refuse_tensor_mode_; }
 
-    // ---- 构型有效性 (覆盖基类: 追加软枝穿透闸门) ----
+    // ---- Configuration validity (overrides the base class: appends the soft-branch penetration gate) ----
     //
-    // 闸门在 Bullet 窄相之前跑 (~10 μs FK 探针 vs ~300-700 μs 几何检测),
-    // 与 edge refuse 相同的 cheap-check-first 模式。挂在 isConfigValid 上
-    // 意味着 DCD 递归的每个采样构型、下探阶段 (moveTowardsGoal 走同一个
-    // isPathValid)、以及随机起点生成全部自动继承 —— 约束只写一处。
+    // The gate runs before Bullet's narrow phase (~10 us of FK probes vs ~300-700 us
+    // of geometry checks), the same cheap-check-first pattern as edge refuse. Hanging
+    // it on isConfigValid means every DCD sample, the descent phase (moveTowardsGoal
+    // goes through the same isPathValid) and random start generation all inherit it
     bool isConfigValid(const Config& config,
                        bool check_borders = true,
                        bool check_collisions = true,
@@ -216,11 +216,11 @@ public:
     unsigned long long getPenGateChecks()  const { return pen_gate_checks_; }
     unsigned long long getPenGateRejects() const { return pen_gate_rejects_; }
 
-    // ---- 离散碰撞检测 (覆盖基类) ----
+    // ---- Discrete collision detection (overrides the base class) ----
 
     /**
-     * 对应 Python CSpaceSampled.isPathValid
-     * 递归中点检测: 先检查中点, 若有效则递归检查两半
+     * Counterpart of the Python CSpaceSampled.isPathValid
+     * Recursive midpoint check: test the midpoint first, then recurse into both halves if valid
      *
      * SPEED OPTIMIZATION: when edge refuse is enabled, we run the cheap
      * directional check (~15 μs) BEFORE the expensive geometric collision
@@ -253,8 +253,8 @@ public:
                 float p_reject = (x >= 0.0f)
                     ? 1.0f / (1.0f + std::exp(-x))
                     : std::exp(x) / (1.0f + std::exp(x));
-                // thread_local: isPathValid 在 OR-parallel 竞速与并行 shortcut
-                // 中被多线程并发调用, 共享成员 RNG 是数据竞争
+                // thread_local: isPathValid is called concurrently by the OR-parallel race
+                // and by parallel shortcutting; a shared member RNG would be a data race
                 static thread_local std::mt19937 rng{std::random_device{}()};
                 std::uniform_real_distribution<float> u(0.0f, 1.0f);
                 if (u(rng) < p_reject) {
@@ -264,9 +264,9 @@ public:
             }
         }
         // Step 2 (expensive, ~300-700 μs): geometric collision check.
-        // DCD 去重: 终点 q2 在此查一次, 中点在递归中各查一次 (q1 由调用方
-        // 保证有效: 树节点/上一路点)。旧版递归叶子会把每个中点作为子段
-        // 终点重复检查第二遍 —— 约一半碰撞检测在重验已证有效的构型。
+        // DCD deduplication: endpoint q2 is checked once here and each midpoint once during
+        // recursion (q1 is guaranteed valid by the caller: a tree node or the previous
+        // waypoint). The old recursion re-checked every midpoint as a sub-segment endpoint
         if (!isConfigValid(q2)) return false;
         return recursivePathCheck(q1, q2, 0);
     }
@@ -277,10 +277,10 @@ public:
     unsigned long long getEdgeRefuseHiScores() const { return er_hi_; }
     double getEdgeRefuseScoreSum() const { return er_score_sum_; }
 
-    // ---- 路径创建 (对应 Python createPath) ----
+    // ---- Path creation (counterpart of the Python createPath) ----
 
     /**
-     * 在 start 和 goal 之间生成中间路径点 (不做碰撞检测)
+     * Generate intermediate waypoints between start and goal (no collision checking)
      */
     ConfigPath createPath(const Config& start, const Config& goal) const {
         ConfigPath path;
@@ -298,9 +298,9 @@ public:
     }
 
     /**
-     * 对应 Python createPathUntilInvalid
-     * 沿路径添加中间点, 遇到碰撞时停止
-     * @return {有效路径点列表, 有效长度比例 0~1}
+     * Counterpart of the Python createPathUntilInvalid
+     * Append intermediate points along the path, stopping at the first collision
+     * @return {list of valid waypoints, valid length fraction 0~1}
      */
     std::pair<ConfigPath, float> createPathUntilInvalid(const Config& start,
                                                         const Config& goal) {
@@ -323,9 +323,9 @@ public:
     }
 
 private:
-    float sampling_size_paths_;  // 路径采样步长
-    float sampling_size_dcd_;    // DCD 碰撞检测步长
-    const int RECURSION_MAX_DEPTH = 24; // 极大提高递归深度，防止极细微路径被漏检
+    float sampling_size_paths_;  // path sampling step
+    float sampling_size_dcd_;    // DCD collision-checking step
+    const int RECURSION_MAX_DEPTH = 24; // deliberately deep, so that very thin path features are not missed
 
     std::shared_ptr<CostEvaluator> cost_evaluator_;
 
@@ -339,7 +339,7 @@ private:
     int   edge_refuse_k_         = 3;
     // false = legacy MAX aggregation; true = structure-tensor quadratic form
     bool  edge_refuse_tensor_mode_ = false;
-    // true = unified severity score (统一规则), 优先于 tensor/MAX
+    // true = unified severity score (unified rule), takes precedence over tensor/MAX
     bool  edge_refuse_unified_mode_ = false;
 
     // Edge-refuse telemetry
@@ -348,24 +348,24 @@ private:
     mutable unsigned long long er_hi_      = 0;
     mutable double er_score_sum_ = 0.0;
 
-    // Penetration-gate telemetry (闸门未启用时 rejects 恒 0; 与 er_ 计数
-    // 同款: 并行 batch 下允许非原子竞态, 仅作遥测)
+    // Penetration-gate telemetry (rejects stays 0 while the gate is disabled; same
+    // convention as the er_ counters: non-atomic races under parallel batch are fine, telemetry only)
     mutable unsigned long long pen_gate_checks_  = 0;
     mutable unsigned long long pen_gate_rejects_ = 0;
 
-    // (概率拒绝的 RNG 已改为 isPathValid 内的 thread_local —— 多线程
-    //  并发调用下共享成员 RNG 是数据竞争; 种子沿用 random_device 惯例)
+    // (the probabilistic-rejection RNG moved to a thread_local inside isPathValid —
+    //  a shared member RNG would be a data race under concurrent calls; seeding still follows the random_device convention)
 
     /**
-     * 递归路径碰撞检测
-     * 前置条件: q1、q2 均已被检查有效 (isPathValid 负责 q2, 调用方保证 q1)。
-     * 每个中点只在生成处检查一次, 基本情况无需再查端点 —— 避免旧版
-     * 叶子重复检查中点造成的 ~50% 冗余碰撞检测。检查的构型集合不变。
+     * Recursive path collision check
+     * Precondition: q1 and q2 have both already been validated (isPathValid handles q2, the caller guarantees q1).
+     * Each midpoint is checked exactly once where it is generated; the base case needs
+     * no endpoint re-check — this removes the ~50% redundant collision checks the old
      */
     bool recursivePathCheck(const Config& q1, const Config& q2, int depth) {
         float dist = calcDist(q1, q2, /*force_disable_weights=*/true);
 
-        // 基本情况: 步长足够小或达到最大深度, 两端点均已检查过
+        // Base case: step small enough or max depth reached; both endpoints already checked
         if (dist <= sampling_size_dcd_) return true;
         if (depth >= RECURSION_MAX_DEPTH) return true;
 

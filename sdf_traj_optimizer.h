@@ -12,8 +12,8 @@ namespace grasp_rrt {
 /**
  * SdfTrajOptimizer (Standalone Lite)
  * ---------------------------------
- * 基于 SDF 梯度的局部轨迹优化器。不依赖 OpenRAVE。
- * 直接利用项目的 Pinocchio 机器人模型和 SdfCostEvaluator。
+ * Local trajectory optimizer driven by SDF gradients. No OpenRAVE dependency.
+ * Uses the project's own Pinocchio robot model and SdfCostEvaluator directly.
  */
 class SdfTrajOptimizer {
 public:
@@ -26,7 +26,7 @@ public:
     };
 
     /**
-     * 针对 VFRRT 路径进行优化
+     * Optimize a VFRRT path
      */
     static std::vector<grasp_rrt::Config> optimize(
         const std::vector<grasp_rrt::Config>& raw_path,
@@ -38,9 +38,9 @@ public:
         int n_steps = traj.size();
         if (n_steps < 3) return traj;
 
-        // 获取机器人球体定义
-        // 注意：我们需要访问 SdfCostEvaluator 内部的机器人球体信息
-        // 由于 RobotSphere 是私有的，我们需要一个辅助结构或直接硬编码 Panda 的关键球
+        // Fetch the robot sphere definitions
+        // Note: we need access to the robot spheres held inside SdfCostEvaluator.
+        // RobotSphere is private, so we need a helper struct or hardcode Panda's key spheres
         struct SphereInfo { std::string link; Eigen::Vector3f offset; float radius; };
         std::vector<SphereInfo> spheres = {
             {"panda_link4", {0, 0, 0.05f}, 0.07f},
@@ -57,21 +57,21 @@ public:
                 grasp_rrt::Config q = traj[i];
                 grasp_rrt::Config grad_q = grasp_rrt::Config::Zero(7);
 
-                // 1. 设置关节角并更新 Pinocchio 数据
+                // 1. Set joint angles and refresh Pinocchio data
                 robot->setJointValues(q);
                 
-                // 2. 针对每个碰撞球计算梯度
+                // 2. Compute the gradient for each collision sphere
                 for (const auto& sp : spheres) {
                     Eigen::Matrix4f T = robot->getFramePose(sp.link);
                     Eigen::Vector3f p = T.block<3,1>(0,3) + T.block<3,3>(0,0) * sp.offset;
 
                     float dist = sdf_eval->querySdf(p) - sp.radius;
                     if (dist < cfg.safe_dist) {
-                        // 数值法计算 SDF 梯度 (指向远离障碍物)
+                        // Numerical SDF gradient (points away from the obstacle)
                         Eigen::Vector3f sdf_grad = calculateSdfGradient(sdf_eval, p);
                         
-                        // 获取该连杆对应位置的 Jacobian (3x7)
-                        // 注意：Panda 模型有 9 个自由度（包含手指），所以我们需要补零
+                        // Fetch the Jacobian at the link's position (3x7)
+                        // Note: the Panda model has 9 DOF (fingers included), so we zero-pad
                         Eigen::VectorXd full_q = Eigen::VectorXd::Zero(robot->getModel().nq);
                         for (int k = 0; k < std::min((int)q.size(), (int)full_q.size()); ++k) {
                             full_q(k) = q(k);
@@ -87,12 +87,12 @@ public:
                         
                         Eigen::Matrix<float, 3, 7> J_pos = J_6xN.topRows(3).leftCols(7).cast<float>();
                         
-                        // 关节空间梯度更新: dq = alpha * (safe - dist) * J^T * sdf_grad
+                        // Joint-space gradient update: dq = alpha * (safe - dist) * J^T * sdf_grad
                         grad_q += J_pos.transpose() * sdf_grad * (cfg.safe_dist - dist);
                     }
                 }
 
-                // 3. 应用梯度更新 + 平滑项
+                // 3. Apply the gradient update plus the smoothing term
                 grasp_rrt::Config smooth = (traj[i-1] + traj[i+1] - 2.0f * traj[i]);
                 next_traj[i] += cfg.alpha * grad_q + cfg.smooth_weight * smooth;
             }
