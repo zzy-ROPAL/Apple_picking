@@ -493,18 +493,11 @@ int main(int argc, char* argv[]) {
     int   edge_refuse_k         = 3;        // K nearest non-rigid branches per sphere (MAX mode only)
 
     // sample steering — angle-range cap on extension direction.
-    bool  sample_steering_enabled         = false;
-    bool  sample_steering_tensor          = false;  // --sample-steering-tensor: min-eigvec escape, no penetration skip
-    float sample_steering_overshoot       = 0.7f;   // --sample-steering-overshoot F: bend target = cos_cap*F (C)
-    float sample_steering_envelope        = 0.05f;
-    float sample_steering_cos_cap         = 0.866f;   // cos(30°)
-    int   sample_steering_k               = 5;        // structure tensor: K=5 nearest
-    float sample_steering_min_anisotropy  = 0.3f;     // skip if too isotropic
 
     bool  branch_stiffness   = false;   // --branch-stiffness: 软枝刚度场 (根硬梢软 + 轴心主导 + 下探偏置)
     bool  pen_gate_enabled   = false;   // --pen-gate: 软枝穿透闸门 (硬有效性约束, cut_violations 同判据进 isConfigValid)
     bool  pen_steer_enabled  = false;   // --pen-steer: depth steering (提议层切向投影, 隐含 --pen-gate)
-    bool  uni_refuse_enabled = false;   // --uni-refuse: 统一分支交互规则 (隐含 --pen-gate; 取代 --edge-refuse* / --sample-steering* / --pen-steer)
+    bool  uni_refuse_enabled = false;   // --uni-refuse: 统一分支交互规则 (隐含 --pen-gate; 取代 --edge-refuse* / --pen-steer)
     bool  nav_field_enabled  = false;   // --nav-field: 测地吸引场 (球冠多源洪泛; 远场绕行 + 近场随机冠点 + 测地下探门)
     float pen_gate_root_mm   = 15.0f;   // --pen-gate-root-mm F: allow(t=0), 枝根许可穿透 (mm)
     float pen_gate_tip_mm    = 75.0f;   // --pen-gate-tip-mm F:  allow(t=1), 枝梢许可穿透 (mm)
@@ -513,7 +506,6 @@ int main(int argc, char* argv[]) {
     float ff_gain            = 1.0f;    // --ff-gain F: 转向旋转偏置增益
     float ff_far             = 0.15f;   // --ff-far F: 激活外半径 (m)
     bool  shortcut_enabled   = false;   // --shortcut: 方法1 — 解路径 score-aware 捷径剪枝
-    bool  sticky_escape_sign = false;   // --sticky-escape-sign: change 1 — 逃逸箭头平局一致性(仅 tensor 转向)
     std::string er_links;               // --er-links "panda_link7:0,panda_link5:2": tensor ER 自定义计分球(链接名:球序号)
     float goal_fade_radius   = 0.0f;    // --goal-fade R: change 2 — 目标邻近衰减半径 (m), 0 = off
 
@@ -644,25 +636,13 @@ int main(int argc, char* argv[]) {
         } else if (a == "--pen-gate-ramp-t0" && i + 1 < argc) {
             pen_gate_ramp_t0 = std::max(0.0f, std::min(0.9f,
                                   static_cast<float>(std::atof(argv[++i]))));
-        } else if (a == "--sample-steering") {
-            sample_steering_enabled = true;
-        } else if (a == "--sample-steering-tensor") {
-            sample_steering_enabled = true;
-            sample_steering_tensor  = true;
-        } else if (a == "--sample-steering-overshoot" && i + 1 < argc) {
-            sample_steering_overshoot = std::max(0.05f, std::min(1.0f,
-                                  static_cast<float>(std::atof(argv[++i]))));
-        } else if (a == "--sample-steering-envelope" && i + 1 < argc) {
-            sample_steering_envelope = std::max(0.001f,
-                                              static_cast<float>(std::atof(argv[++i])));
-        } else if (a == "--sample-steering-cap" && i + 1 < argc) {
-            sample_steering_cos_cap = std::max(0.0f, std::min(1.0f,
-                                              static_cast<float>(std::atof(argv[++i]))));
-        } else if (a == "--sample-steering-k" && i + 1 < argc) {
-            sample_steering_k = std::max(1, std::atoi(argv[++i]));
-        } else if (a == "--sample-steering-anisotropy" && i + 1 < argc) {
-            sample_steering_min_anisotropy = std::max(0.0f, std::min(1.0f,
-                                              static_cast<float>(std::atof(argv[++i]))));
+        } else if (a.rfind("--sample-steering", 0) == 0) {
+            // sample steering 已移除(被 unified steering 取代)。显式报错,
+            // 避免旧脚本静默跑出"以为开了其实没开"的结果。
+            std::cerr << "ERROR: " << a
+                      << " 已移除 —— sample steering 由 unified steering "
+                         "(--uni-refuse) 取代。历史实现见 git 提交 fee46a1。\n";
+            return 1;
         } else if (a == "--branch-stiffness") {
             branch_stiffness = true;
         } else if (a == "--finger-first") {
@@ -673,8 +653,6 @@ int main(int argc, char* argv[]) {
             ff_far = std::max(0.06f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--shortcut") {
             shortcut_enabled = true;
-        } else if (a == "--sticky-escape-sign") {
-            sticky_escape_sign = true;
         } else if (a == "--er-links" && i + 1 < argc) {
             er_links = argv[++i];
         } else if (a == "--goal-fade" && i + 1 < argc) {
@@ -1300,12 +1278,11 @@ int main(int argc, char* argv[]) {
     // 依赖 pen gate 的探针/allow(t) —— 必须在 enablePenetrationGate 之后。
     if (uni_refuse_enabled) {
         if (edge_refuse_enabled || sticky_edge_refuse_enabled ||
-            sample_steering_enabled || pen_steer_enabled) {
+            pen_steer_enabled) {
             std::cout << "[Setup] WARNING: --uni-refuse 取代旧 edge refuse / "
-                         "sample steering / pen-steer, 已忽略这些旧开关\n";
+                         "pen-steer, 已忽略这些旧开关\n";
             edge_refuse_enabled = false;
             sticky_edge_refuse_enabled = false;
-            sample_steering_enabled = false;
             pen_steer_enabled = false;
         }
         // ax_tip 30→8mm(2026-07-28 用户澄清):枝梢的自由是"径向压入",
@@ -1372,13 +1349,6 @@ int main(int argc, char* argv[]) {
     config.use_shell_attractor = shell_attractor_enabled;
     config.branch_anisotropy_K_ax = branch_aniso_K_ax;   // Option A: axial drag on/off
     config.extension_coin_flip = extension_coin_flip;    // ablation: stochastic switch vs deterministic blend
-    config.sample_steering_enabled         = sample_steering_enabled;   // sample steering
-    config.sample_steering_tensor          = sample_steering_tensor;
-    config.sample_steering_overshoot       = sample_steering_overshoot;
-    config.sample_steering_envelope        = sample_steering_envelope;
-    config.sample_steering_cos_cap         = sample_steering_cos_cap;
-    config.sample_steering_k               = sample_steering_k;
-    config.sample_steering_min_anisotropy  = sample_steering_min_anisotropy;
     // Finger-first steering(纯引导,无拒绝)
     config.branch_stiffness_enabled = branch_stiffness;
     if (branch_stiffness) {
@@ -1403,11 +1373,6 @@ int main(int argc, char* argv[]) {
                   << config.ff_align_gain << ", zone " << config.ff_far
                   << "->" << config.ff_near << " m)\n";
     }
-    // Change 1: sticky escape sign(仅 tensor 转向使用)
-    config.sample_steering_sticky_sign     = sticky_escape_sign;
-    if (sticky_escape_sign) {
-        std::cout << "[Setup] STICKY ESCAPE SIGN ENABLED (change 1: tie-break consistency)\n";
-    }
     // Sticky-winner variants
     config.sticky_sample_steering_enabled              = sticky_sample_steering_enabled;
     config.sticky_edge_refuse_enabled            = sticky_edge_refuse_enabled;
@@ -1426,23 +1391,6 @@ int main(int argc, char* argv[]) {
     }
     if (sticky_sample_steering_enabled && sticky_edge_refuse_enabled) {
         std::cerr << "WARN: both --sticky-sample-steering and --sticky-edge-refuse set; sticky-sample-steering takes precedence.\n";
-    }
-    if (sample_steering_enabled) {
-        std::cout << "[Setup] Sample steering ENABLED ("
-                  << (sample_steering_tensor
-                        ? "TENSOR: A+B+C — descent steering, hand+link6, overshoot"
-                        : "legacy: dominant-eigvec cap, off at contact")
-                  << "):\n"
-                  << "        envelope        = " << sample_steering_envelope << " m\n"
-                  << "        cos_cap         = " << sample_steering_cos_cap
-                  << " (min angle ≈ "
-                  << static_cast<int>(std::acos(sample_steering_cos_cap) * 180.0f / M_PI)
-                  << "° off axis)\n";
-        if (!sample_steering_tensor) {
-            std::cout << "        K nearest       = " << sample_steering_k << "\n"
-                      << "        min anisotropy  = " << sample_steering_min_anisotropy
-                      << " (skip if (λmax−λmin)/λmax below)\n";
-        }
     }
 
     // ---- 9. Output directory ----

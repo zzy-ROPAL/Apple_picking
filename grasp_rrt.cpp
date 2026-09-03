@@ -381,7 +381,6 @@ bool GraspRrt::doPlanningCycleBatch(int K) {
         new_node->setEdgeCostToParent(c.edge_cost);
         // Sticky-winner: propagate chosen winner branch id (batch RRT path).
         new_node->setWinnerBranchId(c.chosen_winner_id);
-        new_node->setEscapeArrow(c.escape_arrow);   // change 1: 逃逸箭头继承链
         last_added_id_ = new_node->getId();
         processNode(new_node);
     }
@@ -721,7 +720,7 @@ static float computeAdaptiveStep(float dist_to_obstacle, float base_step) {
 }
 
 // ============================================================================
-// getOrComputeEEJacobian — sample steering (Optimization 1)
+// getOrComputeEEJacobian — 缓存节点的末端雅可比
 // ============================================================================
 // Returns the 3×7 EE Jacobian at the given node configuration, cached by
 // node_id. On cache miss, computes via PandaPinocchioRobot::computeSphere
@@ -794,12 +793,10 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     }
     if (q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
 
-    // 注:此处原有 sample steering(角度锥限幅,--sample-steering /
-    // --sample-steering-tensor)已删除。其职责由下方 unified steering
-    // (提议层投影,按损伤预算而非角度)完全覆盖:全臂 9 探针 × 全部软枝
-    // 逐对取 max,无 argmax/无 K 近邻,结构性无振荡,故不再需要逃逸箭头
-    // 迟滞。SdfCostEvaluator::applySamplingBias / applySamplingBiasTensor
-    // 仍保留在求解器侧(下探转向仍在用)。
+    // 注:此处原有 sample steering(角度锥限幅)已整体删除,实现亦不再
+    // 保留。其职责由下方 unified steering(提议层投影,按损伤预算而非
+    // 角度)完全覆盖:全臂 9 探针 × 全部软枝逐对取 max,无 argmax/无
+    // K 近邻,结构性无振荡。历史实现见 git 提交 fee46a1。
 
 #if 0  // ================== STICKY WINNER — DISABLED ======================
     // Superseded by the structure-tensor edge refuse (--edge-refuse-tensor).
@@ -940,7 +937,6 @@ ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
     // Sticky-winner: propagate the chosen winner branch id onto the new node.
     // If sticky mode was off, chosen_winner_id is -1 (harmless default).
     new_node->setWinnerBranchId(c.chosen_winner_id);
-    new_node->setEscapeArrow(c.escape_arrow);   // change 1: 逃逸箭头继承链
     last_added_id_ = new_node->getId();
 
     processNode(new_node);
@@ -1283,10 +1279,6 @@ MoveArmResult GraspRrt::moveTowardsGoal(CSpaceNodePtr start_node,
 
     auto last_extend_node = start_node;
 
-    // Change 1:每次下探开始时清空逃逸箭头记忆(下探是顺序过程,
-    // 箭头经成员变量在步间传递;见 createWorkspaceSamplingStep)。
-    descent_escape_arrow_.setZero();
-
     // 当前 TCP 到目标的笛卡尔距离
     Matrix4f current_tcp = Matrix4f::Identity();
     auto it = map_config_tcp_.find(last_extend_node->getId());
@@ -1400,33 +1392,6 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
     // 计算 delta
     Matrix4f delta_pose = goal_pose * current_pose.inverse();
     delta_pose.block<3,1>(0, 3) = goal_pose.block<3,1>(0, 3) - current_pose.block<3,1>(0, 3);
-
-    // ---- Sample steering, Improvement A: steer the grasp descent ----
-    // The DiffIK descent was previously unguided by steering, yet it
-    // produces the deepest branch contact (which dominates the
-    // penetration-weighted axial metric). Bend the workspace position
-    // delta away from nearby branch axes; the goal-progress guard inside
-    // steerWorkspaceDelta keeps the original step whenever bending would
-    // stall convergence toward the grasp pose.
-    if (config_.sample_steering_enabled && config_.sample_steering_tensor) {
-        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
-            cspace_->getCostEvaluator());
-        if (sdf_eval) {
-            Vector3f p_ee     = current_pose.block<3,1>(0, 3);
-            Vector3f dp       = delta_pose.block<3,1>(0, 3);
-            Vector3f goal_dir = goal_pose.block<3,1>(0, 3) - p_ee;
-            if (sdf_eval->steerWorkspaceDelta(
-                    p_ee, /*body_radius=*/0.06f, dp,
-                    config_.sample_steering_envelope,
-                    config_.sample_steering_cos_cap,
-                    config_.sample_steering_overshoot,
-                    goal_dir,
-                    config_.sample_steering_sticky_sign
-                        ? &descent_escape_arrow_ : nullptr)) {
-                delta_pose.block<3,1>(0, 3) = dp;
-            }
-        }
-    }
 
     // ---- Finger-first steering(纯引导,见 types.h 注释) ----
     // 侧向先触会把自由苹果拨走;这里在下探每步:

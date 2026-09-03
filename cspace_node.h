@@ -37,17 +37,9 @@ public:
     // Sticky-winner state: identifier of the "most dangerous branch" that was
     // being avoided when this node was created. -1 means no branch was in scope.
     // Propagates from parent to child; hysteresis at the extension primitive
-    // decides when to switch the winner. See applySamplingBias in
-    // sdf_cost_evaluator.h for use.
+    // decides when to switch the winner.
     int  getWinnerBranchId() const { return winner_branch_id_; }
     void setWinnerBranchId(int id) { winner_branch_id_ = id; }
-
-    // Change 1(sticky escape sign):本节点创建时转向所用的逃逸箭头
-    // (张量最小特征向量,已定向)。零向量 = 创建时不在任何枝条包络内
-    // (无记忆)。子节点扩展时与父箭头同侧定向 ±e_min,消除由平局裁决
-    // 产生的逐周期符号翻转。两个符号得分严格相等,继承零质量代价。
-    const Eigen::Vector3f& getEscapeArrow() const { return escape_arrow_; }
-    void setEscapeArrow(const Eigen::Vector3f& a) { escape_arrow_ = a; }
 
     // ---- 修改器 ----
     void setId(int id) { id_ = id; }
@@ -93,7 +85,6 @@ private:
     float  edge_cost_to_parent_;  // RRT*: 与父节点的边代价
 
     int    winner_branch_id_ = -1;  // sticky-winner: id of most-dangerous branch at creation
-    Eigen::Vector3f escape_arrow_ = Eigen::Vector3f::Zero();  // change 1: 转向逃逸箭头(零=无)
 
     std::vector<std::shared_ptr<CSpaceNode>> children_;
 };

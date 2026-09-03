@@ -192,35 +192,6 @@ struct GraspRrtConfig {
     // buildLocalAxisTensor. MUST stay 0.0 until then.
     float branch_anisotropy_K_ax        = 0.0f;
 
-    // ---- Sample steering ( angle-range cap on extension direction) ----
-    // When enabled, the RRT extension primitive applies an axial-cap to
-    // q_step_dir whenever the EE (panda_hand reference point) is within
-    // `sample_steering_envelope` of a branch surface. The cap reduces the
-    // motion component along the branch axis so the resulting EE motion
-    // stays at least `min_angle` away from the axis.
-    //
-    // Cheaper than edge refuse: each cycle produces a useful extension
-    // (no retries). Combined with a per-node Jacobian cache, per-cycle
-    // overhead is ~5-10 μs.
-    //
-    //   cos_cap = cos(min_angle) — maximum allowed |Δp̂·â|.
-    //   Default 0.866 (cos 30°): motion must be ≥ 30° off the branch axis.
-    bool  sample_steering_enabled       = false;
-    float sample_steering_envelope      = 0.05f;   // 5 cm pre-contact shell
-    float sample_steering_cos_cap       = 0.866f;  // cos(30°)
-    // Tensor variant (recommended): order-8 soft-max axial score with the
-    // unclamped depth-amplified weight, escape toward the MINIMUM
-    // eigenvector, no penetration skip. Fixes the legacy dominant-
-    // eigenvector degeneracy and the switch-off-at-contact defect. Also
-    // enables improvements A (grasp-descent steering) and B (link6 as a
-    // second steered sphere). When true, sample_steering_k /
-    // sample_steering_min_anisotropy are unused.
-    bool  sample_steering_tensor        = false;
-    // Improvement C: bend target = cos_cap * overshoot. 1.0 = land exactly
-    // on the allowed-cone boundary (old behavior, systematically the
-    // least-radial acceptable motion); 0.7 = land inside the cone,
-    // mimicking the interior-average that rejection resampling achieves.
-    float sample_steering_overshoot     = 0.7f;
     // ---- Branch stiffness(软枝刚度场,纯引导,无拒绝) ----
     // 物理模型:枝条是悬臂梁 —— 根部硬(推不动,硬推会折断),梢部软
     // (易拨开);越深入枝轴心,所需位移越大。编码为软枝斥力的
@@ -286,21 +257,6 @@ struct GraspRrtConfig {
     float ff_near               = 0.05f;   // w=1 内半径 (m)
     float ff_min_advance        = 0.3f;    // 前进分量最小保留比例
 
-    // Change 1(sticky escape sign,仅 tensor 转向):±e_min 得分严格
-    // 相等,旧规则用含噪提议方向定向导致逐周期符号抛硬币(之字形来源
-    // 之一)。开启后箭头沿树父子链/下探步序继承,平局裁决保持一致。
-    // 零质量代价 —— 与 sticky winner(不等分选项间的滞回)本质不同。
-    bool  sample_steering_sticky_sign   = false;
-
-    // Multi-branch handling: aggregate the K nearest branches inside envelope
-    // into a structure tensor M = Σ wᵢ âᵢ âᵢᵀ, then bias against M's dominant
-    // eigenvector. Falls back gracefully when fewer than K branches present.
-    //   K = 5: balances coverage and noise resistance in dense foliage.
-    //   min_anisotropy ∈ [0, 1]: skip bias when (λmax−λmin)/λmax < this. At
-    //     ~0.3 a clearly dominant axis exists; near 0 the geometry is too
-    //     isotropic to bias against meaningfully.
-    int   sample_steering_k              = 5;       // structure tensor: K=5 nearest
-    float sample_steering_min_anisotropy = 0.3f;    // skip if (λmax−λmin)/λmax below
 
     // ---- Sticky-winner (Upgrades A and B) ----
     // Two variants share the same axis-selection logic:

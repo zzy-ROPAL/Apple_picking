@@ -177,13 +177,11 @@ private:
         float      collision_time_ms = 0.0f;
         int        col_check_count_delta = 0;
         int        chosen_winner_id = -1;  // sticky-winner: id to store on new node
-        Vector3f   escape_arrow = Vector3f::Zero();  // change 1: 逃逸箭头,提交时写入新节点
     };
     ExtendCandidate extendVFRRTCompute(const Config& target);
 
-    // sample steering (Optimization 1): get cached EE Jacobian for a tree node,
-    // computing it on first use. Assumes robot is currently at the node's
-    // configuration when first computing.
+    // 取节点的缓存末端雅可比,首次使用时计算。假定机器人当前已处于该
+    // 节点构型。当前仅 #if 0 的 sticky-winner 块使用。
     MatrixXf getOrComputeEEJacobian(int node_id, const Config& q);
 
     // motion_dir: intended extension direction in joint space (e.g., q_rand−q_near).
@@ -330,11 +328,6 @@ private:
     int  cycles_;
     int  last_added_id_;
     int  col_checks_overall_;
-
-    // Change 1(sticky escape sign):抓取下探的逃逸箭头记忆。下探是
-    // 顺序过程(不走树节点),用成员变量在步间传递;每次 moveTowardsGoal
-    // 开始时清零。树扩展侧的记忆存在 CSpaceNode::escape_arrow_ 上。
-    Vector3f descent_escape_arrow_ = Vector3f::Zero();
 
     // 额外硬质障碍物
     Vector3f hard_obstacle_pos_     = Vector3f::Zero();
