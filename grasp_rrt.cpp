@@ -794,40 +794,12 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     }
     if (q_step_dir.norm() > 1e-6f) q_step_dir.normalize();
 
-    // ---- sample steering: angle-range cap (Optimizations 1-4) ----
-    // Cap the axial-vs-branch-axis component of q_step_dir when the EE is
-    // within envelope of a branch. Uses cached J_EE keyed by node id.
-    if (config_.sample_steering_enabled) {
-        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
-            cspace_->getCostEvaluator());
-        if (sdf_eval) {
-            const MatrixXf& J_EE = getOrComputeEEJacobian(nn->getId(), q_near);
-            // Ensure robot is at q_near so SDF / axis lookup matches.
-            robot_->setJointValues(q_near);
-            // Change 1:继承父节点的逃逸箭头;转向更新后的箭头随
-            // candidate 提交写入新节点(ExtendCandidate::escape_arrow)。
-            Vector3f escape_arrow = nn->getEscapeArrow();
-            bool applied = config_.sample_steering_tensor
-                ? sdf_eval->applySamplingBiasTensor(
-                      q_near, q_step_dir, J_EE,
-                      config_.sample_steering_envelope,
-                      config_.sample_steering_cos_cap,
-                      config_.sample_steering_overshoot,
-                      config_.sample_steering_sticky_sign ? &escape_arrow
-                                                          : nullptr)
-                : sdf_eval->applySamplingBias(
-                      q_near, q_step_dir, J_EE,
-                      config_.sample_steering_envelope,
-                      config_.sample_steering_cos_cap,
-                      config_.sample_steering_k,
-                      config_.sample_steering_min_anisotropy);
-            if (config_.sample_steering_sticky_sign)
-                cand.escape_arrow = escape_arrow;
-            if (applied && q_step_dir.norm() > 1e-6f) {
-                q_step_dir.normalize();
-            }
-        }
-    }
+    // 注:此处原有 sample steering(角度锥限幅,--sample-steering /
+    // --sample-steering-tensor)已删除。其职责由下方 unified steering
+    // (提议层投影,按损伤预算而非角度)完全覆盖:全臂 9 探针 × 全部软枝
+    // 逐对取 max,无 argmax/无 K 近邻,结构性无振荡,故不再需要逃逸箭头
+    // 迟滞。SdfCostEvaluator::applySamplingBias / applySamplingBiasTensor
+    // 仍保留在求解器侧(下探转向仍在用)。
 
 #if 0  // ================== STICKY WINNER — DISABLED ======================
     // Superseded by the structure-tensor edge refuse (--edge-refuse-tensor).
