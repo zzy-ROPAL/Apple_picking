@@ -55,8 +55,8 @@ public:
         // (Optimization B) so per-cycle anisotropy checks skip the
         // normalize() call. Zero for degenerate cylinders (p0 == p1).
         Eigen::Vector3f axis_unit = Eigen::Vector3f::Zero();
-        // 本段在所属枝条上的弧长占比区间 [t0, t1](0 = 枝根, 1 = 枝梢)。
-        // 用于 branch-stiffness 刚度模型(根部更"硬")。单段枝默认 0..1。
+        // Arc-length fraction interval [t0, t1] of this segment along its branch (0 = root, 1 = tip).
+        // Used by the branch-stiffness model (the root is "stiffer"). A single-segment branch defaults to 0..1.
         float t0 = 0.0f;
         float t1 = 1.0f;
     };
@@ -68,13 +68,13 @@ public:
         int frame_id;
     };
 
-    // voxel_size: 体素分辨率 (m)，默认 1cm，精度和速度的较好平衡点
+    // voxel_size: voxel resolution (m); default 1 cm, a good accuracy/speed balance
     explicit SdfCostEvaluator(std::shared_ptr<RobotInterface> robot,
                               float voxel_size = 0.01f)
         : robot_(robot), voxel_size_(voxel_size),
           nx_(0), ny_(0), nz_(0), sdf_built_(false) {}
 
-    // ---- 与 TreeCanopyCostEvaluator 相同的构建接口 ----
+    // ---- Same construction interface as TreeCanopyCostEvaluator ----
 
     void addBranchCylinder(const Eigen::Vector3f& p0,
                            const Eigen::Vector3f& p1,
@@ -90,10 +90,10 @@ public:
         sdf_built_ = false;
     }
 
-    // branch-stiffness 刚度模型:软枝上 t 处的刚度系数。
-    //   t = 0(枝根,悬臂最硬)→ k_root;t = 1(枝梢,易弯)→ k_tip。
-    //   物理动机:真实枝条是悬臂梁,根部位移代价远大于梢部;把
-    //   "从中段/根部硬切过去会折断枝条"编码成场强差异。
+    // branch-stiffness model: stiffness coefficient at position t on a soft branch.
+    //   t = 0 (root, stiffest cantilever) -> k_root;  t = 1 (tip, bends easily) -> k_tip.
+    //   Physical motivation: a real branch is a cantilever beam, so displacing the root costs
+    //   far more than the tip; this encodes "cutting through the root/middle snaps the branch" as field strength.
     static float branchStiffness(float t, float k_root, float k_tip) {
         t = std::max(0.0f, std::min(1.0f, t));
         return k_root + (k_tip - k_root) * t;
@@ -115,17 +115,17 @@ public:
         sdf_built_ = false;
     }
 
-    // 只读访问全部圆柱障碍 (含 rigid 标志)。用于把场景几何导出给
-    // Isaac Sim 对齐 (scene_layout.json), 单一出口, 覆盖所有场景变体。
+    // Read-only access to all cylinder obstacles (rigid flag included). Used to export the scene
+    // geometry for Isaac Sim alignment (scene_layout.json): a single exit point covering every scene variant.
     const std::vector<CylinderObstacle>& getCylinders() const { return cylinders_; }
 
-    // ---- 软枝穿透闸门 (penetration gate) ----
+    // ---- Soft-branch penetration gate ----
     //
-    // 把 benchmark 事后指标 cut_violations 的同一判据装进有效性层:
-    //   pen = (r_枝 + r_探针) − dist_轴 ≤ allow(t)  (斜坡见 penAllowAt)
-    // 探针集与该指标一致 (link3…hand 共 9 个体积化探针)。豁免球
-    // (exempt_center, exempt_radius) 内的接触不计 —— 嵌枝苹果的终端
-    // 抓取固有接触。allow 单位: 米。
+    // Lifts the criterion of the benchmark's post-hoc cut_violations metric into the validity layer:
+    //   pen = (r_branch + r_probe) - dist_axis <= allow(t)  (see penAllowAt for the ramp)
+    // The probe set matches that metric (link3...hand, 9 volumetric probes). Contacts inside the
+    // exemption sphere (exempt_center, exempt_radius) are ignored — they are inherent to the terminal
+    // grasp of a branch-embedded apple. allow is in meters.
     void enablePenetrationGate(float allow_root, float allow_tip,
                                const Eigen::Vector3f& exempt_center,
                                float exempt_radius) {
@@ -153,11 +153,11 @@ public:
         }
     }
 
-    // allow(t): 许可穿透斜坡。根区平台 [0, ramp_t0] 一律取根部值,
-    // 斜坡只覆盖 [ramp_t0, 1] —— 即枝的前 1/4 (默认) 整段按根部刚度
-    // 对待, 后 3/4 线性放宽到梢部许可 (用户 8-09 参数化)。
-    // 唯一的 allow(t) 定义: 闸门/steering/severity/nav 过路费共用,
-    // 各层判据不脱节。
+    // allow(t): the permitted-penetration ramp. The root plateau [0, ramp_t0] always takes the root
+    // value and the ramp covers only [ramp_t0, 1] — i.e. the first quarter of the branch (by default)
+    // is treated at root stiffness and the remaining three quarters relax linearly toward the tip.
+    // This is the ONLY definition of allow(t): the gate, steering, severity and the nav toll all share it,
+    // so the layers cannot drift apart.
     float penAllowAt(float t_arc) const {
         float u = (t_arc - pen_gate_ramp_t0_)
                 / std::max(1e-3f, 1.0f - pen_gate_ramp_t0_);
@@ -167,13 +167,13 @@ public:
              + (pen_gate_allow_tip_ - pen_gate_allow_root_) * u;
     }
 
-    // 斜坡起点 (根区平台宽度, 弧长占比)。0 = 旧行为 (全枝线性)。
+    // Ramp start (width of the root plateau, arc-length fraction). 0 = old behavior (linear along the whole branch).
     void setPenGateRampT0(float t0) {
         pen_gate_ramp_t0_ = std::min(0.95f, std::max(0.0f, t0));
     }
 
-    // 闸门判定。恒真当未启用。FK 走 per-thread 机器人状态, 与
-    // computeEdgeAxialScore 相同的并行安全模式。
+    // Gate decision. Always true while disabled. FK goes through the per-thread robot state,
+    // the same parallel-safe pattern as computeEdgeAxialScore.
     bool isPenetrationAllowed(const Eigen::VectorXf& q) const override {
         if (!pen_gate_enabled_) return true;
         robot_->setJointValues(q);
@@ -182,10 +182,10 @@ public:
             Eigen::Vector3f pp = pose.block<3,1>(0,3)
                                + pose.block<3,3>(0,0) * pr.off;
             if ((pp - pen_gate_exempt_center_).squaredNorm() < pen_gate_exempt_r2_)
-                continue;   // 苹果近旁豁免
+                continue;   // exempt near the apple
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;              // 仅软枝
-                if (cyl.axis_unit.squaredNorm() < 0.25f) continue; // 退化跳过
+                if (cyl.exclude_from_aniso) continue;              // soft branches only
+                if (cyl.axis_unit.squaredNorm() < 0.25f) continue; // skip degenerate
                 Eigen::Vector3f seg = cyl.p1 - cyl.p0;
                 float seg_sq = seg.squaredNorm();
                 float u = (seg_sq > 1e-9f)
@@ -197,9 +197,9 @@ public:
                 if (pen <= 0.0f) continue;
                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                 float allow = penAllowAt(t_arc);
-                // 轴心硬禁区:探针中心永不进入轴线 axis_clear 内 ——
-                // allow 封顶为 (R+r−clear),枝梢也不许"贴轴穿过"。
-                // 确定性位置规则(接受概率恒 0),概率滤波给不了这种保证。
+                // Hard forbidden core around the axis: a probe center never enters within axis_clear of
+                // the axis — allow is capped at (R+r-clear), so even the tip forbids "sliding along the axis".
+                // A deterministic positional rule (acceptance probability exactly 0); probabilistic filtering cannot give that guarantee.
                 float allow_cap = (cyl.radius + pr.r)
                     - pen_gate_axis_clear_ * (1.0f - t_arc);
                 if (allow > allow_cap) allow = allow_cap;
@@ -211,15 +211,15 @@ public:
 
     bool isPenetrationGateEnabled() const { return pen_gate_enabled_; }
 
-    // ---- Depth steering(闸门的提议层配套,见 types.h 注释) ----
+    // ---- Depth steering (proposal-layer companion to the gate, see the note in types.h) ----
     //
-    // 把 C-space 提议方向投影到许可穿透边界的切向。对每个接触邻域内
-    // (体表距接触面 < margin) 的 (探针, 软枝) 对:
-    //   g  = Jᵀ·(−r̂)          — 使该探针最快加深的关节方向 (未归一)
-    //   v  = step · dir·g      — 本步预测加深量 (m, 一阶线性化)
-    //   v > κ·slack 时 dir 减去沿 ĝ 的超出分量 (slack = allow(t) − pen)
-    // 逐约束顺序投影 (多接触时为近似)。调用后 dir 未归一化, 由调用方
-    // renormalize。返回是否弯折 (遥测)。
+    // Projects the C-space proposal direction onto the tangent of the permitted-penetration boundary.
+    // For every (probe, soft branch) pair in the contact neighborhood (body surface within margin):
+    //   g  = J^T * (-r_hat)   — the joint direction that deepens this probe fastest (unnormalized)
+    //   v  = step * dir . g   — predicted deepening this step (m, first-order linearization)
+    //   when v > kappa*slack, subtract the excess along g_hat from dir (slack = allow(t) - pen)
+    // Constraints are projected sequentially (an approximation with multiple contacts). On return dir is
+    // not normalized; the caller renormalizes. Returns whether a bend happened (telemetry).
     bool applyDepthSteering(const Eigen::VectorXf& q,
                             Eigen::VectorXf& q_step_dir,
                             float step, float safety, float margin) const {
@@ -245,10 +245,10 @@ public:
                     : 0.0f;
                 Eigen::Vector3f radial = pp - (cyl.p0 + u * seg);
                 float dist = radial.norm();
-                if (dist <= 1e-4f) continue;               // 贴轴退化, 闸门处理
-                float surf = cyl.radius + pr.r;            // pen = 0 的接触面
-                if (dist - surf > margin) continue;        // 不在接触邻域
-                float pen = surf - dist;                   // 可为负 (未接触)
+                if (dist <= 1e-4f) continue;               // degenerate on the axis, handled by the gate
+                float surf = cyl.radius + pr.r;            // the contact surface where pen = 0
+                if (dist - surf > margin) continue;        // outside the contact neighborhood
+                float pen = surf - dist;                   // may be negative (no contact)
                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                 float allow = penAllowAt(t_arc);
                 float slack = allow - std::max(pen, 0.0f);
@@ -261,7 +261,7 @@ public:
                 float gn = g.norm();
                 if (gn < 1e-6f) continue;
 
-                float v   = step * q_step_dir.dot(g);      // 预测加深 (m)
+                float v   = step * q_step_dir.dot(g);      // predicted deepening (m)
                 float lim = safety * slack;
                 if (v > lim) {
                     q_step_dir -= ((v - lim) / (step * gn)) * (g / gn);
@@ -273,9 +273,9 @@ public:
         return bent;
     }
 
-    // 下探阶段的工作空间版:只夹持手部探针 (下探由手领进枝丛;臂上
-    // 探针仍由闸门兜底)。robot 须已 setJointValues 到当前构型。
-    // dp 为 EE 位置增量;夹掉超出分量后保持原步幅 (切向滑移)。
+    // Workspace variant for the descent phase: only the hand probes are clamped (the hand leads into
+    // the foliage; arm probes are still backed by the gate). robot must already be setJointValues to q.
+    // dp is the EE position increment; after clipping the excess the step magnitude is preserved (tangential slide).
     bool applyDepthSteeringDescent(Eigen::Vector3f& dp,
                                    float safety, float margin) const {
         if (!pen_gate_enabled_ || pen_probes_.empty()) return false;
@@ -283,7 +283,7 @@ public:
         if (dpn < 1e-9f) return false;
         bool bent = false;
         for (const auto& pr : pen_probes_) {
-            if (pr.fid != pen_gate_hand_fid_) continue;    // 仅手部探针
+            if (pr.fid != pen_gate_hand_fid_) continue;    // hand probes only
             Eigen::Matrix4f pose = robot_->getFramePoseById(pr.fid);
             Eigen::Vector3f pp = pose.block<3,1>(0,3)
                                + pose.block<3,3>(0,0) * pr.off;
@@ -309,8 +309,8 @@ public:
                 float slack = allow - std::max(pen, 0.0f);
                 if (slack < 0.0f) slack = 0.0f;
 
-                Eigen::Vector3f deep = -(radial / dist);   // 加深方向
-                float v   = dp.dot(deep);                  // 本步加深量 (m)
+                Eigen::Vector3f deep = -(radial / dist);   // deepening direction
+                float v   = dp.dot(deep);                  // deepening this step (m)
                 float lim = safety * slack;
                 if (v > lim) {
                     dp -= (v - lim) * deep;
@@ -320,7 +320,7 @@ public:
         }
         if (bent) {
             float bn = dp.norm();
-            if (bn > 1e-9f) dp *= dpn / bn;                // 保幅值: 切向滑移
+            if (bn > 1e-9f) dp *= dpn / bn;                // preserve magnitude: tangential slide
             pen_steer_bends_++;
         }
         return bent;
@@ -330,16 +330,16 @@ public:
     unsigned long long getDepthSteerCalls() const { return pen_steer_calls_; }
     unsigned long long getDepthSteerBends() const { return pen_steer_bends_; }
 
-    // ---- Unified refuse(统一分支交互规则,见 types.h 注释) ----
+    // ---- Unified refuse (unified branch-interaction rule, see the note in types.h) ----
     //
-    // 单一运动锥替代 {tensor edge refuse + sample steering + depth
-    // steering}:对接触邻域内每个 (探针, 软枝) 对
+    // A single motion cone replacing {tensor edge refuse + sample steering + depth
+    // steering}: for every (probe, soft branch) pair in the contact neighborhood
     //   severity = v_in / (κ·slack) + G · v_ax / ax_budget
-    //   v_in = 步内径向内压 (m), v_ax = 步内轴向滑移 (m)
-    //   G    = 预接触 η·(1 − surf/env)(接近整形: 从侧面接近)
-    //          接触后 η + (1−η)·min(1, pen/allow)(拖锯惩罚随深度)
-    // severity > 1 时把内压/轴滑分量各乘 1/severity(线性 → 收缩后
-    // severity = 1),剩余分量 ≈ 环向。需先 enablePenetrationGate。
+    //   v_in = radial inward pressure this step (m), v_ax = axial slip this step (m)
+    //   G    = before contact: eta*(1 - surf/env)  (approach shaping: come in from the side)
+    //          after contact:  eta + (1-eta)*min(1, pen/allow)  (saw penalty grows with depth)
+    // When severity > 1, the pressure and slip components are each multiplied by 1/severity (linear,
+    // so after shrinking severity = 1), leaving roughly hoop motion. Requires enablePenetrationGate first.
     void enableUnifiedRefuse(float env, float eta,
                              float ax_root, float ax_tip,
                              float safety, float clamp_target = 0.7f) {
@@ -353,8 +353,8 @@ public:
     }
     bool isUnifiedRefuseEnabled() const { return uni_enabled_; }
 
-    // C-space 版(RRT 扩展原语):dir 为归一化提议方向,step 为实际
-    // 步长。返回是否弯折;弯折后 dir 未归一化,调用方 renormalize。
+    // C-space variant (the RRT extension primitive): dir is the normalized proposal direction, step is
+    // the actual step size. Returns whether a bend happened; after bending dir is unnormalized, caller renormalizes.
     bool applyUnifiedSteering(const Eigen::VectorXf& q,
                               Eigen::VectorXf& q_step_dir,
                               float step) const {
@@ -383,15 +383,15 @@ public:
                 if (J.rows() != 3 || J.cols() != q_step_dir.size()) continue;
                 Eigen::VectorXf g_in = J.transpose() * (-r_hat);
                 Eigen::VectorXf g_ax = J.transpose() * cyl.axis_unit;
-                float s_in = q_step_dir.dot(g_in);   // 内压速率 (m / 单位步)
-                float s_ax = q_step_dir.dot(g_ax);   // 轴滑速率 (带符号)
+                float s_in = q_step_dir.dot(g_in);   // inward-pressure rate (m per unit step)
+                float s_ax = q_step_dir.dot(g_ax);   // axial-slip rate (signed)
                 float v_in = step * std::max(0.0f, s_in);
                 float v_ax = step * std::fabs(s_ax);
                 float b_in = std::max(uni_safety_ * slack, 1e-4f);
                 float sev  = h_in * v_in / b_in + G * v_ax / ax_b;
                 if (sev <= uni_clamp_) continue;
 
-                // 收缩两个越权分量到夹持目标(severity 对二者线性)
+                // Shrink both over-budget components to the clamp target (severity is linear in both)
                 float keep = uni_clamp_ / sev;
                 float gin2 = g_in.squaredNorm();
                 if (s_in > 0.0f && gin2 > 1e-12f)
@@ -406,8 +406,8 @@ public:
         return bent;
     }
 
-    // 下探版(工作空间):dp 为 EE 位置增量;仅手部探针(下探由手领进,
-    // 臂上仍由闸门兜底)。收缩后保持原步幅(环向滑移)。
+    // Descent variant (workspace): dp is the EE position increment; hand probes only (the hand leads
+    // the way in, the arm is still backed by the gate). Magnitude is preserved after shrinking (hoop slide).
     bool applyUnifiedSteeringDescent(Eigen::Vector3f& dp) const {
         if (!uni_enabled_ || !pen_gate_enabled_ || pen_probes_.empty())
             return false;
@@ -448,14 +448,14 @@ public:
         return bent;
     }
 
-    // 边级 severity(有效性层配套):对整条边 q1→q2 的探针位移求
-    // 最大 pair severity。CSpaceSampled 以 sigmoid(gain·(score−1))
-    // 概率拒绝(与旧 edge refuse 同管线,阈值移到 1)。
+    // Edge-level severity (companion to the validity layer): take the maximum pair severity over the
+    // probe displacement along the whole edge q1->q2. CSpaceSampled rejects with probability
+    // sigmoid(gain*(score-1)) (same pipeline as the old edge refuse, with the threshold moved to 1).
     float computeEdgeUnifiedSeverity(const Eigen::VectorXf& q1,
                                      const Eigen::VectorXf& q2) const override {
         if (!uni_enabled_ || !pen_gate_enabled_ || pen_probes_.empty())
             return 0.0f;
-        // 探针位移:q1 → q2 两次 FK
+        // Probe displacement: two FK evaluations, q1 -> q2
         std::vector<Eigen::Vector3f> p1(pen_probes_.size()), p2(pen_probes_.size());
         robot_->setJointValues(q1);
         for (size_t i = 0; i < pen_probes_.size(); ++i) {
@@ -502,11 +502,11 @@ public:
         sphere_jac_cache_.emplace_back(3, robot_->getDimension());
     }
 
-    // ---- 建表 ----
+    // ---- Build ----
 
-    // 根据所有圆柱的几何范围自动计算包围盒，再向外扩展 padding 米，
-    // 然后对整个网格逐体素计算到最近圆柱的距离并缓存。
-    // padding 应 >= 最大机器人球半径 + 一定余量，确保球在接近时能拿到正确梯度。
+    // Derive the bounding box automatically from the extent of all cylinders, expand it outward by
+    // padding meters, then compute and cache the distance to the nearest cylinder for every voxel.
+    // padding should be >= the largest robot sphere radius plus margin, so spheres get correct gradients on approach.
     void buildSdf(float padding = 0.40f) {
         if (cylinders_.empty()) {
             std::cerr << "[SDF] WARNING: No cylinders — SDF trivially empty.\n";
@@ -514,7 +514,7 @@ public:
             return;
         }
 
-        // 1. 从圆柱几何自动推导包围盒
+        // 1. Derive the bounding box from the cylinder geometry
         Eigen::Vector3f bb_min = Eigen::Vector3f::Constant( std::numeric_limits<float>::max());
         Eigen::Vector3f bb_max = Eigen::Vector3f::Constant(-std::numeric_limits<float>::max());
         for (const auto& cyl : cylinders_) {
@@ -525,7 +525,7 @@ public:
         bbox_min_ = bb_min - Eigen::Vector3f::Constant(padding);
         bbox_max_ = bb_max + Eigen::Vector3f::Constant(padding);
 
-        // 2. 计算网格尺寸
+        // 2. Compute the grid dimensions
         Eigen::Vector3f extent = bbox_max_ - bbox_min_;
         nx_ = static_cast<int>(std::ceil(extent.x() / voxel_size_)) + 1;
         ny_ = static_cast<int>(std::ceil(extent.y() / voxel_size_)) + 1;
@@ -540,7 +540,7 @@ public:
                   << total * sizeof(float) / 1024.0f / 1024.0f << " MB)\n"
                   << "[SDF] Building...  (cylinders=" << cylinders_.size() << ")\n";
 
-        // 3. 逐体素填充最小有符号距离 (OpenMP 并行化, embarrassingly parallel)
+        // 3. Fill in the minimum signed distance per voxel (OpenMP parallel, embarrassingly parallel)
         sdf_grid_.resize(total);
         auto t_start = std::chrono::steady_clock::now();
 
@@ -696,10 +696,10 @@ public:
 
         for (size_t k = 0; k < spheres_.size(); ++k) {
             const auto& rs = spheres_[k];
-            // engagement_only 现跟随规划目标球集(erSphereActive):默认
-            // hand+link6;--er-links 自定义时按自定义集合计。注意:这使
-            // axial_ee 变成"规划器是否保护了自己的目标"的自评指标,
-            // 不同球集的 arm 之间不再直接可比。
+            // engagement_only now follows the planner's target sphere set (erSphereActive): by default
+            // hand+link6; with a custom --er-links it follows that set. Note this makes axial_ee a
+            // self-assessment of "did the planner protect its own targets", so arms with different
+            // sphere sets are no longer directly comparable.
             if (engagement_only && !erSphereActive(k)) continue;
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
             Eigen::Vector3f p = pose.block<3,1>(0,3)
@@ -1040,19 +1040,19 @@ public:
     //      selection-free: no argmax, nothing flips at branch handoff.
     // ------------------------------------------------------------------
     // ------------------------------------------------------------------
-    // 自定义 tensor edge refuse 的计分球集合(实验用)
+    // Custom scoring-sphere set for tensor edge refuse (experimental)
     //
-    // sel = {链接名, 该链接上第几个球(0 起,按 addRobotSphere 顺序)}。
-    // 必须在所有 addRobotSphere 之后调用;空集合 = 恢复默认
-    // (panda_hand + panda_link6 的全部球)。只影响 tensor 模式;
-    // legacy MAX 模式仍固定 hand+link6。
+    // sel = {link name, index of the sphere on that link (0-based, in addRobotSphere order)}.
+    // Must be called after all addRobotSphere calls; an empty set restores the default
+    // (all spheres of panda_hand + panda_link6). Affects tensor mode only;
+    // legacy MAX mode stays fixed at hand+link6.
     // ------------------------------------------------------------------
     void setEdgeRefuseSphereSet(
         const std::vector<std::pair<std::string, int>>& sel) {
         if (sel.empty()) { er_sphere_mask_.clear(); return; }
         er_sphere_mask_.assign(spheres_.size(), 0);
         for (size_t k = 0; k < spheres_.size(); ++k) {
-            // 该球在其链接上的序号
+            // Index of this sphere on its link
             int idx = 0;
             for (size_t j = 0; j < k; ++j)
                 if (spheres_[j].link_name == spheres_[k].link_name) ++idx;
@@ -1062,7 +1062,7 @@ public:
         }
     }
 
-    // tensor edge refuse:第 k 个球是否参与计分
+    // tensor edge refuse: does sphere k participate in scoring
     bool erSphereActive(size_t k) const {
         if (!er_sphere_mask_.empty()) return er_sphere_mask_[k] != 0;
         const auto& rs = spheres_[k];
@@ -1090,7 +1090,7 @@ public:
         // Evaluate at q_new.
         robot_->setJointValues(q_new);
         float best = 0.0f;
-        // Change 2:hand 球位置,用于末尾的目标邻近衰减 g
+        // Change 2: hand sphere position, used for the goal-proximity fade g at the end
         Eigen::Vector3f p_hand = Eigen::Vector3f::Zero();
         bool hand_seen = false;
         for (size_t k = 0; k < spheres_.size(); ++k) {
@@ -1100,7 +1100,7 @@ public:
             Eigen::Matrix4f pose = robot_->getFramePoseById(rs.frame_id);
             Eigen::Vector3f p_curr = pose.block<3,1>(0,3)
                                    + pose.block<3,3>(0,0) * rs.offset;
-            // 注:自定义球集不含 hand 时,goal fade 不生效(fade 需 hand 位置)
+            // Note: if the custom sphere set has no hand sphere, the goal fade is inactive (it needs the hand position)
             if (!hand_seen && rs.link_name == "panda_hand"
                 && rs.offset.norm() < 1e-4f) {
                 p_hand = p_curr;
@@ -1137,8 +1137,8 @@ public:
             float s = std::sqrt(std::sqrt(std::sqrt(acc)));   // ^(1/8)
             if (s > best) best = s;
         }
-        // Change 2:目标邻近衰减 —— 苹果近旁最后几厘米的接近方向由抓取
-        // 位姿决定,拒绝只会造成不可达(完备性),按 g 线性退场。
+        // Change 2: goal-proximity fade — in the last few centimeters the approach direction is
+        // dictated by the grasp pose, so rejecting only causes unreachability; fade it out linearly by g.
         if (hand_seen) best *= goalFadeAt(p_hand);
         return best;
     }
@@ -1459,18 +1459,18 @@ public:
 
 
     // ------------------------------------------------------------------
-    // Change 2:目标邻近衰减 g(goal-proximity fade)
+    // Change 2: goal-proximity fade g
     //
-    // 动机(完备性):未截断的深度放大权重 W = 1 − d/envelope 使拒绝锥
-    // 随穿入深度变宽;若苹果紧贴/藏于枝条,最后几厘米的一切接近方向都
-    // 是"深且偏轴向"—— edge refuse 会全部拒绝,苹果不可达。同理,转向
-    // 在终端漏斗内只能制造 bend/re-aim 极限环。修复:以到苹果的距离
-    // 线性渐变(平滑,无新阈值面):
+    // Motivation (completeness): the unclamped depth-amplified weight W = 1 - d/envelope widens the
+    // rejection cone with penetration depth; if the apple sits against or inside a branch, every
+    // approach direction in the last centimeters is "deep and axial" — edge refuse would reject them
+    // all and the apple becomes unreachable. Likewise, steering inside the terminal funnel can only
+    // produce bend/re-aim limit cycles. Fix: fade linearly with distance to the apple (smooth, no new threshold surface):
     //     g = clamp(dist(p, apple) / R_relax, 0, 1)
-    // g=1(≥R 处)行为与历史完全一致;g→0(苹果处)拒绝与弯折全部
-    // 退场,终端接近只由普通碰撞检查(刚性障碍照常阻挡)约束。
-    // 两个机制共用同一个 g:只衰减其一会造成"拒绝但不再引导"或
-    // "无谓弯折"的不一致。radius ≤ 0 时禁用(g 恒为 1)。
+    // g=1 (at >= R) reproduces the historical behavior exactly; g->0 (at the apple) retires both
+    // rejection and bending, so the terminal approach is constrained only by plain collision checking
+    // (rigid obstacles still block as usual). Both mechanisms share the same g: fading only one would
+    // create "rejects but no longer guides" or "pointless bending". Disabled when radius <= 0 (g == 1).
     // ------------------------------------------------------------------
     void setGoalFade(const Eigen::Vector3f& center, float radius) {
         goal_fade_center_ = center;
@@ -1482,7 +1482,7 @@ public:
         return std::max(0.0f, std::min(1.0f, d / goal_fade_radius_));
     }
 
-    // 查询某世界坐标点的原始 SDF 值（用于可视化/调试）
+    // Query the raw SDF value at a world point (for visualization/debugging)
     float querySdf(const Eigen::Vector3f& p) const {
         if (!sdf_built_) return std::numeric_limits<float>::max();
         return sampleSdf(p);
@@ -1496,15 +1496,15 @@ public:
     bool isSdfBuilt() const { return sdf_built_; }
 
     // ==================================================================
-    // Nav field(B 计划)—— 以苹果下方球冠为源的测地距离场
+    // Nav field (plan B) — geodesic distance field sourced at the spherical cap below the apple
     //
-    // 与 SDF 同网格的第二个标量场:每个体素存"沿可行路线到球冠的
-    // 行程代价"。多源 Dijkstra,种子 = 球冠体素(整冠静态种子,
-    // 单次构建);通行代价:自由 ×1,刚性障碍 + 闸门禁核不可通行,
-    // 软枝许可壳层内为"过路费"(随深度×刚度增长 —— 注意这不是斥力:
-    // 斥力是规划时逐步的推挤,过路费是建场时一次性算进路线总价,
-    // 只影响"哪条走廊更便宜",不推任何东西)。
-    // 下坡方向即"绕开树冠、从下方汇入球冠"的吸引方向。
+    // A second scalar field on the same grid as the SDF: each voxel stores the "travel cost to the cap
+    // along a feasible route". Multi-source Dijkstra, seeds = the cap voxels (the whole cap is a static
+    // seed, built once). Traversal cost: free space x1; rigid obstacles and the gate's forbidden core are
+    // impassable; inside a soft branch's permitted shell there is a "toll" (growing with depth x stiffness
+    // — note this is NOT a repulsion: repulsion pushes step by step during planning, whereas the toll is
+    // priced once into the route total at build time and only decides which corridor is cheaper).
+    // The downhill direction is the attraction that "goes around the canopy and joins the cap from below".
     // ==================================================================
     void buildNavField(const Eigen::Vector3f& apple,
                        float shell_radius, float cap_height,
@@ -1517,7 +1517,7 @@ public:
         const long long total = (long long)nx_ * ny_ * nz_;
         const float INF = std::numeric_limits<float>::max();
 
-        // 1. 每体素通行代价倍率(OpenMP 并行, 与 buildSdf 同模式)
+        // 1. Per-voxel traversal cost multiplier (OpenMP parallel, same pattern as buildSdf)
         std::vector<float> mult(total, 1.0f);
         #pragma omp parallel for collapse(2) schedule(static)
         for (int iz = 0; iz < nz_; ++iz) {
@@ -1535,10 +1535,10 @@ public:
                         float dist = (p - (cyl.p0 + u * seg)).norm();
                         float pen = (cyl.radius + robot_r) - dist;
                         if (pen <= 0.0f) continue;
-                        if (cyl.exclude_from_aniso) { m = -1.0f; break; }  // 刚性: 不可通行
+                        if (cyl.exclude_from_aniso) { m = -1.0f; break; }  // rigid: impassable
                         float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                         float allow = penAllowAt(t_arc);
-                        if (pen > allow) { m = -1.0f; break; }             // 闸门禁核
+                        if (pen > allow) { m = -1.0f; break; }             // gate forbidden core
                         float stiff = branchStiffness(t_arc, 3.0f, 0.5f) / 3.0f;
                         m += nav_toll_gain_ * stiff * (pen / std::max(allow, 1e-3f));
                     }
@@ -1547,7 +1547,7 @@ public:
             }
         }
 
-        // 2. 多源种子:球冠透镜区(dist ≤ shell_r 且 z 低于冠上缘)
+        // 2. Multi-source seeds: the cap lens region (dist <= shell_r and z below the cap's upper edge)
         nav_grid_.assign(total, INF);
         using QE = std::pair<float, int>;
         std::priority_queue<QE, std::vector<QE>, std::greater<QE>> pq;
@@ -1566,7 +1566,7 @@ public:
                     ++n_seed;
                 }
 
-        // 3. 6-邻接 Dijkstra
+        // 3. 6-connected Dijkstra
         const int NB[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
         long long visited = 0;
         while (!pq.empty()) {
@@ -1599,7 +1599,7 @@ public:
 
     bool isNavBuilt() const { return nav_built_; }
 
-    // 到球冠的测地行程代价 (m 等效);不可达 / 场外 = +∞ 的一半以上
+    // Geodesic travel cost to the cap (in meter-equivalents); unreachable / outside the field = more than half of +inf
     float queryNavDistance(const Eigen::Vector3f& p) const {
         if (!nav_built_) return std::numeric_limits<float>::max();
         int ix = (int)((p.x() - bbox_min_.x()) / voxel_size_);
@@ -1610,8 +1610,8 @@ public:
         return nav_grid_[linearIdx(ix, iy, iz)];
     }
 
-    // 下坡方向(26 邻接取最小值邻居;轴量化方向,与 50% 随机混合后
-    // 足够平滑)。无更低邻居 / 场外 / 未建 → 零向量,调用方回退直线。
+    // Downhill direction (26-connected, pick the smallest neighbor; axis-quantized, which is smooth
+    // enough after the 50% random blend). No lower neighbor / outside the field / not built -> zero vector, caller falls back to a straight line.
     Eigen::Vector3f queryNavDirection(const Eigen::Vector3f& p) const {
         if (!nav_built_) return Eigen::Vector3f::Zero();
         int ix = (int)((p.x() - bbox_min_.x()) / voxel_size_);
@@ -1650,49 +1650,49 @@ private:
     int             nx_, ny_, nz_;
     std::vector<float> sdf_grid_;
     bool            sdf_built_;
-    // Nav field 状态(与 sdf_grid_ 同网格的第二标量场)
+    // Nav-field state (a second scalar field on the same grid as sdf_grid_)
     std::vector<float> nav_grid_;
     bool               nav_built_ = false;
-    float              nav_toll_gain_ = 8.0f;  // 软枝过路费增益
-    // Change 2:目标邻近衰减 g 的参数(radius ≤ 0 = 禁用)
+    float              nav_toll_gain_ = 8.0f;  // soft-branch toll gain
+    // Change 2: parameters of the goal-proximity fade g (radius <= 0 = disabled)
     Eigen::Vector3f goal_fade_center_ = Eigen::Vector3f::Zero();
     float           goal_fade_radius_ = 0.0f;
-    // tensor edge refuse 自定义计分球掩码(空 = 默认 hand+link6)
+    // Custom scoring-sphere mask for tensor edge refuse (empty = default hand+link6)
     std::vector<char> er_sphere_mask_;
 
-    // ---- 软枝穿透闸门状态 ----
+    // ---- Soft-branch penetration gate state ----
     struct PenProbe { int fid; Eigen::Vector3f off; float r; };
     bool                  pen_gate_enabled_    = false;
-    float                 pen_gate_allow_root_ = 0.015f;  // allow 根部值, m
+    float                 pen_gate_allow_root_ = 0.015f;  // allow at the root, m
     float                 pen_gate_allow_tip_  = 0.050f;  // allow(t=1), m
-    float                 pen_gate_ramp_t0_    = 0.25f;   // 斜坡起点 (根区平台宽)
+    float                 pen_gate_ramp_t0_    = 0.25f;   // ramp start (width of the root plateau)
     Eigen::Vector3f       pen_gate_exempt_center_ = Eigen::Vector3f::Zero();
     float                 pen_gate_exempt_r2_  = 0.0144f; // 0.12² m²
-    float                 pen_gate_axis_clear_ = 0.01f;   // 轴心硬禁区半径 (m)
+    float                 pen_gate_axis_clear_ = 0.01f;   // radius of the hard forbidden core around the axis (m)
     std::vector<PenProbe> pen_probes_;
-    int                   pen_gate_hand_fid_   = -1;      // 下探转向只用手部探针
-    // Depth-steering telemetry (与 er_ 计数同款: 并行下允许竞态, 仅遥测)
+    int                   pen_gate_hand_fid_   = -1;      // descent steering uses hand probes only
+    // Depth-steering telemetry (same convention as the er_ counters: races allowed under parallelism, telemetry only)
     mutable unsigned long long pen_steer_calls_ = 0;
     mutable unsigned long long pen_steer_bends_ = 0;
 
-    // ---- Unified refuse 状态 ----
+    // ---- Unified refuse state ----
     bool  uni_enabled_   = false;
-    float uni_env_       = 0.05f;   // 预接触包络 (m, 枝面以外)
-    float uni_eta_       = 0.5f;    // 预接触轴向权重上限 (接近整形强度)
-    float uni_ax_root_   = 0.005f;  // 枝根滑移预算 (m/步, 悬臂根部≈不许拖)
-    float uni_ax_tip_    = 0.03f;   // 枝梢滑移预算 (m/步)
-    float uni_in_ramp_   = 0.03f;   // 内压项接近性 ramp 厚度 (m, 触前)
-    float uni_safety_    = 0.8f;    // κ: 每步最多消耗剩余深度预算的比例
-    float uni_clamp_     = 0.7f;    // 转向夹持目标 = 边级 sigmoid 中点 (预算占用)
+    float uni_env_       = 0.05f;   // pre-contact envelope (m, outside the branch surface)
+    float uni_eta_       = 0.5f;    // upper bound of the pre-contact axial weight (approach-shaping strength)
+    float uni_ax_root_   = 0.005f;  // slip budget at the root (m/step; a cantilever root allows almost no dragging)
+    float uni_ax_tip_    = 0.03f;   // slip budget at the tip (m/step)
+    float uni_in_ramp_   = 0.03f;   // ramp thickness of the inward-pressure approach term (m, before contact)
+    float uni_safety_    = 0.8f;    // kappa: max fraction of the remaining depth budget consumed per step
+    float uni_clamp_     = 0.7f;    // steering clamp target = midpoint of the edge-level sigmoid (budget usage)
     mutable unsigned long long uni_calls_ = 0;
     mutable unsigned long long uni_bends_ = 0;
 
-    // 统一规则的几何核心:给定探针位置/半径与软枝,输出轴向权重 G、
-    // 剩余深度预算 slack、外向径向单位向量 r̂、滑移预算 L_ax(t)、
-    // 内压激活 h_in。不在包络内返回 false。
-    // 连续性:G 在包络边缘归零(轴向项平滑启动),h_in 在触前
-    // uni_in_ramp_ 内 0→1(内压项平滑启动)—— severity 处处连续,
-    // 枝间交接不会跳变(tensor 反振荡性质的结构化继承)。
+    // Geometric core of the unified rule: given a probe position/radius and a soft branch, output the
+    // axial weight G, the remaining depth budget slack, the outward radial unit vector r_hat, the slip
+    // budget L_ax(t) and the inward-pressure activation h_in. Returns false when outside the envelope.
+    // Continuity: G vanishes at the envelope edge (the axial term starts smoothly) and h_in rises 0->1
+    // within uni_in_ramp_ before contact (the pressure term starts smoothly) — so severity is continuous
+    // everywhere and handoffs between branches cannot jump (a structural inheritance of the tensor's anti-oscillation property).
     bool uniPairGeometry(const Eigen::Vector3f& pp, float probe_r,
                          const CylinderObstacle& cyl,
                          float& G, float& slack, Eigen::Vector3f& r_hat,
@@ -1704,29 +1704,29 @@ private:
             : 0.0f;
         Eigen::Vector3f radial = pp - (cyl.p0 + u * seg);
         float dist = radial.norm();
-        if (dist <= 1e-4f) return false;                  // 贴轴退化, 闸门处理
+        if (dist <= 1e-4f) return false;                  // degenerate on the axis, handled by the gate
         float surf = cyl.radius + probe_r;
-        float surf_dist = dist - surf;                    // <0 = 已穿透
-        if (surf_dist >= uni_env_) return false;          // 包络外
+        float surf_dist = dist - surf;                    // <0 = already penetrating
+        if (surf_dist >= uni_env_) return false;          // outside the envelope
         float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
         float allow = penAllowAt(t_arc);
-        // 与闸门一致的轴心硬禁区封顶(转向/评分与有效性判据不脱节)
+        // Cap by the same hard forbidden core as the gate (so steering/scoring never drift from the validity criterion)
         float allow_cap = surf - pen_gate_axis_clear_ * (1.0f - t_arc);
         if (allow > allow_cap) allow = allow_cap;
         if (allow < 1e-4f) allow = 1e-4f;
         float pen = -surf_dist;
         slack = allow - std::max(pen, 0.0f);
         if (slack < 0.0f) slack = 0.0f;
-        // G 双段曲线:预接触 0→η(从侧面接近),接触后 η→1(拖锯惩罚)
+        // Two-regime G curve: 0->eta before contact (approach from the side), eta->1 after contact (saw penalty)
         G = (pen <= 0.0f)
             ? uni_eta_ * std::min(1.0f, (uni_env_ - surf_dist) / 0.01f)
             : uni_eta_ + (1.0f - uni_eta_)
                   * std::min(1.0f, pen / std::max(allow, 1e-3f));
-        // A4: 滑移预算随弧长(根≈0 梢宽松,与 allow(t) 同形的悬臂模型)
+        // A4: slip budget varies with arc length (root ~0, tip loose; same cantilever shape as allow(t))
         ax_budget = std::max(1e-4f,
             uni_ax_root_ + (uni_ax_tip_ - uni_ax_root_) * t_arc);
-        // A5: 内压激活 —— 触前 ramp 内 0→1,接触后恒 1;远处自由飞行
-        // 不计深度预算
+        // A5: inward-pressure activation — 0->1 within the pre-contact ramp, constant 1 after contact;
+        // free flight far away does not consume the depth budget
         h_in = (pen > 0.0f)
             ? 1.0f
             : std::max(0.0f, 1.0f - surf_dist / uni_in_ramp_);
@@ -1735,23 +1735,23 @@ private:
     }
 
     // ------------------------------------------------------------------
-    // 几何辅助：找到离 p 最近的圆柱的轴向单位向量
-    //   - 用于 Option A 的轴向 drag：需要每个 sphere 知道"最近树枝沿哪条轴"
-    //   - 退化情况（p0 == p1，例如 overhead 球被当 cylinder 加进来）返回 0
-    //   - 当 cylinders_ 为空时返回 0
+    // Geometric helper: find the axis unit vector of the cylinder nearest to p
+    //   - used by Option A's axial drag: each sphere needs to know "along which axis the nearest branch runs"
+    //   - degenerate case (p0 == p1, e.g. the overhead sphere registered as a cylinder) returns 0
+    //   - returns 0 when cylinders_ is empty
     //
-    // 刚性圆柱（exclude_from_aniso = true，即树干）被跳过：各向异性是柔性
-    // 枝叶的属性，"径向拨开"对刚性树干无意义。所有方法（edge refuse /
-    // sample steering / sticky）本就跳过树干；此处的跳过让 Option A 的
-    // 轴向 drag 与两个 anisotropy 指标与之保持一致 —— 否则树干的竖直轴会
-    // 被当成 â，把与树枝无关的运动混入 axial/radial 统计。
+    // Rigid cylinders (exclude_from_aniso = true, i.e. the trunk) are skipped: anisotropy is a property
+    // of compliant foliage, and "push aside radially" is meaningless for a rigid trunk. Every method
+    // (edge refuse / sample steering / sticky) already skipped the trunk; skipping here keeps Option A's
+    // axial drag and the two anisotropy metrics consistent with them — otherwise the trunk's vertical
+    // axis would be taken as a_hat and mix branch-unrelated motion into the axial/radial statistics.
     // ------------------------------------------------------------------
     Eigen::Vector3f findNearestCylinderAxis(const Eigen::Vector3f& p) const {
         if (cylinders_.empty()) return Eigen::Vector3f::Zero();
         int best_idx = -1;
         float best_dist = std::numeric_limits<float>::max();
         for (size_t i = 0; i < cylinders_.size(); ++i) {
-            if (cylinders_[i].exclude_from_aniso) continue;   // 树干等刚性障碍
+            if (cylinders_[i].exclude_from_aniso) continue;   // rigid obstacles such as the trunk
             float d = distToCylinder(p, cylinders_[i]);
             if (d < best_dist) {
                 best_dist = d;
@@ -1767,7 +1767,7 @@ private:
     }
 
     // ------------------------------------------------------------------
-    // 几何辅助：点到圆柱的有符号距离（在圆柱内为负）
+    // Geometric helper: signed distance from a point to a cylinder (negative inside)
     // ------------------------------------------------------------------
     static float distToCylinder(const Eigen::Vector3f& p,
                                  const CylinderObstacle& cyl) {
@@ -1780,41 +1780,41 @@ private:
                   : 0.0f;
 
         const Eigen::Vector3f closest = cyl.p0 + t * v;
-        return (p - closest).norm() - cyl.radius;  // 负值 = 在圆柱内部
+        return (p - closest).norm() - cyl.radius;  // negative = inside the cylinder
     }
 
     // ------------------------------------------------------------------
-    // 网格辅助
+    // Grid helpers
     // ------------------------------------------------------------------
 
-    // 体素中心的世界坐标
+    // World coordinates of a voxel center
     inline Eigen::Vector3f voxelCenter(int ix, int iy, int iz) const {
         return bbox_min_ + Eigen::Vector3f(ix * voxel_size_,
                                            iy * voxel_size_,
                                            iz * voxel_size_);
     }
 
-    // 平铺一维索引
+    // Flattened 1D index
     inline int linearIdx(int ix, int iy, int iz) const {
         return ix + nx_ * (iy + ny_ * iz);
     }
 
     // ------------------------------------------------------------------
-    // 三线性插值 SDF 查询
-    // 对网格内的点给出连续平滑的距离值；越界时夹取最近边界体素。
+    // Trilinearly interpolated SDF query
+    // Gives a continuous, smooth distance inside the grid; out-of-range points clamp to the nearest boundary voxel.
     // ------------------------------------------------------------------
     float sampleSdf(const Eigen::Vector3f& p) const {
-        // 映射到连续网格坐标
+        // Map to continuous grid coordinates
         const float gx = (p.x() - bbox_min_.x()) / voxel_size_;
         const float gy = (p.y() - bbox_min_.y()) / voxel_size_;
         const float gz = (p.z() - bbox_min_.z()) / voxel_size_;
 
-        // 越界：直接夹取最近体素（不插值，节省一次 if-else 分支）
+        // Out of range: clamp straight to the nearest voxel (no interpolation, saves an if-else branch)
         const int x0 = std::max(0, std::min(nx_ - 1, (int)gx));
         const int y0 = std::max(0, std::min(ny_ - 1, (int)gy));
         const int z0 = std::max(0, std::min(nz_ - 1, (int)gz));
 
-        // 检查是否真的在可插值范围内
+        // Check whether the point is really within the interpolatable range
         if (gx < 0.0f || gx >= nx_ - 1 ||
             gy < 0.0f || gy >= ny_ - 1 ||
             gz < 0.0f || gz >= nz_ - 1) {
@@ -1829,7 +1829,7 @@ private:
         const float fy = gy - y0;
         const float fz = gz - z0;
 
-        // 8 个角点
+        // The 8 corner points
         const float c000 = sdf_grid_[linearIdx(x0, y0, z0)];
         const float c100 = sdf_grid_[linearIdx(x1, y0, z0)];
         const float c010 = sdf_grid_[linearIdx(x0, y1, z0)];
@@ -1839,17 +1839,17 @@ private:
         const float c011 = sdf_grid_[linearIdx(x0, y1, z1)];
         const float c111 = sdf_grid_[linearIdx(x1, y1, z1)];
 
-        // 沿 X 插值
+        // Interpolate along X
         const float c00 = c000 * (1 - fx) + c100 * fx;
         const float c01 = c001 * (1 - fx) + c101 * fx;
         const float c10 = c010 * (1 - fx) + c110 * fx;
         const float c11 = c011 * (1 - fx) + c111 * fx;
 
-        // 沿 Y 插值
+        // Interpolate along Y
         const float c0 = c00 * (1 - fy) + c10 * fy;
         const float c1 = c01 * (1 - fy) + c11 * fy;
 
-        // 沿 Z 插值
+        // Interpolate along Z
         return c0 * (1 - fz) + c1 * fz;
     }
 };

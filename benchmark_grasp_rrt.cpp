@@ -47,8 +47,8 @@
 
 using namespace grasp_rrt;
 
-// ---- tree6 枝几何 (23 枝 × 6 节点), 提升到文件作用域: 苹果定位 (--apple-branch-idx/
-//      --apple-frac) 与几何构建共用同一份数据, 不再各自硬编码 ----
+// ---- tree6 branch geometry (23 branches x 6 nodes), lifted to file scope: apple placement
+//      (--apple-branch-idx / --apple-frac) and geometry construction share one copy ----
 static const Vector3f TREE6_BRANCH_NODES[23][6] = {
     {{0.7338f,-0.0364f,0.6730f},{0.6963f, 0.0236f,0.6883f},{0.6504f, 0.0901f,0.6923f},{0.6114f, 0.1617f,0.6865f},{0.5648f, 0.2300f,0.7012f},{0.5171f, 0.2968f,0.7215f}},
     {{0.7341f,-0.0374f,0.6980f},{0.6641f,-0.0716f,0.6774f},{0.6178f,-0.1627f,0.6953f},{0.5486f,-0.2075f,0.6671f},{0.4574f,-0.2419f,0.6056f},{0.3546f,-0.2674f,0.5607f}},
@@ -260,19 +260,19 @@ struct RunResult {
     // Same, restricted to waypoints in-envelope of a branch (where rejection
     // is active) — isolates wiggle caused by branch interaction near the apple.
     float   path_env_turning_deg   = 0.0f;
-    float   shortcut_ms            = 0.0f;  // 方法1: score-aware shortcut 用时 (0 = off)
-    // finger-first 事后指标: 路径上手部球首次触及苹果的部位与对准角
-    int         first_contact_wp        = -1;     // -1 = 全程未触
-    // branch-stiffness 事后指标: "硬切"违规 —— 探针点穿入软枝深度
-    // 超过 allow(t)=5mm+25mm·t 的路点数, 以及最大超限量 (m)
+    float   shortcut_ms            = 0.0f;  // Method 1: score-aware shortcut time (0 = off)
+    // finger-first post-hoc metric: which hand part first touches the apple, and the alignment angle
+    int         first_contact_wp        = -1;     // -1 = never touched
+    // branch-stiffness post-hoc metric: "hard cut" violations — number of waypoints whose
+    // probe penetration into a soft branch exceeds allow(t)=5mm+25mm*t, plus the worst excess (m)
     int   cut_violations = 0;
     float cut_worst_over = 0.0f;
-    // 软枝(绿枝)穿透深度指标: 沿路径机体表面穿入软枝的深度 pen (m)
-    //   = (r_枝 + r_探针) − dist。判断"是否穿绿枝太深", 与 allow 无关。
-    //   途中(排除苹果 12cm 终端抓取区)统计: 最大 / 平均(仅计有接触的探针-路点样本)
-    float max_soft_pen  = 0.0f;   // 全程最深穿入 (m)
-    float mean_soft_pen = 0.0f;   // 有接触样本的平均穿入 (m); 0 = 全程无接触
-    float       first_contact_align_deg = -1.0f;  // 触点处 ẑ_g 与 palm→apple 夹角
+    // Soft-branch (green branch) penetration depth: depth pen (m) of the body surface into a soft branch
+    //   = (r_branch + r_probe) - dist. Answers "did we press into a green branch too deep", independent of allow.
+    //   Measured en route (excluding the 12 cm terminal grasp zone around the apple): max / mean (contacting probe-waypoint samples only)
+    float max_soft_pen  = 0.0f;   // deepest penetration over the whole path (m)
+    float mean_soft_pen = 0.0f;   // mean penetration over contacting samples (m); 0 = no contact at all
+    float       first_contact_align_deg = -1.0f;  // angle between z_g and palm->apple at the contact
     std::string first_contact_part      = "none"; // palm / mouth / finger
     int     path_env_turns         = 0;
 };
@@ -381,7 +381,7 @@ void writeCsvHeader(std::ofstream& f) {
       // Group E4: EE-path smoothness (raw path)
       << "path_total_turning_deg,path_mean_turning_deg,path_reversals,"
       << "path_env_turning_deg,path_env_turns,shortcut_ms,first_contact_wp,first_contact_align_deg,first_contact_part,cut_violations,cut_worst_over,"
-      // 软枝穿透深度 (m): 全程最深 / 有接触样本平均
+      // Soft-branch penetration depth (m): deepest over the path / mean over contacting samples
       << "max_soft_pen,mean_soft_pen\n";
 }
 
@@ -469,14 +469,14 @@ int main(int argc, char* argv[]) {
     bool tree6_scene        = false;
     bool tree6_simple       = false;
     bool apple_branch_soft  = false;
-    float apple_hang        = -1.0f;  // --apple-hang F: 苹果心到枝轴的垂直距离 (m), <0 = 默认(枝面相切)  // --apple-branch-soft: tree6 苹果枝改为软枝 (仅 SDF, 无硬碰撞, 无 rigid 旋涡)  // --tree6-simple: 简化加粗版 tree6 (枝条按 30° 合并 + 统一 r=0.03; 苹果枝仍 rigid)  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches × 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
+    float apple_hang        = -1.0f;  // --apple-hang F: vertical distance from apple center to the branch axis (m), <0 = default (tangent to the branch surface)  // --apple-branch-soft: make the tree6 apple branch soft (SDF only, no hard collision, no rigid vortex)  // --tree6-simple: simplified thickened tree6 (branches merged at 30 deg + uniform r=0.03; the apple branch stays rigid)  // --tree6: reconstructed tree6 continuous scene (8-seg trunk + 23 branches x 5 segs). Apple defaults to the tip of the 5th branch; --apple-root flips it back to 25% along (trunk side).
     bool tree6_apple_root   = false;  // --apple-root: shortcut for --apple-frac 0.25 (only meaningful with --tree6)
     float tree6_apple_frac  = 0.95f;  // --apple-frac F: fraction along the 5th branch arclength (0=root, 1=tip)
     float branch_rscale     = 1.0f;   // --branch-rscale S: multiply every tree6 branch radius by S (2=double). Apple offset tracks the scaled apple-branch radius.
-    float tree_yaw_deg      = 0.0f;    // --tree-yaw DEG: 绕树根竖直轴旋转整棵树 (+CCW, 从顶视). 顺时针 90° = -90. 机器人基座不动.
-    float tree_dist_scale   = 1.0f;    // --tree-dist-scale S: 把树根到机器人基座的水平距离缩放为 S 倍 (0.5=减半, 更易够到). 整棵树平移.
-    int   apple_branch_idx  = 4;       // --apple-branch-idx N: 苹果挂在第 N 根枝上 (0-based, tree6 的 23 根枝; 默认 4 = 原苹果枝). 该枝获得与原苹果枝相同的特殊处理 (rigid 或 --apple-branch-soft).
-    float base_raise        = 0.0f;    // --base-raise F: 机器人基座抬高 F 米 (实现 = 整棵树在机器人系下沉 F; 场景 json 导出的即下沉后坐标).
+    float tree_yaw_deg      = 0.0f;    // --tree-yaw DEG: rotate the whole tree about the root's vertical axis (+CCW seen from above). 90 deg clockwise = -90. The robot base does not move.
+    float tree_dist_scale   = 1.0f;    // --tree-dist-scale S: scale the horizontal distance from the tree root to the robot base by S (0.5 = halved, easier to reach). Translates the whole tree.
+    int   apple_branch_idx  = 4;       // --apple-branch-idx N: hang the apple on branch N (0-based, tree6 has 23 branches; default 4 = the original apple branch). That branch gets the same special treatment as the original (rigid, or soft with --apple-branch-soft).
+    float base_raise        = 0.0f;    // --base-raise F: raise the robot base by F meters (implemented as sinking the whole tree by F in the robot frame; the exported scene json already reflects the sunk coordinates).
     bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing sticky-winner. Branch A along x̂ above apple, branch B along ẑ in front of apple.
     bool sparse_long_scene  = false;  // --sparse-long: standard 10-branch scene with wider vertical/angular spacing and ~1.7x longer branches
     bool xgate_scene        = false;  // --xgate: multi-branch scene = V6 rigid A + two CROSSED soft branches (B1 ŷ, B2 x̂) whose 5cm envelopes overlap on the approach corridor. Tests MAX-vs-winner oscillation.
@@ -494,20 +494,20 @@ int main(int argc, char* argv[]) {
 
     // sample steering — angle-range cap on extension direction.
 
-    bool  branch_stiffness   = false;   // --branch-stiffness: 软枝刚度场 (根硬梢软 + 轴心主导 + 下探偏置)
-    bool  pen_gate_enabled   = false;   // --pen-gate: 软枝穿透闸门 (硬有效性约束, cut_violations 同判据进 isConfigValid)
-    bool  pen_steer_enabled  = false;   // --pen-steer: depth steering (提议层切向投影, 隐含 --pen-gate)
-    bool  uni_refuse_enabled = false;   // --uni-refuse: 统一分支交互规则 (隐含 --pen-gate; 取代 --edge-refuse* / --pen-steer)
-    bool  nav_field_enabled  = false;   // --nav-field: 测地吸引场 (球冠多源洪泛; 远场绕行 + 近场随机冠点 + 测地下探门)
-    float pen_gate_root_mm   = 15.0f;   // --pen-gate-root-mm F: allow(t=0), 枝根许可穿透 (mm)
-    float pen_gate_tip_mm    = 75.0f;   // --pen-gate-tip-mm F:  allow(t=1), 枝梢许可穿透 (mm)
-    float pen_gate_ramp_t0   = 0.0f;    // --pen-gate-ramp-t0 F: 斜坡起点 (根区平台宽, 弧长占比)。0 = 从枝根线性 (2026-08-10 用户指定恢复; method-a 曾用 0.25 = 外 3/4 斜坡, 留作消融)
-    bool  finger_first       = false;   // --finger-first: 指尖先触转向引导(纯引导,无拒绝)
-    float ff_gain            = 1.0f;    // --ff-gain F: 转向旋转偏置增益
-    float ff_far             = 0.15f;   // --ff-far F: 激活外半径 (m)
-    bool  shortcut_enabled   = false;   // --shortcut: 方法1 — 解路径 score-aware 捷径剪枝
-    std::string er_links;               // --er-links "panda_link7:0,panda_link5:2": tensor ER 自定义计分球(链接名:球序号)
-    float goal_fade_radius   = 0.0f;    // --goal-fade R: change 2 — 目标邻近衰减半径 (m), 0 = off
+    bool  branch_stiffness   = false;   // --branch-stiffness: soft-branch stiffness field (stiff root, soft tip + axis dominance + descent bias)
+    bool  pen_gate_enabled   = false;   // --pen-gate: soft-branch penetration gate (hard validity constraint, the cut_violations criterion moved into isConfigValid)
+    bool  pen_steer_enabled  = false;   // --pen-steer: depth steering (proposal-layer tangential projection, implies --pen-gate)
+    bool  uni_refuse_enabled = false;   // --uni-refuse: unified branch-interaction rule (implies --pen-gate; supersedes --edge-refuse* / --pen-steer)
+    bool  nav_field_enabled  = false;   // --nav-field: geodesic attraction field (multi-source flood from the spherical cap; far-field detour + near-field random cap point + geodesic descent gate)
+    float pen_gate_root_mm   = 15.0f;   // --pen-gate-root-mm F: allow(t=0), permitted penetration at the branch root (mm)
+    float pen_gate_tip_mm    = 75.0f;   // --pen-gate-tip-mm F:  allow(t=1), permitted penetration at the branch tip (mm)
+    float pen_gate_ramp_t0   = 0.0f;    // --pen-gate-ramp-t0 F: ramp start (width of the root plateau, arc-length fraction). 0 = linear from the root (restored per user request 2026-08-10; method-a used 0.25 = ramp over the outer 3/4, kept for ablation)
+    bool  finger_first       = false;   // --finger-first: fingertip-first steering guidance (pure guidance, no rejection)
+    float ff_gain            = 1.0f;    // --ff-gain F: gain of the steering rotation bias
+    float ff_far             = 0.15f;   // --ff-far F: outer activation radius (m)
+    bool  shortcut_enabled   = false;   // --shortcut: Method 1 — score-aware shortcut pruning of the solution path
+    std::string er_links;               // --er-links "panda_link7:0,panda_link5:2": custom scoring spheres for tensor ER (link name : sphere index)
+    float goal_fade_radius   = 0.0f;    // --goal-fade R: change 2 — goal-proximity fade radius (m), 0 = off
 
     // Parse args
     std::vector<std::string> positional;
@@ -621,10 +621,10 @@ int main(int argc, char* argv[]) {
             pen_gate_enabled = true;
         } else if (a == "--pen-steer") {
             pen_steer_enabled = true;
-            pen_gate_enabled  = true;   // 转向依赖闸门的 allow(t)/探针, 且需其兜底
+            pen_gate_enabled  = true;   // steering depends on the gate's allow(t)/probes and needs it as a backstop
         } else if (a == "--uni-refuse") {
             uni_refuse_enabled = true;
-            pen_gate_enabled   = true;  // 统一规则依赖闸门的探针/allow(t), 且需其兜底
+            pen_gate_enabled   = true;  // the unified rule depends on the gate's probes/allow(t) and needs it as a backstop
         } else if (a == "--nav-field") {
             nav_field_enabled = true;
         } else if (a == "--pen-gate-root-mm" && i + 1 < argc) {
@@ -637,11 +637,11 @@ int main(int argc, char* argv[]) {
             pen_gate_ramp_t0 = std::max(0.0f, std::min(0.9f,
                                   static_cast<float>(std::atof(argv[++i]))));
         } else if (a.rfind("--sample-steering", 0) == 0) {
-            // sample steering 已移除(被 unified steering 取代)。显式报错,
-            // 避免旧脚本静默跑出"以为开了其实没开"的结果。
+            // sample steering has been removed (superseded by unified steering). Fail loudly
+            // so old scripts cannot silently produce "thought it was on but it wasn't" results.
             std::cerr << "ERROR: " << a
-                      << " 已移除 —— sample steering 由 unified steering "
-                         "(--uni-refuse) 取代。历史实现见 git 提交 fee46a1。\n";
+                      << " has been removed — sample steering is superseded by unified "
+                         "steering (--uni-refuse). Historical implementation: git commit fee46a1.\n";
             return 1;
         } else if (a == "--branch-stiffness") {
             branch_stiffness = true;
@@ -796,9 +796,9 @@ int main(int argc, char* argv[]) {
                   << "lengths 0.55-0.60 m, widened angular gaps\n";
     }
 
-    // ---- tree6 刚体场景变换: 绕树根竖直轴 yaw + 水平缩放到基座距离 ----
-    // 机器人基座在原点; 保持树根竖直轴与基座不动, 只旋转/平移整棵树 (trunk+枝+苹果)。
-    // 对 tree6 / tree6-simple 两个几何块与苹果定位统一生效。
+    // ---- tree6 rigid scene transform: yaw about the root's vertical axis + horizontal scaling of the base distance ----
+    // The robot base sits at the origin; the tree root's vertical axis and the base stay fixed, only the whole tree (trunk+branches+apple) rotates/translates.
+    // Applies uniformly to both the tree6 and tree6-simple geometry blocks and to apple placement.
     const Vector3f TREE_ROOT(0.7526f, -0.0624f, 0.0011f);   // = TRUNK_NODES[0]
     const float _tree_yaw = tree_yaw_deg * static_cast<float>(M_PI) / 180.0f;
     const float _cy = std::cos(_tree_yaw), _sy = std::sin(_tree_yaw);
@@ -808,7 +808,7 @@ int main(int argc, char* argv[]) {
         float dx = p.x() - TREE_ROOT.x(), dy = p.y() - TREE_ROOT.y();
         float rx = TREE_ROOT.x() + _cy * dx - _sy * dy;
         float ry = TREE_ROOT.y() + _sy * dx + _cy * dy;
-        // yaw 绕竖直轴 + 水平平移; --base-raise 抬高机器人 = 整树下沉
+        // yaw about the vertical axis + horizontal translation; --base-raise lifts the robot = sinks the whole tree
         return Vector3f(rx + _shx, ry + _shy, p.z() - base_raise);
     };
 
@@ -840,13 +840,13 @@ int main(int argc, char* argv[]) {
             }
             acc += seg_len[i];
         }
-        if (tree6_simple) local_r = 0.03f;  // 简化版: 统一枝半径 0.03
+        if (tree6_simple) local_r = 0.03f;  // simplified variant: uniform branch radius 0.03
         local_r *= branch_rscale;   // apple sits below the (possibly thickened) branch surface
-        // --apple-hang: 直接指定苹果心到枝轴的垂距(可小于 local_r+r_apple,
-        // 即苹果嵌入枝包络 —— 用于对齐细枝场景的悬挂几何)
+        // --apple-hang: directly specify the vertical distance from apple center to branch axis (may be
+        // less than local_r+r_apple, i.e. the apple sits inside the branch envelope — matches thin-branch scenes)
         float hang = (apple_hang > 0.0f) ? apple_hang
                                           : (local_r + scene.apple_radius);
-        // 苹果挂在(变换后)枝上附着点正下方; yaw/平移只动 xy, 悬挂垂距沿 -z 不变。
+        // The apple hangs directly below the (transformed) attachment point; yaw/translation only move xy, the hang distance along -z is unchanged.
         Vector3f attach_t = treeXform(attach);
         scene.apple_pos = Vector3f(attach_t.x(), attach_t.y(), attach_t.z() - hang);
         // No overhead obstacle in tree6 — push it far so any hint referencing it is a no-op
@@ -879,10 +879,10 @@ int main(int argc, char* argv[]) {
 
     // 5c-d. Robot collision capsules (mirrors example)
     struct LinkCapsule { std::string name; float radius, center_z, half_h; };
-    // 2026-08-10 修正: 旧表假设所有 link 网格沿各自 frame 的 +z 延伸, 但 Franka URDF
-    // 中 link1/3/5 网格在 −z 侧 (实测网格中心 z = −0.07/−0.03/−0.11) —— 旧 capsule
-    // 罩住的是关节另一侧的空气, link5(前臂) 对 DCD 完全隐形, 在 root-apple 场景中
-    // 被实测穿干 68mm。新表按 pybullet 实测网格 AABB 中心/范围重新放置。
+    // 2026-08-10 fix: the old table assumed every link mesh extends along its own frame's +z, but in
+    // the Franka URDF the link1/3/5 meshes sit on the -z side (measured mesh centers z = -0.07/-0.03/-0.11)
+    // — the old capsules guarded the air on the other side of the joint, link5 (forearm) was completely
+    // invisible to DCD and was measured passing 68 mm through in the root-apple scene. The new table repositions everything from pybullet-measured mesh AABBs.
     std::vector<LinkCapsule> capsule_structure = {
         {"panda_link0", 0.10f,  0.05f, 0.02f}, {"panda_link1", 0.09f, -0.07f, 0.12f},
         {"panda_link2", 0.11f,  0.00f, 0.04f}, {"panda_link3", 0.09f, -0.035f, 0.10f},
@@ -1058,15 +1058,15 @@ int main(int argc, char* argv[]) {
             cost_evaluator->addRigidCylinder(p0, p1, r);
         }
 
-        // 苹果枝 (--apple-branch-idx, 默认 4): rigid — hard collision in Bullet +
-        // rigid in SDF (anisotropy skips); --apple-branch-soft 时转软.
+        // Apple branch (--apple-branch-idx, default 4): rigid — hard collision in Bullet +
+        // rigid in SDF (anisotropy skips); becomes soft with --apple-branch-soft.
         const int APPLE_BRANCH_IDX = apple_branch_idx;
         int n_soft = 0, n_rigid = 0;
         for (int b = 0; b < 23; ++b) {
             bool is_apple_branch = (b == APPLE_BRANCH_IDX);
 
-            // 简化版(--tree6-simple):按 30° 弯折角合并节点(与
-            // visualize_tree6_simple.py 同算法), 统一半径 0.03。
+            // Simplified variant (--tree6-simple): merge nodes by a 30 deg bend angle (same
+            // algorithm as visualize_tree6_simple.py), uniform radius 0.03.
             std::vector<Vector3f> poly;
             if (tree6_simple) {
                 poly.push_back(TREE6_BRANCH_NODES[b][0]);
@@ -1084,7 +1084,7 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i <= 5; ++i) poly.push_back(TREE6_BRANCH_NODES[b][i]);
             }
 
-            // 各段在整枝上的弧长占比 (branch-stiffness 刚度模型用)
+            // Arc-length fraction of each segment along the whole branch (used by the branch-stiffness model)
             std::vector<float> arc(poly.size(), 0.0f);
             for (size_t i = 1; i < poly.size(); ++i)
                 arc[i] = arc[i-1] + (poly[i] - poly[i-1]).norm();
@@ -1212,8 +1212,8 @@ int main(int argc, char* argv[]) {
 
     cspace->setCostEvaluator(cost_evaluator);
 
-    // Change 2: goal-proximity fade g — 以苹果为中心的线性衰减,
-    // 同时作用于 tensor edge refuse 的拒绝分数与转向的弯折量。
+    // Change 2: goal-proximity fade g — a linear fade centered on the apple, applied both
+    // to the tensor edge-refuse rejection score and to the steering bend magnitude.
     if (goal_fade_radius > 0.0f) {
         cost_evaluator->setGoalFade(scene.apple_pos, goal_fade_radius);
         std::cout << "[Setup] GOAL FADE ENABLED (change 2: R = "
@@ -1245,7 +1245,7 @@ int main(int argc, char* argv[]) {
         if (er_links.empty() || !edge_refuse_tensor) {
             std::cout << "        spheres   = panda_hand + panda_link6\n";
         } else {
-            // 解析 "link:idx,link:idx" 为自定义计分球集合(仅 tensor 模式)
+            // Parse "link:idx,link:idx" into a custom set of scoring spheres (tensor mode only)
             std::vector<std::pair<std::string, int>> sel;
             std::stringstream ss(er_links);
             std::string tok;
@@ -1260,41 +1260,41 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ---- 软枝穿透闸门 (硬有效性约束) ----
-    // 与事后指标 cut_violations 同判据 (allow(t) 线性插值 + 苹果 12cm
-    // 豁免), 但装进 isConfigValid: 违规构型 = 无效, 切断在构造上不可能。
+    // ---- Soft-branch penetration gate (hard validity constraint) ----
+    // Same criterion as the post-hoc cut_violations metric (linearly interpolated allow(t)
+    // + 12 cm apple exemption), but inside isConfigValid: a violating config is invalid, so cuts are impossible by construction.
     if (pen_gate_enabled) {
         cost_evaluator->enablePenetrationGate(
             pen_gate_root_mm * 0.001f, pen_gate_tip_mm * 0.001f,
             scene.apple_pos, /*exempt_radius=*/0.12f);
-        cost_evaluator->setPenGateRampT0(pen_gate_ramp_t0);  // 0 = 从枝根线性斜坡
+        cost_evaluator->setPenGateRampT0(pen_gate_ramp_t0);  // 0 = linear ramp starting at the branch root
         std::cout << "[Setup] PENETRATION GATE ENABLED (hard validity, ramp_t0="
                   << pen_gate_ramp_t0 << "):\n"
                   << "        allow(t) = " << pen_gate_root_mm << " mm (root) → "
                   << pen_gate_tip_mm << " mm (tip), apple exempt r = 0.12 m\n";
     }
 
-    // ---- Unified refuse (统一分支交互规则, 提议层投影 + 边级 sigmoid) ----
-    // 依赖 pen gate 的探针/allow(t) —— 必须在 enablePenetrationGate 之后。
+    // ---- Unified refuse (unified branch-interaction rule, proposal projection + edge-level sigmoid) ----
+    // Depends on the pen gate's probes / allow(t) — must come after enablePenetrationGate.
     if (uni_refuse_enabled) {
         if (edge_refuse_enabled || sticky_edge_refuse_enabled ||
             pen_steer_enabled) {
-            std::cout << "[Setup] WARNING: --uni-refuse 取代旧 edge refuse / "
-                         "pen-steer, 已忽略这些旧开关\n";
+            std::cout << "[Setup] WARNING: --uni-refuse supersedes the old edge refuse / "
+                         "pen-steer; those switches are ignored\n";
             edge_refuse_enabled = false;
             sticky_edge_refuse_enabled = false;
             pen_steer_enabled = false;
         }
-        // ax_tip 30→8mm(2026-07-28 用户澄清):枝梢的自由是"径向压入",
-        // 不是"轴向滑行"—— allow(t) 保持斜坡(径向自由随 t 增大),
-        // L_ax 全枝收紧(轴向到处严格)。
+        // ax_tip 30 -> 8 mm (user clarification 2026-07-28): freedom at the branch tip means
+        // RADIAL pressing, not AXIAL sliding — allow(t) keeps its ramp (radial freedom grows with t)
+        // while L_ax is tightened along the whole branch (axial motion is strict everywhere).
         cost_evaluator->enableUnifiedRefuse(
             /*env=*/0.05f, /*eta=*/0.5f,
             /*ax_root=*/0.005f, /*ax_tip=*/0.008f, /*safety=*/0.8f,
             /*clamp_target=*/0.7f);
         cspace->setEdgeRefuseEnabled(true);
         cspace->setEdgeRefuseUnifiedMode(true);
-        cspace->setEdgeRefuseThreshold(0.7f);   // 压枝上限: 70% 预算占用 = 50/50
+        cspace->setEdgeRefuseThreshold(0.7f);   // branch-pressing ceiling: 70% budget used = 50/50
         cspace->setEdgeRefuseGain(6.0f);
         std::cout << "[Setup] UNIFIED REFUSE ENABLED:\n"
                   << "        env=0.05 m, eta=0.5, L_ax(t)=5→30 mm, kappa=0.8, "
@@ -1303,11 +1303,11 @@ int main(int argc, char* argv[]) {
                      "steer clamp=0.7; axis hard-clear=10 mm\n";
     }
 
-    // ---- Nav field(测地吸引场):同网格二次洪泛 ----
-    // 必须在 enablePenetrationGate 之后(禁核用闸门 allow(t))。种子 =
-    // 苹果下方球冠(与 shell attractor 同几何);构建耗时并入 setup。
+    // ---- Nav field (geodesic attraction field): a second flood on the same grid ----
+    // Must come after enablePenetrationGate (the forbidden core uses the gate's allow(t)). Seeds =
+    // the spherical cap below the apple (same geometry as the shell attractor); build time counts toward setup.
     if (nav_field_enabled) {
-        GraspRrtConfig tmp_cfg;   // 读球冠默认几何参数
+        GraspRrtConfig tmp_cfg;   // read the default spherical-cap geometry
         auto t_nav0 = std::chrono::high_resolution_clock::now();
         cost_evaluator->buildNavField(
             scene.apple_pos,
@@ -1316,7 +1316,7 @@ int main(int argc, char* argv[]) {
             /*robot_r=*/0.06f);
         auto t_nav1 = std::chrono::high_resolution_clock::now();
         float nav_ms = std::chrono::duration<float, std::milli>(t_nav1 - t_nav0).count();
-        voxel_build_ms += nav_ms;   // 并入 setup 时间统计
+        voxel_build_ms += nav_ms;   // folded into the setup time statistics
         std::cout << "[Setup] NAV FIELD ENABLED (geodesic attraction, build "
                   << nav_ms << " ms; switch=0.15 m, descent gate=0.60 m geodesic)\n";
     }
@@ -1349,7 +1349,7 @@ int main(int argc, char* argv[]) {
     config.use_shell_attractor = shell_attractor_enabled;
     config.branch_anisotropy_K_ax = branch_aniso_K_ax;   // Option A: axial drag on/off
     config.extension_coin_flip = extension_coin_flip;    // ablation: stochastic switch vs deterministic blend
-    // Finger-first steering(纯引导,无拒绝)
+    // Finger-first steering (pure guidance, no rejection)
     config.branch_stiffness_enabled = branch_stiffness;
     if (branch_stiffness) {
         std::cout << "[Setup] BRANCH STIFFNESS ENABLED (k_root="
@@ -1412,12 +1412,12 @@ int main(int argc, char* argv[]) {
     mkdir(out_dir.c_str(), 0755);  // ignore EEXIST
     std::cout << "[Setup] Output directory: " << out_dir << "/\n";
 
-    // ---- 9b. 导出场景布局 (给 Isaac Sim 对齐用) ----
-    // 单一出口: SdfCostEvaluator 里注册过的全部圆柱 (rigid 标志区分硬/软),
-    // 自动覆盖所有场景变体 (标准 / --sparse-long / --diag / --tree6 / aniso)。
-    // 坐标均在机器人基座 frame (基座即原点), 单位米。
-    // 注意: --diag 场景的 Branch A 在 Bullet 里是硬障碍但 SDF 里登记为软,
-    // 导出 class 以 SDF rigid 标志为准, 该诊断场景下需人工留意。
+    // ---- 9b. Export the scene layout (for aligning with Isaac Sim) ----
+    // Single exit point: every cylinder registered in SdfCostEvaluator (the rigid flag separates hard/soft),
+    // automatically covering all scene variants (standard / --sparse-long / --diag / --tree6 / aniso).
+    // All coordinates are in the robot base frame (the base is the origin), units meters.
+    // Note: in the --diag scene, Branch A is a hard obstacle in Bullet but registered as soft in the SDF;
+    // the exported class follows the SDF rigid flag, so that diagnostic scene needs manual attention.
     {
         std::ofstream sf(out_dir + "/scene_layout.json");
         if (sf.is_open()) {
@@ -1428,8 +1428,8 @@ int main(int argc, char* argv[]) {
             };
             const auto& cyls = cost_evaluator->getCylinders();
             sf << "{\n"
-               << "  \"comment\": \"机器人基座 frame, 米; 圆柱 = p0/p1 两端点 + 半径; "
-                  "p0==p1 表示球体; class hard=碰到判FAIL, soft=可推开\",\n"
+               << "  \"comment\": \"robot base frame, meters; cylinder = endpoints p0/p1 + radius; "
+                  "p0==p1 means a sphere; class hard=contact is a FAIL, soft=can be pushed aside\",\n"
                << "  \"apple\": {\"center\": " << vec3(scene.apple_pos)
                << ", \"radius\": " << scene.apple_radius << "},\n"
                << "  \"cylinders\": [\n";
@@ -1454,7 +1454,7 @@ int main(int argc, char* argv[]) {
     }
     writeCsvHeader(csv_file);
 
-    // 自动保存每个 run 的起点 (方便后续用 --starts-file 复现)
+    // Automatically save each run's start configuration (so it can be reproduced with --starts-file)
     std::ofstream starts_out(out_dir + "/starts_used.txt");
 
     // ---- 10. Random start sampling range (home_pose ± π/4) ----
@@ -1483,7 +1483,7 @@ int main(int argc, char* argv[]) {
         planner->addExtraSetupTimeMs(voxel_build_ms);
         planner->setGoalBiasProb(method_a_enabled ? 0.15f : 0.0f);  // Method A on/off
         planner->setNumThreads(num_threads);  // Batch RRT (K=1 = serial)
-        planner->setShortcutThreads(num_threads);  // 剪枝复用同一批线程槽位
+        planner->setShortcutThreads(num_threads);  // pruning reuses the same thread slots
 
         // Decide start config: priority is starts-file > fixed-start > random
         Config start_config(7);
@@ -1523,7 +1523,7 @@ int main(int argc, char* argv[]) {
         Matrix4f start_tcp = robot->getGCPGlobalPose();
         result.tcp_to_apple_start = (start_tcp.block<3,1>(0,3) - scene.apple_pos).norm();
 
-        // 保存这个 run 的起点 (CSV 一行)
+        // Save this run's start configuration (one CSV row)
         if (starts_out.is_open()) {
             for (int j = 0; j < 7; ++j) {
                 starts_out << start_config[j] << (j == 6 ? "\n" : ",");
@@ -1552,8 +1552,8 @@ int main(int argc, char* argv[]) {
                 planners[k]->addExtraSetupTimeMs(voxel_build_ms);
                 planners[k]->setGoalBiasProb(method_a_enabled ? 0.15f : 0.0f);
                 planners[k]->setNumThreads(1);  // each tree runs serial K=1 internally
-                // 竞速后只有赢家做 shortcut, 此时其余核空闲; robot/checker
-                // 的 per-thread 槽位按 num_threads(=K) 分配, 剪枝可全用
+                // After the race only the winner is shortcut, so the other cores are idle; the
+                // per-thread slots of robot/checker are allocated by num_threads(=K), so pruning can use them all
                 planners[k]->setShortcutThreads(num_threads);
                 if (!planners[k]->setStart(start_config)) {
                     std::cerr << "ERROR: planner[" << k << "] setStart failed\n";
@@ -1658,8 +1658,8 @@ int main(int argc, char* argv[]) {
                                                           - result.pose_calc_ms);
 
             auto solution = planner->getSolution();
-            // 方法1:score-aware shortcutting(与建树同一有效性检查;
-            // 指标与 grasp_path CSV 均在剪枝后的路径上计)
+            // Method 1: score-aware shortcutting (same validity checks as tree growth;
+            // both the metrics and the grasp_path CSV are computed on the pruned path)
             if (shortcut_enabled && solution.size() > 2) {
                 auto t_sc0 = std::chrono::high_resolution_clock::now();
                 auto sc = planner->shortcutSolutionPath(solution);
@@ -1780,9 +1780,9 @@ int main(int argc, char* argv[]) {
                 result.path_env_turning_deg = static_cast<float>(env_turn);
                 result.path_env_turns       = env_turns;
 
-                // ---- Finger-first 事后指标:首次触及苹果的部位与对准角 ----
-                // 手部 4 球(palm / mouth-front / 两指),球心距苹果心
-                // ≤ r_sphere + r_apple 记为接触;取路径上首个接触路点。
+                // ---- Finger-first post-hoc metric: which part touches the apple first, and the alignment angle ----
+                // The 4 hand spheres (palm / mouth-front / two fingers); a contact is recorded when the
+                // sphere center is within r_sphere + r_apple of the apple center; the first such waypoint is taken.
                 {
                     struct HS { const char* part; Vector3f off; };
                     const HS hs[4] = {
@@ -1820,16 +1820,16 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // ---- Branch-stiffness 事后指标:"硬切"违规计数 ----
-                // 探针点(与 VF 同款 6 个手臂点)穿入软枝的深度超过
-                // allow(t) = 5mm + 25mm·t(根部几乎不许压,梢部可压
-                // ~3cm)即记一次违规。反映"会折断枝条"的穿越。
+                // ---- Branch-stiffness post-hoc metric: "hard cut" violation count ----
+                // A violation is recorded whenever a probe point (the same 6 arm points used by
+                // the VF) penetrates a soft branch deeper than allow(t) = 5mm + 25mm*t (almost no
+                // squeezing at the root, up to ~3 cm at the tip). It captures branch-snapping traversals.
                 {
-                    // 体积化探针(半径 = SDF 球模型;含手指),穿入深度
-                    // pen = (r_枝 + r_体) − dist,即枝条被机体挤开的位移。
-                    // allow(t) = 15mm + 60mm·t:根部几乎不许挤,梢部可挤
-                    // ~7.5cm(细枝易弯)。苹果近旁 12cm 内的接触是抓取
-                    // 固有的(嵌枝苹果),不计入 —— 只统计"途中硬切"。
+                    // Volumetric probes (radius = the SDF sphere model; fingers included); penetration depth
+                    // pen = (r_branch + r_body) - dist, i.e. how far the branch is pushed aside by the body.
+                    // allow(t) = 15mm + 60mm*t: almost no squeezing at the root, up to ~7.5 cm at the tip
+                    // (thin branches bend easily). Contacts within 12 cm of the apple are inherent to the
+                    // grasp (branch-embedded apple) and are excluded — only "hard cuts en route" are counted.
                     struct Probe { const char* frame; Vector3f off; float r; };
                     const Probe probes[9] = {
                         {"panda_link3", Vector3f(0,0,0.15f), 0.07f},
@@ -1843,8 +1843,8 @@ int main(int argc, char* argv[]) {
                         {"panda_hand",  Vector3f(0,-0.04f,0.05f), 0.06f},
                     };
                     const auto& cyls2 = cost_evaluator->getCylinders();
-                    double soft_pen_sum = 0.0;   // 软枝穿入深度累加 (有接触样本)
-                    long   soft_pen_cnt = 0;     // 有接触的探针-路点样本数
+                    double soft_pen_sum = 0.0;   // accumulated soft-branch penetration depth (contacting samples)
+                    long   soft_pen_cnt = 0;     // number of contacting probe-waypoint samples
                     for (size_t i = 0; i < solution.size(); ++i) {
                         robot->setJointValues(solution[i]);
                         bool violated = false;
@@ -1853,7 +1853,7 @@ int main(int argc, char* argv[]) {
                             Vector3f pp = pose.block<3,1>(0,3)
                                         + pose.block<3,3>(0,0) * pr.off;
                             if ((pp - scene.apple_pos).norm() < 0.12f)
-                                continue;   // 终端抓取接触不计
+                                continue;   // terminal grasp contacts are not counted
                             for (const auto& cyl : cyls2) {
                                 if (cyl.exclude_from_aniso) continue;
                                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
@@ -1864,9 +1864,9 @@ int main(int argc, char* argv[]) {
                                           (pp - cyl.p0).dot(seg) / seg_sq))
                                     : 0.0f;
                                 float dist = (pp - (cyl.p0 + u * seg)).norm();
-                                float pen = (cyl.radius + pr.r) - dist;  // 体积化
+                                float pen = (cyl.radius + pr.r) - dist;  // volumetric
                                 if (pen <= 0.0f) continue;
-                                // 软枝穿透深度指标(与 allow 无关的原始穿入量)
+                                // Soft-branch penetration metric (raw penetration, independent of allow)
                                 result.max_soft_pen = std::max(result.max_soft_pen, pen);
                                 soft_pen_sum += pen;
                                 ++soft_pen_cnt;
@@ -1980,7 +1980,7 @@ int main(int argc, char* argv[]) {
         std::cout << "\n[PenGate telemetry] configs checked=" << chk
                   << "  rejects=" << rej
                   << " (" << (chk ? 100.0*rej/chk : 0.0) << "%)"
-                  << "  —— 期望: 有解 run 的 cut_violations 恒为 0\n";
+                  << "  — expected: cut_violations is always 0 for solved runs\n";
     }
     if (pen_steer_enabled) {
         unsigned long long calls = cost_evaluator->getDepthSteerCalls();
@@ -2038,7 +2038,7 @@ int main(int argc, char* argv[]) {
               << (100.0 * success_count / num_runs) << "%)\n";
 
     if (success_count > 0) {
-        // 收集所有成功 run 的各项指标
+        // Collect the metrics of all successful runs
         auto collect = [&](auto getter) {
             std::vector<float> v;
             v.reserve(all_results.size());
@@ -2127,7 +2127,7 @@ int main(int argc, char* argv[]) {
         row("Nodes",           nd, "   ");
         row("Grasp tries",     tr, "   ");
 
-        // ---- 软枝(绿枝)穿透深度: 判断机体是否穿绿枝太深 (mm) ----
+        // ---- Soft-branch (green branch) penetration depth: did the body press too deep (mm) ----
         auto msp_v = collect([](const RunResult& r){ return r.max_soft_pen  * 1000.0f; });
         auto mnp_v = collect([](const RunResult& r){ return r.mean_soft_pen * 1000.0f; });
         auto msp = stats(msp_v);
@@ -2137,8 +2137,8 @@ int main(int argc, char* argv[]) {
         row("Mean soft-branch pen", mnp, " mm");
         int cuts_total = 0;
         for (const auto& r : all_results) if (r.success) cuts_total += r.cut_violations;
-        std::cout << "  (allow(t) 预算 15→75mm 沿枝; cut_violations 总计 = "
-                  << cuts_total << " —— 超预算的穿透次数)\n";
+        std::cout << "  (allow(t) budget 15->75 mm along the branch; cut_violations total = "
+                  << cuts_total << " — number of over-budget penetrations)\n";
     }
 
     std::cout << "\n  Results written to: " << out_dir << "/\n"
