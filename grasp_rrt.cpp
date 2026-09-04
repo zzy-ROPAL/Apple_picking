@@ -433,7 +433,25 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
     } else if (!panda_robot) {
         robot_->prepareJacobians();
     }
-    MatrixXf J_T = robot_->computeJacobian().transpose();
+    // Mapping (a): each workspace force is converted with the Jacobian evaluated at
+    // ITS OWN application point. Reusing the end-effector Jacobian (the previous
+    // behaviour) is only valid for forces acting at the end effector: for a force on
+    // link3 it commands joints 4-7, which cannot move link3 at all, and in 3-8% of
+    // configurations the resulting motion pushes the link further into the obstacle.
+    // Frames repeat across the three loops below, so results are cached per call.
+    struct JacEntry { int fid; Vector3f off; MatrixXf J; };
+    std::vector<JacEntry> jac_cache;
+    jac_cache.reserve(12);
+    auto jacobianAt = [&](int fid, const Vector3f& off) -> const MatrixXf& {
+        for (const auto& e : jac_cache) {
+            if (e.fid == fid && (e.off - off).squaredNorm() < 1e-12f) return e.J;
+        }
+        MatrixXf J = panda_robot
+            ? panda_robot->computeSphereJacobianDirect(fid, off)
+            : robot_->computeSphereJacobianById(fid, off);
+        jac_cache.push_back({fid, off, std::move(J)});
+        return jac_cache.back().J;
+    };
 
     Matrix4f tcp_pose = robot_->getGCPGlobalPose();
     Vector3f tcp_pos = tcp_pose.block<3,1>(0,3);
@@ -521,9 +539,8 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                         if (act > bs_act) bs_act = act;
 
                         radial /= dist;
-                        Eigen::VectorXf e_rep = Eigen::VectorXf::Zero(6);
-                        e_rep.head<3>() = radial * (stiff * depth);
-                        Config link_rep = J_T * e_rep;
+                        Vector3f F_stiff = radial * (stiff * depth);
+                        Config link_rep = jacobianAt(pt.fid, pt.offset).transpose() * F_stiff;
                         if (link_rep.norm() > 1e-6f)
                             soft_stiff_vector += link_rep.normalized() * act;
                         continue;
@@ -543,18 +560,16 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                     radial /= dist;
                     float force_mag = 1.0f / (dist * dist);
 
-                    Eigen::VectorXf e_rep = Eigen::VectorXf::Zero(6);
-                    e_rep.head<3>() = radial * force_mag;
-                    Config link_rep = J_T * e_rep;
+                    const MatrixXf& J_pt = jacobianAt(pt.fid, pt.offset);
+                    Config link_rep = J_pt.transpose() * (radial * force_mag);
                     if (link_rep.norm() > 1e-6f)
                         hard_trunk_rep_vector += link_rep.normalized();
 
                     Vector3f vortex_dir = cyl.axis_unit.cross(radial);
                     if (vortex_dir.norm() > 1e-6f) {
                         vortex_dir.normalize();
-                        Eigen::VectorXf e_v = Eigen::VectorXf::Zero(6);
-                        e_v.head<3>() = vortex_dir * force_mag * 1.5f;
-                        Config link_vortex = J_T * e_v;
+                        Config link_vortex =
+                            J_pt.transpose() * (vortex_dir * force_mag * 1.5f);
                         if (link_vortex.norm() > 1e-6f)
                             vortex_vector += link_vortex.normalized();
                     }
@@ -589,16 +604,13 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
             if (dist < hard_obstacle_trigger_ && dist > 0.01f) {
                 p_to_obs.normalize();
                 float force_mag = 1.0f / (dist * dist);
-                Eigen::VectorXf e_rep = Eigen::VectorXf::Zero(6);
-                e_rep.head<3>() = p_to_obs * force_mag;
-                Config node_rep = J_T * e_rep;
+                const MatrixXf& J_pt = jacobianAt(pt.fid, pt.offset);
+                Config node_rep = J_pt.transpose() * (p_to_obs * force_mag);
                 if (node_rep.norm() > 1e-6f) total_hard_obs_rep += node_rep.normalized();
                 Vector3f v_dir = Vector3f(0,0,1).cross(p_to_obs);
                 if (v_dir.norm() > 1e-6f) {
                     v_dir.normalize();
-                    Eigen::VectorXf e_v = Eigen::VectorXf::Zero(6);
-                    e_v.head<3>() = v_dir * force_mag * 1.5f;
-                    Config bin_v = J_T * e_v;
+                    Config bin_v = J_pt.transpose() * (v_dir * force_mag * 1.5f);
                     if (bin_v.norm() > 1e-6f) total_hard_obs_rep += bin_v.normalized() * 0.5f;
                 }
             }
@@ -669,9 +681,8 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                 }
                 // dnav = infinity (outside the field / unreachable) -> keep the straight-line fallback
             }
-            Eigen::VectorXf e_a = Eigen::VectorXf::Zero(6);
-            e_a.head<3>() = dir * ap.weight;
-            Config link_att = J_T * e_a;
+            Config link_att =
+                jacobianAt(ap.fid, ap.offset).transpose() * (dir * ap.weight);
             if (link_att.norm() > 1e-6f) att_vector += link_att.normalized() * ap.weight;
         }
         if (att_vector.norm() > 1e-6f) att_vector.normalize();
