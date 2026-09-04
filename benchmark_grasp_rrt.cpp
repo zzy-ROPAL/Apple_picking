@@ -480,7 +480,7 @@ int main(int argc, char* argv[]) {
     bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing branch-selection oscillation. Branch A along x̂ above apple, branch B along ẑ in front of apple.
     bool sparse_long_scene  = false;  // --sparse-long: standard 10-branch scene with wider vertical/angular spacing and ~1.7x longer branches
     bool xgate_scene        = false;  // --xgate: multi-branch scene = V6 rigid A + two CROSSED soft branches (B1 ŷ, B2 x̂) whose 5cm envelopes overlap on the approach corridor. Tests MAX-vs-winner oscillation.
-    float vf_w_rep          = 2.4f;   // --vf-w-rep W: VF blend weight, semi-rigid branch repulsion
+    float vf_w_rep          = 3.6f;   // --vf-w-rep W: VF blend weight, semi-rigid branch repulsion
     float vf_w_att          = 4.0f;   // --vf-w-att W: VF blend weight, goal attraction
     float bs_weight_max     = 6.0f;   // --bs-weight-max W: upper bound of the stiffness axis-dominance weight
     float vf_w_rigid        = 1.0f;   // --vf-w-rigid W: VF blend weight, rigid-cylinder repulsion

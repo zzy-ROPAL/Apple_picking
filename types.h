@@ -201,7 +201,7 @@ struct GraspRrtConfig {
     // Retuned 2026-09-03 after the switch to per-point Jacobians and sum-then-normalize
     // aggregation (the old 1.2/2.5/2.0 were fit against the previous behaviour). Chosen
     // from a screening sweep + N=200 confirmation; see experiments/2026-09-03_vf_jacobian.
-    float vf_w_rep      = 2.4f;   // semi-rigid branch repulsion (SDF gradient, per-sphere J)
+    float vf_w_rep      = 3.6f;   // semi-rigid branch repulsion (SDF gradient, per-sphere J)
     float vf_w_rigid    = 1.0f;   // rigid cylinder repulsion (trunk, rigid branches)
     float vf_w_vortex   = 4.0f;   // circulation around rigid cylinders
     float vf_w_hardobs  = 2.5f;   // standalone hard obstacle (dormant in tree6 scenes)
