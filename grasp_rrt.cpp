@@ -540,9 +540,10 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
 
                         radial /= dist;
                         Vector3f F_stiff = radial * (stiff * depth);
-                        Config link_rep = jacobianAt(pt.fid, pt.offset).transpose() * F_stiff;
-                        if (link_rep.norm() > 1e-6f)
-                            soft_stiff_vector += link_rep.normalized() * act;
+                        // Sum the real forces; the term is normalized once after the
+                        // loop. Magnitudes therefore survive within the sum, so a deep
+                        // contact near a stiff root outvotes a shallow one at the tip.
+                        soft_stiff_vector += jacobianAt(pt.fid, pt.offset).transpose() * F_stiff;
                         continue;
                     }
 
@@ -561,17 +562,15 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                     float force_mag = 1.0f / (dist * dist);
 
                     const MatrixXf& J_pt = jacobianAt(pt.fid, pt.offset);
-                    Config link_rep = J_pt.transpose() * (radial * force_mag);
-                    if (link_rep.norm() > 1e-6f)
-                        hard_trunk_rep_vector += link_rep.normalized();
+                    hard_trunk_rep_vector += J_pt.transpose() * (radial * force_mag);
 
                     Vector3f vortex_dir = cyl.axis_unit.cross(radial);
                     if (vortex_dir.norm() > 1e-6f) {
                         vortex_dir.normalize();
-                        Config link_vortex =
-                            J_pt.transpose() * (vortex_dir * force_mag * 1.5f);
-                        if (link_vortex.norm() > 1e-6f)
-                            vortex_vector += link_vortex.normalized();
+                        // The former x1.5 factor had no effect while each contribution
+                        // was normalized individually; it is dropped rather than
+                        // silently revived, keeping the previous vortex:repulsion 1:1.
+                        vortex_vector += J_pt.transpose() * (vortex_dir * force_mag);
                     }
                 }
             }
@@ -605,13 +604,12 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                 p_to_obs.normalize();
                 float force_mag = 1.0f / (dist * dist);
                 const MatrixXf& J_pt = jacobianAt(pt.fid, pt.offset);
-                Config node_rep = J_pt.transpose() * (p_to_obs * force_mag);
-                if (node_rep.norm() > 1e-6f) total_hard_obs_rep += node_rep.normalized();
+                total_hard_obs_rep += J_pt.transpose() * (p_to_obs * force_mag);
                 Vector3f v_dir = Vector3f(0,0,1).cross(p_to_obs);
                 if (v_dir.norm() > 1e-6f) {
                     v_dir.normalize();
-                    Config bin_v = J_pt.transpose() * (v_dir * force_mag * 1.5f);
-                    if (bin_v.norm() > 1e-6f) total_hard_obs_rep += bin_v.normalized() * 0.5f;
+                    // vortex at half the repulsion, as before (the x1.5 was dead)
+                    total_hard_obs_rep += J_pt.transpose() * (v_dir * force_mag * 0.5f);
                 }
             }
         }
@@ -685,9 +683,10 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                 }
                 // dnav = infinity (outside the field / unreachable) -> keep the straight-line fallback
             }
-            Config link_att =
-                jacobianAt(ap.fid, ap.offset).transpose() * (dir * ap.weight);
-            if (link_att.norm() > 1e-6f) att_vector += link_att.normalized() * ap.weight;
+            // ap.weight was previously applied twice (once in the force, once after
+            // normalizing), making the effective point weights 0.16/0.36/1.0. It is
+            // now applied once, so they are the stated 0.4/0.6/1.0.
+            att_vector += jacobianAt(ap.fid, ap.offset).transpose() * (dir * ap.weight);
         }
         if (att_vector.norm() > 1e-6f) att_vector.normalize();
     }
