@@ -192,6 +192,18 @@ struct GraspRrtConfig {
     // buildLocalAxisTensor. MUST stay 0.0 until then.
     float branch_anisotropy_K_ax        = 0.0f;
 
+    // ---- Vector-field blend weights ----
+    // Every component reaches the blend as a UNIT direction (see computeVectorField),
+    // so these coefficients set the relative priority of the components, not force
+    // magnitudes. The stiffness term is the exception: its weight is dynamic,
+    // bs_act * bs_weight_max, so a deep contact near a stiff root can outrank
+    // attraction and make the net field point outward.
+    float vf_w_rep      = 1.2f;   // semi-rigid branch repulsion (SDF gradient, per-sphere J)
+    float vf_w_rigid    = 2.5f;   // rigid cylinder repulsion (trunk, rigid branches)
+    float vf_w_vortex   = 2.0f;   // circulation around rigid cylinders
+    float vf_w_hardobs  = 2.5f;   // standalone hard obstacle (dormant in tree6 scenes)
+    float vf_w_att      = 4.0f;   // goal attraction
+
     // ---- Branch stiffness (soft-branch stiffness field, pure guidance, no rejection) ----
     // Physical model: a branch is a cantilever — stiff at the root (forcing it snaps),
     // soft at the tip (easy to sweep aside); deeper toward the axis needs more displacement.

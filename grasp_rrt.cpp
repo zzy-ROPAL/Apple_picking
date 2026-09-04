@@ -615,6 +615,10 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                 }
             }
         }
+        // Normalize like every other component: without this the term's magnitude
+        // grew with the number of protection points in range (up to ~7.5), silently
+        // overriding the blend weights. Dormant in tree6 scenes (no overhead obstacle).
+        if (total_hard_obs_rep.norm() > 1e-6f) total_hard_obs_rep.normalize();
     }
 
     // 3. Attraction field — applied to wrist region (link6, link7, hand) + TCP
@@ -693,10 +697,12 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
     // from 0 to bs_weight_max (default 6.0, above the attraction weight 4.0). At shallow
     // contact it merely supplements the repulsion; near the branch axis the net field
     float w_stiff = bs_act * config_.bs_weight_max;
-    vf = 1.2f * rep_vector + w_stiff * soft_stiff_vector +
-         2.5f * hard_trunk_rep_vector + 2.0f * vortex_vector +
-         2.5f * total_hard_obs_rep +
-         4.0f * att_vector;
+    vf = config_.vf_w_rep     * rep_vector +
+         w_stiff              * soft_stiff_vector +
+         config_.vf_w_rigid   * hard_trunk_rep_vector +
+         config_.vf_w_vortex  * vortex_vector +
+         config_.vf_w_hardobs * total_hard_obs_rep +
+         config_.vf_w_att     * att_vector;
     if (vf.norm() > 1e-6f) vf.normalize();
     return vf;
 }
