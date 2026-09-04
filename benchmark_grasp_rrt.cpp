@@ -480,8 +480,11 @@ int main(int argc, char* argv[]) {
     bool diag_scene         = false;  // --diag-scene: minimal two-orthogonal-branches diagnostic scene for testing branch-selection oscillation. Branch A along x̂ above apple, branch B along ẑ in front of apple.
     bool sparse_long_scene  = false;  // --sparse-long: standard 10-branch scene with wider vertical/angular spacing and ~1.7x longer branches
     bool xgate_scene        = false;  // --xgate: multi-branch scene = V6 rigid A + two CROSSED soft branches (B1 ŷ, B2 x̂) whose 5cm envelopes overlap on the approach corridor. Tests MAX-vs-winner oscillation.
-    float vf_w_rigid        = 2.5f;   // --vf-w-rigid W: VF blend weight, rigid-cylinder repulsion
-    float vf_w_vortex       = 2.0f;   // --vf-w-vortex W: VF blend weight, rigid-cylinder circulation
+    float vf_w_rep          = 2.4f;   // --vf-w-rep W: VF blend weight, semi-rigid branch repulsion
+    float vf_w_att          = 4.0f;   // --vf-w-att W: VF blend weight, goal attraction
+    float bs_weight_max     = 6.0f;   // --bs-weight-max W: upper bound of the stiffness axis-dominance weight
+    float vf_w_rigid        = 1.0f;   // --vf-w-rigid W: VF blend weight, rigid-cylinder repulsion
+    float vf_w_vortex       = 4.0f;   // --vf-w-vortex W: VF blend weight, rigid-cylinder circulation
     int   winner_metric_k   = 3;      // --winner-metric-k K: how many nearest non-rigid branches the post-hoc winner-switch metric scores
     bool edge_refuse_enabled = false;   // --edge-refuse: enable anisotropic edge refuse (Layer 1)
     bool edge_refuse_tensor  = false;   // --edge-refuse-tensor: structure-tensor aggregation instead of MAX (implies --edge-refuse)
@@ -584,6 +587,12 @@ int main(int argc, char* argv[]) {
         } else if (a == "--xgate") {
             xgate_scene = true;
             diag_scene  = true;   // reuse diag apple/overhead override + geometry gating
+        } else if (a == "--vf-w-rep" && i + 1 < argc) {
+            vf_w_rep = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--vf-w-att" && i + 1 < argc) {
+            vf_w_att = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--bs-weight-max" && i + 1 < argc) {
+            bs_weight_max = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--vf-w-rigid" && i + 1 < argc) {
             vf_w_rigid = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--vf-w-vortex" && i + 1 < argc) {
@@ -1351,6 +1360,9 @@ int main(int argc, char* argv[]) {
     config.branch_anisotropy_K_ax = branch_aniso_K_ax;   // Option A: axial drag on/off
     config.extension_coin_flip = extension_coin_flip;    // ablation: stochastic switch vs deterministic blend
     // Finger-first steering (pure guidance, no rejection)
+    config.vf_w_rep      = vf_w_rep;
+    config.vf_w_att      = vf_w_att;
+    config.bs_weight_max = bs_weight_max;
     config.vf_w_rigid  = vf_w_rigid;
     config.vf_w_vortex = vf_w_vortex;
     config.branch_stiffness_enabled = branch_stiffness;

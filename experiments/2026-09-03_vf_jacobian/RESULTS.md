@@ -40,3 +40,45 @@ w = vf_w_rigid / vf_w_vortex.
 
 Decision: keep (a) with default weights, on correctness grounds -- it is
 mechanically right and measurably comparable.
+
+---
+
+# Weight retune after per-point Jacobian + sum-then-normalize (same day)
+
+The old weights 1.2 / 2.5 / 2.0 (rep / rigid / vortex) were fit against the
+previous behaviour, so they were re-screened. All 22 sweep configurations kept
+50/50 success and cut_violations = 0: the validity layer is independent of the
+guidance weights, as designed.
+
+## One-at-a-time screening (N=50 each, wide spacing so effects exceed noise)
+
+Consistent directions, all trading time for quality:
+  higher vf_w_rep     -> shallower contact, better axial, slower
+  lower  vf_w_rigid   -> better on every metric
+  higher vf_w_vortex  -> markedly shallower contact
+  lower  vf_w_att     -> much shallower contact, much slower
+  higher bs_weight_max-> shallower contact, much slower
+
+## Confirmation (N=200 pooled)
+
+| rep/rigid/vortex | p50 | p90 | p99 | max_pen | mean_pen | axial | rad_depth |
+|---|---|---|---|---|---|---|---|
+| 1.2/2.5/2.0 (old) | 105.9 | 307.5 | 383.3 | 34.0 | 12.0 | 0.488 | 0.627 |
+| 0.4/1.0/4.0 | 92.5 | 304.8 | 389.4 | 31.0 | 12.0 | 0.489 | 0.625 |
+| 1.2/1.0/4.0 | 113.8 | 290.4 | 339.8 | 26.0 | 11.0 | 0.483 | 0.633 |
+| **2.4/1.0/4.0 (new default)** | 124.5 | **264.9** | 349.4 | **25.0** | **10.0** | **0.461** | **0.648** |
+
+2.4/1.0/4.0 wins every quality metric AND the p90 tail; only p50 is worse
+(+18%). Since the budget claim rests on the tail, not the median, and the
+method's thesis is minimizing branch damage, this is the right trade.
+
+## Pareto alternatives (N=50, not confirmed)
+
+| config | p50 | p90 | max_pen | axial | note |
+|---|---|---|---|---|---|
+| 2.4/0.5/4.0 | 107.5 | 232.3 | 30.0 | 0.454 | best tail, faster, shallower than old |
+| 3.6/1.0/4.0 | 169.2 | 275.0 | 26.0 | 0.412 | best axial |
+| 2.4/1.0/4.0 + bs_max 9 | 223.1 | 422.3 | 19.0 | 0.436 | best depth, well over 2x slower |
+
+Pick along this frontier if the paper needs a different balance. Everything
+stays far inside the sub-second budget (worst p99 observed ~420 ms).

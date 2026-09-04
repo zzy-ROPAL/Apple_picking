@@ -198,9 +198,12 @@ struct GraspRrtConfig {
     // magnitudes. The stiffness term is the exception: its weight is dynamic,
     // bs_act * bs_weight_max, so a deep contact near a stiff root can outrank
     // attraction and make the net field point outward.
-    float vf_w_rep      = 1.2f;   // semi-rigid branch repulsion (SDF gradient, per-sphere J)
-    float vf_w_rigid    = 2.5f;   // rigid cylinder repulsion (trunk, rigid branches)
-    float vf_w_vortex   = 2.0f;   // circulation around rigid cylinders
+    // Retuned 2026-09-03 after the switch to per-point Jacobians and sum-then-normalize
+    // aggregation (the old 1.2/2.5/2.0 were fit against the previous behaviour). Chosen
+    // from a screening sweep + N=200 confirmation; see experiments/2026-09-03_vf_jacobian.
+    float vf_w_rep      = 2.4f;   // semi-rigid branch repulsion (SDF gradient, per-sphere J)
+    float vf_w_rigid    = 1.0f;   // rigid cylinder repulsion (trunk, rigid branches)
+    float vf_w_vortex   = 4.0f;   // circulation around rigid cylinders
     float vf_w_hardobs  = 2.5f;   // standalone hard obstacle (dormant in tree6 scenes)
     float vf_w_att      = 4.0f;   // goal attraction
 
