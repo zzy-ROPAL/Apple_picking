@@ -17,14 +17,17 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 依赖:**Eigen3**、**Pinocchio**(FK/Jacobian)、**Bullet3**(碰撞)。URDF 查找:
 argv → 环境变量 `PANDA_URDF` → pybullet_data 硬编码路径。
 
-**当前标准实验命令**(tree6 简化树、15mm 枝、苹果在枝根、全机制栈):
+**当前标准实验命令**(tree6 简化树、15mm 枝、苹果在枝根):
 
 ```bash
 ./build/benchmark_grasp_rrt 50 --starts-file <starts.txt> \
   --tree6-simple --branch-rscale 0.5 --apple-root --apple-branch-soft \
-  --branch-stiffness --shortcut --uni-refuse --nav-field --or-parallel 8 \
+  --shortcut --uni-refuse --nav-field --or-parallel 8 \
   --label <标签>
 ```
+
+**2026-09-03 起 `--branch-stiffness` 不再默认开**(用户决定)。stiffness 场代码保留,
+加回该开关即可复现旧配置与 0.40/0.74 消融对照。
 
 输出目录名由开关自动拼接(`_pengate_uni_nav_<label>`),内含 `benchmark_results.csv`
 (每行一 run)、`grasp_path_XX.csv`(轨迹,7 关节/行)、`scene_layout.json`
@@ -41,8 +44,9 @@ Phase3 **只用 shortcut,TrajOpt 已被用户明令禁用**(指标一律 raw/sho
 | 树生长引导 | **VF-RRT**:`dir = normalize(0.5·随机 + 0.5·场)`;采样均匀 → 概率完备保持 | `extendVFRRT` |
 | — 吸引(全局路由) | **nav 场**:体素网格上多源 Dijkstra(种子=苹果下方球冠;刚性+禁核不可通行;软枝壳层过路费 ∝ 深度×刚度,gain=8)。远场走洪泛下坡,**测地距离 < 0.15m(+0.10 平滑带)** 切回随机球冠点直线吸引(球冠每 1000 cycle 重采样)。切换一律测地、绝不欧氏(苹果正上方欧氏近测地远,防止从上硬凿) | `buildNavField`, `queryNavDirection/Distance` |
 | — 斥力(全臂避障) | SDF 梯度斥力(~20 球覆盖全臂,读预计算距离网格) | `evaluateAnisotropicForce` |
-| — 软枝额外推离(轻柔度) | **stiffness 场**(force ∝ stiffness(t)·depth,根硬梢软)。消融结论:去掉它快 32% 但典型接触深度 0.40→0.74,**保留** | `computeVectorField` |
+| — 软枝额外推离(轻柔度) | **stiffness 场**(force ∝ stiffness(t)·depth,根硬梢软)。消融:去掉它快 32% 但接触深度 0.40→0.74。**2026-09-03 起默认关闭**,`--branch-stiffness` 开 | `computeVectorField` |
 | — 绕树干 | 旋涡场(刚性圆柱切向环流) | 同上 |
+| — 力→关节映射 | 每个力用**其作用点自身的雅可比** `Jᵢᵀ`(2026-09-03 修正;旧实现全部复用末端 J,对 link3/link4 有 3–8% 概率把连杆推向障碍)。各分量先归一化再按权重混合,权重在 `types.h::vf_w_*` | `computeVectorField`, `computeSphereJacobianDirect` |
 | — 采样偏置 | Method A(最优赤道下节点加抖动) | `sampleGoalBiased` |
 | 软枝安全交互 | 三层:**unified steering**(提议投影)→ **severity sigmoid**(边级概率拒绝)→ **pen gate**(硬有效性,唯一保证层) | 见下 |
 | 碰撞 | Bullet DCD 递归中点,eager | `cspace_sampled.h` |
@@ -72,8 +76,13 @@ severity = h_in·内压/(κ·slack) + G·轴滑/L_ax(t)
 (`axis_clear = 10mm·(1−t)`,梢部为 0)→ 构型无效。挂在 `isConfigValid` 上,
 DCD/下探/shortcut/起点全部自动继承。cuts=0 是构造保证,不是统计结果。
 
-旧机制(depth steering `--pen-steer`、sample steering、tensor edge refuse、sticky)
-全部保留在代码里作 ablation,`--uni-refuse` 时自动禁用。
+旧机制现状(2026-09-03):
+- `--pen-steer`(depth steering)、`--edge-refuse-tensor`:保留,`--uni-refuse` 时自动禁用
+- **sample steering、sticky winner:已整体删除**(`ef640a1` / `87725ae` / `5437b64`)。
+  二者的 CLI 开关改为显式报错退出,历史实现见 `fee46a1`。删除前均已长期不参与任何实验
+  (前者默认关且被 `--uni-refuse` 强制禁用,后者两个调用块都在 `#if 0` 里)。
+- `maxWinnerBranchId` **保留**:它是事后振荡指标(CSV 的 winner_* 三列 + measure_trajopt),
+  与已删的 sticky 机制无关;参数更名为 `winner_metric_envelope` / `--winner-metric-k`。
 
 ## 关键文件
 
@@ -122,8 +131,13 @@ Isaac 回放:`replay_isaac.py` + `isaac_calibration_tree6.yaml`(记得 z=0.4)。
 | 配置 | 成功 | 均时 | cuts | 接触深度中位 | 轴向分数 |
 |---|---|---|---|---|---|
 | 无约束 baseline | 49/50 | 3514ms | **23/49 切枝** | — | 0.54 |
-| 当前全栈(= 上面标准命令) | 50/50 | **714ms** | **0/50** | **0.40** | **0.45** |
-| 全栈去 stiffness(消融) | 50/50 | 482ms | 0/50 | 0.74 | 0.51 |
+| 全栈含 stiffness(旧标准命令) | 50/50 | **714ms** | **0/50** | **0.40** | **0.45** |
+| 全栈去 stiffness | 50/50 | 482ms | 0/50 | 0.74 | 0.51 |
+
+**2026-09-03 复测**(当前标准命令,无 stiffness,per-link 雅可比;N=200 池化):
+中位 89.6ms / p75 200.6 / p90 255.4 / 均值 129.1,50/50,cuts=0。比旧表快得多,
+因为其间落地了 per-check 性能优化(FK 缓存、DCD 去重、并行 shortcut)——**旧表的
+714/482 ms 不可与新数字直接比较**,仅在同一次会话内横向对比才有意义。
 
 关键结论链:引导场永远只能减少"可避免的"伤害,保证必须来自有效性层(gate);
 约束+路由对齐后,安全栈反而比无约束快 6.4×。
@@ -137,11 +151,22 @@ Isaac 回放:`replay_isaac.py` + `isaac_calibration_tree6.yaml`(记得 z=0.4)。
    包络内飞行 两项(最差轴向 run32 max_pen 仅 13mm,证明大头是飞行)。
 3. clamp 0.7→0.5 选项(更浅接触,代价时间)——等 Isaac 回放判断是否需要。
 4. 预算标定:用 Isaac 回放实测枝条变形,校准 allow(t)/L_ax(t)/η。
-5. **git**:仓库是 git,近期全部改动未 commit——新机器上先 `git status` 看情况,
-   建议按机制分块提交。
+5. **VF 权重再标定**(可选):`vf_w_*` 现在都在 `types.h`。2026-09-03 对
+   `vf_w_rigid × vf_w_vortex` 做过 3×3 扫,没找到比 2.5/2.0 更好的组合 —— 但那次扫
+   受噪声限制(50-run 均值的 run 间波动 ±6–13%,分布重尾:中位 ~85ms 均值 ~127ms)。
+   要真正定权重需要每组 200+ run,或改用中位/p90 而非均值做判据。
+6. **VF 各分量聚合方式不一致**:软枝斥力是"真实力求和后归一化一次",其余五项是
+   "每点先归一化再加权求和"。前者深接触压过浅接触,后者近似等权。是建模选择而非
+   bug,但写论文时不能统一写成 `Σ Jᵢᵀ Fᵢ`。
+7. **git**:主工作树(非本 worktree)可能仍有未提交改动,换机器先 `git status`。
 
 ## 工作约定
 
-- 注释/文档中文;调参改 `types.h`,别在 .cpp 硬编码
-- 新机制一律加 CLI 开关,旧机制保留作 ablation,输出目录名带后缀
+- **C++ 源码注释与控制台输出一律英文**(2026-09-03 全量转换,中文残留 0 行);
+  本文档等项目文档保持中文
+- 调参改 `types.h`,别在 .cpp 硬编码(VF 混合权重已于 2026-09-03 移入 `vf_w_*`)
+- 新机制一律加 CLI 开关,输出目录名带后缀
+- 旧机制默认保留作 ablation;**确认长期不参与实验后可以删除**,但删除时:
+  (1) 其 CLI 开关必须改为显式报错,不能静默失效;(2) commit message 记下历史实现的
+  commit 号;(3) 先确认没有指标/工具还在依赖它的辅助函数
 - 每次算法改动:同 starts 文件 5×10 对照 + `--rank` 深度分布 + cuts 必须 0
