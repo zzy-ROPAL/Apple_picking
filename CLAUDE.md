@@ -17,17 +17,14 @@ mkdir -p build && cd build && cmake .. && make -j$(nproc)
 依赖:**Eigen3**、**Pinocchio**(FK/Jacobian)、**Bullet3**(碰撞)。URDF 查找:
 argv → 环境变量 `PANDA_URDF` → pybullet_data 硬编码路径。
 
-**当前标准实验命令**(tree6 简化树、15mm 枝、苹果在枝根):
+**当前标准实验命令**(tree6 简化树、15mm 枝、苹果在枝根、全机制栈):
 
 ```bash
 ./build/benchmark_grasp_rrt 50 --starts-file <starts.txt> \
   --tree6-simple --branch-rscale 0.5 --apple-root --apple-branch-soft \
-  --shortcut --uni-refuse --nav-field --or-parallel 8 \
+  --branch-stiffness --shortcut --uni-refuse --nav-field --or-parallel 8 \
   --label <标签>
 ```
-
-**2026-09-03 起 `--branch-stiffness` 不再默认开**(用户决定)。stiffness 场代码保留,
-加回该开关即可复现旧配置与 0.40/0.74 消融对照。
 
 输出目录名由开关自动拼接(`_pengate_uni_nav_<label>`),内含 `benchmark_results.csv`
 (每行一 run)、`grasp_path_XX.csv`(轨迹,7 关节/行)、`scene_layout.json`
@@ -44,7 +41,7 @@ Phase3 **只用 shortcut,TrajOpt 已被用户明令禁用**(指标一律 raw/sho
 | 树生长引导 | **VF-RRT**:`dir = normalize(0.5·随机 + 0.5·场)`;采样均匀 → 概率完备保持 | `extendVFRRT` |
 | — 吸引(全局路由) | **nav 场**:体素网格上多源 Dijkstra(种子=苹果下方球冠;刚性+禁核不可通行;软枝壳层过路费 ∝ 深度×刚度,gain=8)。远场走洪泛下坡,**测地距离 < 0.15m(+0.10 平滑带)** 切回随机球冠点直线吸引(球冠每 1000 cycle 重采样)。切换一律测地、绝不欧氏(苹果正上方欧氏近测地远,防止从上硬凿) | `buildNavField`, `queryNavDirection/Distance` |
 | — 斥力(全臂避障) | SDF 梯度斥力(~20 球覆盖全臂,读预计算距离网格) | `evaluateAnisotropicForce` |
-| — 软枝额外推离(轻柔度) | **stiffness 场**(force ∝ stiffness(t)·depth,根硬梢软)。消融:去掉它快 32% 但接触深度 0.40→0.74。**2026-09-03 起默认关闭**,`--branch-stiffness` 开 | `computeVectorField` |
+| — 软枝额外推离(轻柔度) | **stiffness 场**(force ∝ stiffness(t)·depth,根硬梢软),`--branch-stiffness`。**2026-09-03 复测:开它不再变慢,反而中位快 ~20%、cycles 少 ~25%,且 axial/径向深度占比都更好 —— 旧表"去掉它快 32%"已失效** | `computeVectorField` |
 | — 绕树干 | 旋涡场(刚性圆柱切向环流) | 同上 |
 | — 力→关节映射 | 每个力用**其作用点自身的雅可比** `Jᵢᵀ`(2026-09-03 修正;旧实现全部复用末端 J,对 link3/link4 有 3–8% 概率把连杆推向障碍)。各分量先归一化再按权重混合,权重在 `types.h::vf_w_*` | `computeVectorField`, `computeSphereJacobianDirect` |
 | — 采样偏置 | Method A(最优赤道下节点加抖动) | `sampleGoalBiased` |
@@ -134,10 +131,21 @@ Isaac 回放:`replay_isaac.py` + `isaac_calibration_tree6.yaml`(记得 z=0.4)。
 | 全栈含 stiffness(旧标准命令) | 50/50 | **714ms** | **0/50** | **0.40** | **0.45** |
 | 全栈去 stiffness | 50/50 | 482ms | 0/50 | 0.74 | 0.51 |
 
-**2026-09-03 复测**(当前标准命令,无 stiffness,per-link 雅可比;N=200 池化):
-中位 89.6ms / p75 200.6 / p90 255.4 / 均值 129.1,50/50,cuts=0。比旧表快得多,
-因为其间落地了 per-check 性能优化(FK 缓存、DCD 去重、并行 shortcut)——**旧表的
-714/482 ms 不可与新数字直接比较**,仅在同一次会话内横向对比才有意义。
+**2026-09-03 复测 2×2**(同起点文件,每格 N=200 池化,全部 50/50 且 cuts=0):
+
+| 配置 | 中位 ms | p90 ms | max_pen 中位 | axial | 径向深度占比 | cycles |
+|---|---|---|---|---|---|---|
+| J_ee 映射,无 stiffness | 84.2 | 268.5 | 37.0mm | 0.536 | 0.592 | 1489 |
+| J_ee 映射,+ stiffness | **66.7** | 294.4 | 38.0mm | **0.486** | **0.632** | **1159** |
+| per-link 映射,无 stiffness | 88.7 | 255.4 | 38.0mm | 0.535 | 0.595 | 1686 |
+| **per-link + stiffness(当前标准)** | 79.7 | 303.8 | **34.0mm** | 0.506 | 0.612 | 1228 |
+
+两个结论:(1) **stiffness 现在是净收益**,旧表的"去掉它快 32%"已被 per-check
+优化推翻;(2) per-link 雅可比换来的是**深度**不是速度 —— 开 stiffness 时
+max_pen 中位 38→34mm(−10.5%),代价中位 +13ms,axial/径向占比略逊于 J_ee。
+取 per-link 是因为论文主张是"少伤枝",深度才是质量主指标,且映射本身正确。
+
+**旧表的 714/482 ms 不可与新数字比较**(其间落地了 FK 缓存、DCD 去重、并行 shortcut)。
 
 关键结论链:引导场永远只能减少"可避免的"伤害,保证必须来自有效性层(gate);
 约束+路由对齐后,安全栈反而比无约束快 6.4×。
