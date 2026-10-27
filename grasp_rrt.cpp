@@ -44,15 +44,47 @@ GraspRrt::GraspRrt(std::shared_ptr<CSpaceSampled> cspace,
 // ============================================================================
 
 bool GraspRrt::setStart(const Config& start_config) {
+    start_violation_ = 0.0f;
+    violating_nodes_ = 0;
+    node_violation_.clear();
+
     if (!cspace_->isConfigValid(start_config)) {
-        std::cerr << "[GraspRrt] ERROR: Start config is invalid (collision or out of bounds)\n";
-        return false;
+        // Start-in-violation: the only admissible reason to accept an invalid root is that
+        // the whole of its invalidity is penetration of an INSERTED capsule. Measure v(q),
+        // then re-run the full validity check with exactly that much HARD_BRANCH slack: if it
+        // now passes, the pose is clear of the trunk, in bounds, within every soft allow(t),
+        // and violates only the budget we just invented. Anything else is a real rejection.
+        bool accepted = false;
+        if (start_in_violation_) {
+            auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
+                cspace_->getCostEvaluator());
+            if (sdf_eval) {
+                float v0 = sdf_eval->penViolation(start_config);
+                if (v0 > 0.0f) {
+                    SdfCostEvaluator::ViolationToleranceGuard g(v0);
+                    if (cspace_->isConfigValid(start_config)) {
+                        start_violation_ = v0;
+                        accepted = true;
+                        if (verbose_) {
+                            std::cout << "[GraspRrt] setStart: rooted in violation, v = "
+                                      << v0 * 1000.0f << " mm\n";
+                        }
+                    }
+                }
+            }
+        }
+        if (!accepted) {
+            std::cerr << "[GraspRrt] ERROR: Start config is invalid (collision or out of bounds)\n";
+            return false;
+        }
     }
 
     // Initialize the tree
     tree_ = std::make_unique<CSpaceTree>(cspace_.get());
     start_node_ = tree_->appendNode(start_config, -1);
     start_node_->setStatus(0);
+    if (start_violation_ > 0.0f)
+        setNodeViolation(start_node_->getId(), start_violation_);
 
     // Process the start node (cache its TCP pose)
     processNode(start_node_);
@@ -80,6 +112,11 @@ void GraspRrt::reset() {
     col_checks_overall_ = 0;
     map_config_tcp_.clear();
     grasps_.clear();
+    // Node ids restart with the tree, so stale per-node violations would be read against
+    // the wrong nodes (and a leftover root violation would relax the gate for them).
+    node_violation_.clear();
+    start_violation_ = 0.0f;
+    violating_nodes_ = 0;
     if (tree_) tree_->reset();
 }
 
@@ -202,7 +239,9 @@ bool GraspRrt::doPlanningCycle() {
 
     float r = randFloat01();
 
-    if (r <= config_.probab_grasp_hypothesis) {
+    // In repair mode the goal is the surviving suffix, not a new grasp, so the
+    // grasp-hypothesis strategy is skipped and every cycle grows the tree.
+    if (!repair_mode_ && r <= config_.probab_grasp_hypothesis) {
         // ===== Strategy A: probabilistically triggered terminal grasp descent =====
         do_normal_connect = false;
         MoveArmResult grasp_status = connectRandomGraspPositionJacobian();
@@ -237,7 +276,9 @@ bool GraspRrt::doPlanningCycle() {
         // ===== Stage one: VF-RRT tree extension (with goal-biased sampling) =====
         Config rand_config;
         float r2 = randFloat01();
-        if (r2 < goal_bias_prob_) {
+        if (repair_mode_ && r2 < repair_goal_prob_) {
+            rand_config = sampleRepairGoalBiased();
+        } else if (r2 < goal_bias_prob_) {
             rand_config = sampleGoalBiased();   // Method A
         } else {
             rand_config = cspace_->getRandomConfig();
@@ -245,6 +286,8 @@ bool GraspRrt::doPlanningCycle() {
         ExtensionResult ext_status = extendVFRRT(rand_config);
         if (ext_status == ExtensionResult::ERROR) {
             stop_search_ = true;
+        } else if (repair_mode_) {
+            tryConnectRepairGoal();
         }
     }
 
@@ -376,6 +419,7 @@ bool GraspRrt::doPlanningCycleBatch(int K) {
         new_node->setCostFromRoot(cost);
         new_node->setEdgeCostToParent(c.edge_cost);
         last_added_id_ = new_node->getId();
+        if (start_in_violation_) setNodeViolation(new_node->getId(), c.violation);
         processNode(new_node);
     }
 
@@ -490,7 +534,7 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
         // (0.7,0) — merely an approximation for tree6's tilted trunk, and no coverage at all
         // for the rigid (horizontal) apple branch: the attraction field dragged the search
         // straight into it with no tangential detour (one cause of start 3 getting stuck).
-        // Now every rigid cylinder in the SDF is traversed (exclude_from_aniso=true:
+        // Now every rigid cylinder in the SDF is traversed (cls != SOFT:
         // trunk segments + tree6's rigid apple branch):
         //   repulsion = radial (toward the closest point on the segment), 1/d^2
         //   vortex    = axis_unit x radial (tangential around the true axis), weight 1.5x
@@ -514,7 +558,7 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                     // force ~ stiffness(t)*depth: push hard at the root / deep inside, softly at the tip.
                     // The depth activation bs_act_ raises this term's weight in the VF blend
                     // until the axis dominates (> attraction); see the note at the blending site.
-                    if (!cyl.exclude_from_aniso) {
+                    if (cyl.cls == CylClass::SOFT) {
                         if (!config_.branch_stiffness_enabled) continue;
                         Vector3f seg = cyl.p1 - cyl.p0;
                         float seg_sq = seg.squaredNorm();
@@ -564,13 +608,21 @@ Config GraspRrt::computeVectorField(const Config& q, CSpaceNodePtr nn,
                     const MatrixXf& J_pt = jacobianAt(pt.fid, pt.offset);
                     hard_trunk_rep_vector += J_pt.transpose() * (radial * force_mag);
 
-                    Vector3f vortex_dir = cyl.axis_unit.cross(radial);
-                    if (vortex_dir.norm() > 1e-6f) {
-                        vortex_dir.normalize();
-                        // The former x1.5 factor had no effect while each contribution
-                        // was normalized individually; it is dropped rather than
-                        // silently revived, keeping the previous vortex:repulsion 1:1.
-                        vortex_vector += J_pt.transpose() * (vortex_dir * force_mag);
+                    // Circulation is per-cylinder opt-in (TRUNK: on; HARD_BRANCH: off by
+                    // default). axis_unit x radial is orthogonal to the axis, so the vortex
+                    // has no axial component and cannot generate the "get past the tip"
+                    // detour a tip reclassification needs — while vf_w_vortex is the largest
+                    // weight in the blend. The capped-u radial repulsion above does give that
+                    // escape, because near the end cap `radial` is measured from the endpoint.
+                    if (cyl.vortex_on) {
+                        Vector3f vortex_dir = cyl.axis_unit.cross(radial);
+                        if (vortex_dir.norm() > 1e-6f) {
+                            vortex_dir.normalize();
+                            // The former x1.5 factor had no effect while each contribution
+                            // was normalized individually; it is dropped rather than
+                            // silently revived, keeping the previous vortex:repulsion 1:1.
+                            vortex_vector += J_pt.transpose() * (vortex_dir * force_mag);
+                        }
                     }
                 }
             }
@@ -749,6 +801,13 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
     Config q_near = nn->getConfiguration();
     cand.nn_id = nn->getId();
 
+    // Start-in-violation: an edge out of a violating node is validated with the HARD_BRANCH
+    // allowance relaxed by exactly that node's own violation. The guard restores the previous
+    // tolerance on every return path below. v_parent == 0 (the ordinary case) sets a
+    // tolerance of 0, i.e. no change in behaviour at all.
+    const float v_parent = start_in_violation_ ? nodeViolation(cand.nn_id) : 0.0f;
+    SdfCostEvaluator::ViolationToleranceGuard vguard(v_parent);
+
     Config q_rand_dir = target - q_near;
     if (q_rand_dir.norm() > 1e-6f) q_rand_dir.normalize();
 
@@ -815,6 +874,21 @@ GraspRrt::ExtendCandidate GraspRrt::extendVFRRTCompute(const Config& target) {
 
     if (!is_valid) return cand;
 
+    // Monotone descent out of the violation. The relaxed check above only guarantees the
+    // child is no deeper than the PARENT already was; without this the tree would be free to
+    // wander inside the capsule at a constant depth, which is exactly the "forbidden region"
+    // we are modelling. Requiring a strict decrease turns the relaxation into a one-way
+    // escape: depth is a Lyapunov function, and the ordinary gate resumes at v = 0.
+    if (v_parent > 0.0f) {
+        auto sdf_eval = std::dynamic_pointer_cast<SdfCostEvaluator>(
+            cspace_->getCostEvaluator());
+        if (sdf_eval) {
+            float v_new = sdf_eval->penViolation(new_config);
+            if (v_new > v_parent - kViolationDecrease) return cand;   // no progress
+            cand.violation = v_new;
+        }
+    }
+
     cand.new_config = new_config;
     cand.edge_cost  = cspace_->calcDist(q_near, new_config);
     cand.valid      = true;
@@ -841,6 +915,7 @@ ExtensionResult GraspRrt::extendVFRRT(const Config& target) {
     new_node->setCostFromRoot(cost);
     new_node->setEdgeCostToParent(c.edge_cost);
     last_added_id_ = new_node->getId();
+    if (start_in_violation_) setNodeViolation(new_node->getId(), c.violation);
 
     processNode(new_node);
     return ExtensionResult::SUCCESS;
@@ -1358,7 +1433,7 @@ std::pair<MoveArmResult, Config> GraspRrt::createWorkspaceSamplingStep(
                 Vector3f push = Vector3f::Zero();
                 float act = 0.0f;
                 for (const auto& cyl : sdf_eval_bs->getCylinders()) {
-                    if (cyl.exclude_from_aniso) continue;               // soft branches only
+                    if (cyl.cls != CylClass::SOFT) continue;               // soft branches only
                     if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                     Vector3f seg = cyl.p1 - cyl.p0;
                     float seg_sq = seg.squaredNorm();
@@ -1632,6 +1707,56 @@ bool GraspRrt::processNode(CSpaceNodePtr node) {
 // ============================================================================
 // sampleGoalBiased — Method A: closest below-equator node + jitter
 // ============================================================================
+// ============================================================================
+// Repair mode — reconnect to the surviving suffix of the path under repair
+// ============================================================================
+
+void GraspRrt::setRepairGoals(const std::vector<Config>& goals,
+                              float connect_radius,
+                              float goal_sample_prob) {
+    repair_goals_ = goals;
+    repair_connect_r2_ = connect_radius * connect_radius;
+    repair_goal_prob_ = std::max(0.0f, std::min(1.0f, goal_sample_prob));
+    repair_mode_ = !repair_goals_.empty();
+    repair_joined_ = -1;
+}
+
+bool GraspRrt::tryConnectRepairGoal() {
+    if (!repair_mode_ || !tree_) return false;
+    auto n = tree_->getLastAddedNode();
+    if (!n) return false;
+    // A node still inside the capsule cannot splice: the goal set is gate-valid, so the
+    // straight edge would have to cross back out through the strict gate. Wait for the
+    // descent to reach v = 0 — one or two extensions, and it costs nothing to skip.
+    if (start_in_violation_ && nodeViolation(n->getId()) > 0.0f) return false;
+    const Config& q = n->getConfiguration();
+
+    // Ascending scan: the earliest reachable rejoin point keeps the most of the
+    // original path, and it lets us stop at the first hit instead of scanning all.
+    for (size_t k = 0; k < repair_goals_.size(); ++k) {
+        if ((repair_goals_[k] - q).squaredNorm() > repair_connect_r2_) continue;
+        if (!cspace_->isPathValid(q, repair_goals_[k])) continue;
+        repair_joined_ = static_cast<int>(k);
+        goal_node_ = n;
+        found_solution_ = true;
+        return true;
+    }
+    return false;
+}
+
+Config GraspRrt::sampleRepairGoalBiased() {
+    // Aim at the early part of the suffix only. Biasing uniformly over the whole
+    // suffix would spend most samples on waypoints near the apple, which is the
+    // unrestricted-replan behaviour we are trying to avoid paying for here.
+    const size_t span = std::min<size_t>(repair_goals_.size(), 10);
+    const Config& g = repair_goals_[static_cast<size_t>(
+        randInt(0, static_cast<int>(span) - 1))];
+    Config jitter(dimension_);
+    for (int i = 0; i < dimension_; ++i)
+        jitter[i] = (2.0f * randFloat01() - 1.0f) * goal_bias_jitter_;
+    return g + jitter;
+}
+
 Config GraspRrt::sampleGoalBiased() {
     // Fallback: if no node below apple equator yet, use uniform random
     if (closest_below_node_id_ < 0) {

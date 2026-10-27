@@ -40,17 +40,42 @@ namespace grasp_rrt {
 //   4. cspace->setCostEvaluator(...)
 // ============================================================================
 
+// ============================================================================
+// CylClass — how a scene cylinder behaves in the validity and guidance layers.
+//
+// Replaces the former single `exclude_from_aniso` bool, which conflated four
+// behaviours (gate exclusion, anisotropy exclusion, vortex enable, nav
+// impassability). The split is needed by the sim-to-real repair loop: a branch
+// measured as unyielding must become HARD in the VALIDITY layer, whereas
+// setting the old flag only moved it out of every validity layer and left it
+// enforced by nothing (the trunk is avoided because it is ALSO registered as a
+// Bullet obstacle; soft branches never are).
+//
+//   SOFT        yieldable branch: gate uses allow(t); severity/steering/
+//               anisotropy active; nav toll; stiffness field in the VF.
+//   HARD_BRANCH reclassified at run time by a measured contact: gate uses
+//               allow_override (0 = no penetration); severity/steering/
+//               anisotropy skipped (hard means avoid, not press gently);
+//               nav impassable; 1/d^2 repulsion in the VF.
+//   TRUNK       rigid structure: hard collision comes from Bullet, so the gate
+//               skips it; nav impassable; 1/d^2 repulsion + vortex in the VF.
+// ============================================================================
+enum class CylClass : uint8_t {
+    SOFT = 0,
+    HARD_BRANCH,
+    TRUNK
+};
+
 class SdfCostEvaluator : public CostEvaluator {
 public:
     struct CylinderObstacle {
         Eigen::Vector3f p0;
         Eigen::Vector3f p1;
         float radius;
-        // If true, this cylinder is excluded from anisotropy mechanisms
-        // (sample steering, axial drag K_ax, edge refuse). Use for rigid
-        // obstacles like the trunk where "push aside radially" is not a
-        // valid behavior — the robot must avoid them entirely.
-        bool exclude_from_aniso = false;
+        // Behaviour class; see CylClass above. Every site that used to test
+        // `exclude_from_aniso` now tests `cls != CylClass::SOFT`, except the
+        // penetration gate and the VF, which distinguish HARD_BRANCH from TRUNK.
+        CylClass cls = CylClass::SOFT;
         // Pre-normalized axis (p1 − p0)/|p1 − p0|. Cached at build time
         // (Optimization B) so per-cycle anisotropy checks skip the
         // normalize() call. Zero for degenerate cylinders (p0 == p1).
@@ -59,6 +84,33 @@ public:
         // Used by the branch-stiffness model (the root is "stiffer"). A single-segment branch defaults to 0..1.
         float t0 = 0.0f;
         float t1 = 1.0f;
+        // Permitted penetration for cls == HARD_BRANCH, in meters. 0 means the
+        // gate probe sphere may not intersect the cylinder surface at all —
+        // since the probe radii are the physical link radii (0.06-0.07 m), that
+        // is proper hard collision against the 9-sphere arm model, not an
+        // arbitrary standoff. Ignored for SOFT (uses penAllowAt) and TRUNK.
+        float allow_override = 0.0f;
+        // Circulation about this cylinder's own axis in the VF. True for the
+        // trunk. For a HARD_BRANCH this is opt-in and defaults to false:
+        // axis_unit x radial is orthogonal to the axis by construction, so the
+        // vortex cannot produce the "get past the tip" escape that a tip
+        // reclassification needs, and vf_w_vortex is the largest blend weight.
+        bool vortex_on = false;
+        // Gate scope. -1 = this cylinder constrains EVERY probe (soft branches, trunk).
+        // >= 0 = it constrains ONLY that probe index.
+        //
+        // Contact-inserted obstacles use the scoped form. A stall teaches us that ONE
+        // link could not pass through ONE spot; forbidding a 6.5 cm ball to all nine
+        // probes, at all times, from all directions, is a far stronger claim than was
+        // measured. Unscoped, the capsule was invalidating waypoint 0 through links that
+        // were never in contact -- in 9 of 20 no-retreat failures the probe deepest in
+        // the capsule at the start was a DIFFERENT link from the one that stalled.
+        // TESTED AND REJECTED 2026-10-18: scoping gained only +4 points of repair
+        // success and permitted other links to drive 26 mm into a capsule with a 20 mm
+        // allowance. The epistemic argument ("we only learned about one link") is right,
+        // but physically wrong: the capsule stands for rigid branch material, which
+        // blocks every link that reaches it. Left in place as an ablation; default -1.
+        int probe_scope = -1;
     };
 
     struct RobotSphere {
@@ -67,6 +119,11 @@ public:
         Eigen::Vector3f offset;
         int frame_id;
     };
+
+    // One volumetric probe of the penetration gate (link3...hand, 9 of them).
+    // Public so contact attribution and the repair harness can use the exact
+    // same probe set the gate enforces, instead of keeping a second copy in sync.
+    struct PenProbe { int fid; Eigen::Vector3f off; float r; };
 
     // voxel_size: voxel resolution (m); default 1 cm, a good accuracy/speed balance
     explicit SdfCostEvaluator(std::shared_ptr<RobotInterface> robot,
@@ -85,8 +142,9 @@ public:
         Eigen::Vector3f a_unit = (len > 1e-6f)
             ? Eigen::Vector3f(a / len)
             : Eigen::Vector3f::Zero();
-        cylinders_.push_back({p0, p1, radius, /*exclude_from_aniso=*/false,
-                              a_unit, t0, t1});
+        cylinders_.push_back({p0, p1, radius, CylClass::SOFT,
+                              a_unit, t0, t1,
+                              /*allow_override=*/0.0f, /*vortex_on=*/false});
         sdf_built_ = false;
     }
 
@@ -111,13 +169,251 @@ public:
         Eigen::Vector3f a_unit = (len > 1e-6f)
             ? Eigen::Vector3f(a / len)
             : Eigen::Vector3f::Zero();
-        cylinders_.push_back({p0, p1, radius, /*exclude_from_aniso=*/true, a_unit});
+        cylinders_.push_back({p0, p1, radius, CylClass::TRUNK, a_unit,
+                              /*t0=*/0.0f, /*t1=*/1.0f,
+                              /*allow_override=*/0.0f, /*vortex_on=*/true});
         sdf_built_ = false;
     }
 
-    // Read-only access to all cylinder obstacles (rigid flag included). Used to export the scene
+    // Read-only access to all cylinder obstacles (class included). Used to export the scene
     // geometry for Isaac Sim alignment (scene_layout.json): a single exit point covering every scene variant.
     const std::vector<CylinderObstacle>& getCylinders() const { return cylinders_; }
+
+    // ==================================================================
+    // Run-time scene edits (sim-to-real repair)
+    //
+    // A measured contact tells us the model was wrong about ONE segment. These
+    // apply that correction. Call only between planning runs: the evaluator
+    // shares robot_ and isPenetrationAllowed() mutates its FK state, so a
+    // concurrent query during a mutation is a data race.
+    // ==================================================================
+
+    // Reclassify a soft branch segment as unyielding. Costs no grid work at all:
+    // the gate, severity, steering and anisotropy layers are analytic over
+    // cylinders_, and distToCylinder() ignores cls, so sdf_grid_ is unchanged.
+    void makeCylinderHard(int idx, float allow = 0.0f, bool vortex_on = false) {
+        auto& c = cylinders_.at(static_cast<size_t>(idx));
+        c.cls = CylClass::HARD_BRANCH;
+        c.allow_override = std::max(0.0f, allow);
+        c.vortex_on = vortex_on;
+    }
+
+    // Insert a NEW hard obstacle at a measured contact. This is the primary
+    // sim-to-real correction: the robot hit something the model said was passable,
+    // so a hard patch goes where the contact was, and the existing soft branch is
+    // left soft everywhere — soft interaction elsewhere on it is preserved.
+    //
+    // Why inserting works even on top of a modelled branch: the SDF grid composes
+    // by minimum, so an overlapping insert leaves sdf_grid_ unchanged and is
+    // invisible to evaluateAnisotropicForce(). But the penetration GATE composes by
+    // conjunction — it checks every cylinder and any one can reject — and the VF's
+    // rigid repulsion reads p0/p1 analytically rather than through the grid. So the
+    // validity guarantee and the rigid repulsion both see this obstacle. Only the
+    // grid-based force term does not, and that term is guidance, not the guarantee.
+    //
+    // `axis` must be non-degenerate: the gate skips cylinders whose axis_unit is
+    // zero, so a sphere built as addRigidCylinder(c, c, r) would be silently
+    // ignored. Pass the contacted branch's axis when known (the hard patch then
+    // follows the branch), otherwise the contact normal.
+    //
+    // Effective hard region: a probe centre must stay outside radius + r_probe of
+    // the capsule, and r_probe is 0.06-0.07 m, so the forbidden region is ~7 cm
+    // larger than the capsule in every direction. Shrinking `radius` below ~2 cm
+    // buys little.
+    //
+    // No SDF patch is performed: where the insert overlaps modelled geometry the
+    // grid is already correct, and where it does not, the gate and the VF cover it.
+    // Returns the index of the new cylinder.
+    int addContactObstacle(const Eigen::Vector3f& center,
+                           const Eigen::Vector3f& axis,
+                           float half_len, float radius,
+                           float allow = 0.0f, bool vortex_on = false,
+                           int probe_scope = -1) {
+        Eigen::Vector3f a = axis;
+        float an = a.norm();
+        a = (an > 1e-6f) ? Eigen::Vector3f(a / an) : Eigen::Vector3f(0.0f, 0.0f, 1.0f);
+        half_len = std::max(half_len, 0.01f);   // keep the axis non-degenerate
+        CylinderObstacle n;
+        n.p0 = center - a * half_len;
+        n.p1 = center + a * half_len;
+        n.radius = std::max(radius, 1e-3f);
+        n.cls = CylClass::HARD_BRANCH;
+        n.axis_unit = a;
+        n.t0 = 0.0f;
+        n.t1 = 1.0f;
+        n.allow_override = std::max(0.0f, allow);
+        n.vortex_on = vortex_on;
+        n.probe_scope = probe_scope;
+        cylinders_.push_back(n);
+        return static_cast<int>(cylinders_.size()) - 1;
+    }
+
+    // Split cylinder `idx` at arc-length fraction u and harden ONLY a window of
+    // +/- half_width meters around that point, leaving the rest of the segment soft.
+    //
+    // Why this exists: makeCylinderHard() works at the granularity the scene was
+    // built with, and in tree6-simple a "segment" is 12-45 cm long. Hardening one
+    // whole segment inserts a 40 cm x 8.5 cm-radius forbidden tube (probe radius
+    // included) across the approach corridor — which invalidates ~45% of the
+    // executed path, forces an 11-37 waypoint retreat, and makes the replan 11x
+    // slower. A contact tells us about a patch of branch, not about half a branch.
+    //
+    // The union of the three pieces is geometrically identical to the original, so
+    // sdf_grid_ remains exactly correct — no patch, no rebuild. t0/t1 are
+    // interpolated so allow(t) and the stiffness model stay consistent.
+    //
+    // Indices after `idx` shift by up to 2. Take snapshotCylinders() first if you
+    // need to undo. Returns the index of the hardened piece, or -1 on failure.
+    int splitAndHarden(int idx, float u, float half_width,
+                       float allow = 0.0f, bool vortex_on = false) {
+        if (idx < 0 || idx >= static_cast<int>(cylinders_.size())) return -1;
+        const CylinderObstacle c = cylinders_[static_cast<size_t>(idx)];   // copy
+        const float len = (c.p1 - c.p0).norm();
+        if (len < 1e-6f) return -1;
+
+        // Window covers the whole segment: nothing to split.
+        if (half_width <= 0.0f || 2.0f * half_width >= len) {
+            makeCylinderHard(idx, allow, vortex_on);
+            return idx;
+        }
+
+        const float s_mid = std::max(0.0f, std::min(1.0f, u));
+        const float dw = half_width / len;              // half-width in parameter units
+        const float s0 = std::max(0.0f, s_mid - dw);
+        const float s1 = std::min(1.0f, s_mid + dw);
+
+        auto mk = [&](float sa, float sb, CylClass cls) {
+            CylinderObstacle n = c;
+            n.p0 = c.p0 + sa * (c.p1 - c.p0);
+            n.p1 = c.p0 + sb * (c.p1 - c.p0);
+            Eigen::Vector3f a = n.p1 - n.p0;
+            float l = a.norm();
+            n.axis_unit = (l > 1e-6f) ? Eigen::Vector3f(a / l)
+                                      : Eigen::Vector3f::Zero();
+            n.t0 = c.t0 + sa * (c.t1 - c.t0);
+            n.t1 = c.t0 + sb * (c.t1 - c.t0);
+            n.cls = cls;
+            n.allow_override = (cls == CylClass::HARD_BRANCH)
+                             ? std::max(0.0f, allow) : 0.0f;
+            n.vortex_on = (cls == CylClass::HARD_BRANCH) ? vortex_on : c.vortex_on;
+            return n;
+        };
+
+        std::vector<CylinderObstacle> pieces;
+        if (s0 > 1e-4f)          pieces.push_back(mk(0.0f, s0, CylClass::SOFT));
+        pieces.push_back(mk(s0, s1, CylClass::HARD_BRANCH));
+        const int hard_local = static_cast<int>(pieces.size()) - 1;
+        if (s1 < 1.0f - 1e-4f)   pieces.push_back(mk(s1, 1.0f, CylClass::SOFT));
+
+        cylinders_[static_cast<size_t>(idx)] = pieces[0];
+        if (pieces.size() > 1)
+            cylinders_.insert(cylinders_.begin() + idx + 1,
+                              pieces.begin() + 1, pieces.end());
+        return idx + hard_local;
+    }
+
+    // Snapshot / restore for scene edits that change the cylinder COUNT.
+    // Geometry is unchanged by a split, so the SDF stays valid across both.
+    std::vector<CylinderObstacle> snapshotCylinders() const { return cylinders_; }
+    void restoreCylinders(const std::vector<CylinderObstacle>& snap) { cylinders_ = snap; }
+
+    // Update the permitted penetration of an already-inserted obstacle. Used by the
+    // adaptive-allowance rule: the capsule is created first, the stall-pose penetration
+    // is then measured against it, and the allowance is set from that measurement.
+    void setCylinderAllow(int idx, float allow) {
+        cylinders_.at(static_cast<size_t>(idx)).allow_override = std::max(0.0f, allow);
+    }
+
+    // Undo a reclassification that did not change the cylinder count — the tree
+    // moves between reaches, so a correction derived from one reach should not
+    // silently persist into the next.
+    void revertCylinderSoft(int idx) {
+        auto& c = cylinders_.at(static_cast<size_t>(idx));
+        c.cls = CylClass::SOFT;
+        c.allow_override = 0.0f;
+        c.vortex_on = false;
+    }
+
+    // Nearest cylinder SURFACE to p. Returns -1 if nothing is within max_dist.
+    // TRUNK is skipped by default: a trunk contact is not a repair case.
+    int nearestCylinder(const Eigen::Vector3f& p, float& u_out, float& surf_dist_out,
+                        float max_dist = 0.10f, bool include_trunk = false) const {
+        int best = -1;
+        float best_d = max_dist;
+        for (size_t i = 0; i < cylinders_.size(); ++i) {
+            const auto& c = cylinders_[i];
+            if (!include_trunk && c.cls == CylClass::TRUNK) continue;
+            if (c.axis_unit.squaredNorm() < 0.25f) continue;
+            Eigen::Vector3f seg = c.p1 - c.p0;
+            float seg_sq = seg.squaredNorm();
+            float u = (seg_sq > 1e-9f)
+                ? std::max(0.0f, std::min(1.0f, (p - c.p0).dot(seg) / seg_sq))
+                : 0.0f;
+            float d = (p - (c.p0 + u * seg)).norm() - c.radius;
+            if (d < best_d) { best_d = d; best = static_cast<int>(i); u_out = u; }
+        }
+        surf_dist_out = best_d;
+        return best;
+    }
+
+    // Deepest gate-probe penetration at q, over all SOFT cylinders.
+    //
+    // This is the attribution step for the Isaac stiffness experiment, where only
+    // STIFFNESS is perturbed and the geometry stays identical — so the planner's
+    // model of where the branch is remains correct and the contacted segment is
+    // exactly the deepest modelled penetration. No torque least-squares needed.
+    // Once geometry is perturbed too (registration or extent error) this stops
+    // being exact and the torque-residual estimator has to take over.
+    //
+    // The apple exemption is NOT applied: a stall inside the exempt sphere is
+    // still a stall, and the caller decides what to do about it.
+    struct ContactHypothesis {
+        int   cyl_idx = -1;
+        int   probe_index = -1;
+        float u = 0.0f;              // arc-length param along the segment
+        float t_arc = 0.0f;          // arc-length fraction along the whole branch
+        float pen = 0.0f;            // penetration depth, m
+        Eigen::Vector3f point  = Eigen::Vector3f::Zero();   // on the cylinder surface
+        Eigen::Vector3f normal = Eigen::Vector3f::Zero();   // outward = escape direction
+    };
+
+    bool deepestContact(const Eigen::VectorXf& q, ContactHypothesis& out) const {
+        if (pen_probes_.empty()) return false;
+        robot_->setJointValues(q);
+        float worst = 0.0f;
+        bool found = false;
+        for (size_t i = 0; i < pen_probes_.size(); ++i) {
+            const auto& pr = pen_probes_[i];
+            Eigen::Matrix4f pose = robot_->getFramePoseById(pr.fid);
+            Eigen::Vector3f pp = pose.block<3,1>(0,3)
+                               + pose.block<3,3>(0,0) * pr.off;
+            for (size_t c = 0; c < cylinders_.size(); ++c) {
+                const auto& cyl = cylinders_[c];
+                if (cyl.cls != CylClass::SOFT) continue;
+                if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+                Eigen::Vector3f seg = cyl.p1 - cyl.p0;
+                float seg_sq = seg.squaredNorm();
+                float u = (seg_sq > 1e-9f)
+                    ? std::max(0.0f, std::min(1.0f, (pp - cyl.p0).dot(seg) / seg_sq))
+                    : 0.0f;
+                Eigen::Vector3f radial = pp - (cyl.p0 + u * seg);
+                float dist = radial.norm();
+                if (dist <= 1e-4f) continue;
+                float pen = (cyl.radius + pr.r) - dist;
+                if (pen <= worst) continue;
+                worst = pen;
+                found = true;
+                out.cyl_idx = static_cast<int>(c);
+                out.probe_index = static_cast<int>(i);
+                out.u = u;
+                out.t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
+                out.pen = pen;
+                out.normal = radial / dist;
+                out.point = cyl.p0 + u * seg + out.normal * cyl.radius;
+            }
+        }
+        return found;
+    }
 
     // ---- Soft-branch penetration gate ----
     //
@@ -177,14 +473,24 @@ public:
     bool isPenetrationAllowed(const Eigen::VectorXf& q) const override {
         if (!pen_gate_enabled_) return true;
         robot_->setJointValues(q);
-        for (const auto& pr : pen_probes_) {
+        for (size_t probe_i = 0; probe_i < pen_probes_.size(); ++probe_i) {
+            const auto& pr = pen_probes_[probe_i];
             Eigen::Matrix4f pose = robot_->getFramePoseById(pr.fid);
             Eigen::Vector3f pp = pose.block<3,1>(0,3)
                                + pose.block<3,3>(0,0) * pr.off;
-            if ((pp - pen_gate_exempt_center_).squaredNorm() < pen_gate_exempt_r2_)
-                continue;   // exempt near the apple
+            // The apple exemption used to `continue` here, skipping the whole probe. It now
+            // applies per cylinder and only to SOFT ones: the exemption exists because grasping
+            // a branch-embedded apple necessarily means touching the soft branch it hangs on,
+            // never to license pressing into geometry measured as unyielding. Without this a
+            // HARD_BRANCH within exempt_radius of the apple would be a no-op — exactly where
+            // the protection matters most, since --apple-root puts the apple on a branch.
+            const bool near_apple =
+                (pp - pen_gate_exempt_center_).squaredNorm() < pen_gate_exempt_r2_;
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;              // soft branches only
+                if (cyl.cls == CylClass::TRUNK) continue;          // hard collision via Bullet
+                if (cyl.probe_scope >= 0 &&
+                    cyl.probe_scope != static_cast<int>(probe_i)) continue;
+                if (near_apple && cyl.cls == CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue; // skip degenerate
                 Eigen::Vector3f seg = cyl.p1 - cyl.p0;
                 float seg_sq = seg.squaredNorm();
@@ -195,6 +501,15 @@ public:
                 float dist = (pp - (cyl.p0 + u * seg)).norm();
                 float pen = (cyl.radius + pr.r) - dist;
                 if (pen <= 0.0f) continue;
+                if (cyl.cls == CylClass::HARD_BRANCH) {
+                    // Per-cylinder allowance; no axis-clear cap (that ramp exists to stop
+                    // axial sliding inside a yieldable branch, which cannot arise at allow=0).
+                    // hard_violation_tol_ is the start-in-violation relaxation: it is nonzero
+                    // only while a repair tree is growing out of a pose that already violates
+                    // this capsule (see setHardViolationTolerance). SOFT is never relaxed.
+                    if (pen > cyl.allow_override + hard_violation_tol_) return false;
+                    continue;
+                }
                 float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                 float allow = penAllowAt(t_arc);
                 // Hard forbidden core around the axis: a probe center never enters within axis_clear of
@@ -210,6 +525,67 @@ public:
     }
 
     bool isPenetrationGateEnabled() const { return pen_gate_enabled_; }
+
+    // ---- Start-in-violation support (graded relaxation of the INSERTED obstacles only) ----
+    //
+    // penViolation(q) = max over (probe, HARD_BRANCH) of (pen - allow_override)^+, in meters.
+    // Zero whenever the pose satisfies every inserted capsule; it says nothing about SOFT
+    // branches, which keep their allow(t) ramp unconditionally. This asymmetry is the whole
+    // point: a repair capsule's forbidden region is a budget we invented one cycle ago at a
+    // place the arm has already safely reached, whereas allow(t) is the construction
+    // guarantee behind cuts = 0 and must never be relaxed.
+    float penViolation(const Eigen::VectorXf& q) const {
+        if (!pen_gate_enabled_) return 0.0f;
+        float worst = 0.0f;
+        robot_->setJointValues(q);
+        for (size_t probe_i = 0; probe_i < pen_probes_.size(); ++probe_i) {
+            const auto& pr = pen_probes_[probe_i];
+            Eigen::Matrix4f pose = robot_->getFramePoseById(pr.fid);
+            Eigen::Vector3f pp = pose.block<3,1>(0,3)
+                               + pose.block<3,3>(0,0) * pr.off;
+            for (const auto& cyl : cylinders_) {
+                if (cyl.cls != CylClass::HARD_BRANCH) continue;
+                if (cyl.probe_scope >= 0 &&
+                    cyl.probe_scope != static_cast<int>(probe_i)) continue;
+                Eigen::Vector3f seg = cyl.p1 - cyl.p0;
+                float seg_sq = seg.squaredNorm();
+                float u = (seg_sq > 1e-9f)
+                    ? std::max(0.0f, std::min(1.0f,
+                          (pp - cyl.p0).dot(seg) / seg_sq))
+                    : 0.0f;
+                float dist = (pp - (cyl.p0 + u * seg)).norm();
+                float over = ((cyl.radius + pr.r) - dist) - cyl.allow_override;
+                if (over > worst) worst = over;
+            }
+        }
+        return worst;
+    }
+
+    // Slack added to every HARD_BRANCH allowance for the calling thread only. Set it to the
+    // parent node's violation before validating an edge out of that node, then back to 0.
+    // thread_local because the extend batch and the OR-parallel race validate edges
+    // concurrently, each carrying a different parent's budget.
+    static void  setHardViolationTolerance(float v) { hard_violation_tol_ = std::max(0.0f, v); }
+    static float getHardViolationTolerance()        { return hard_violation_tol_; }
+
+    // RAII: restores the previous tolerance on every exit path (extendVFRRTCompute has
+    // several early returns, and leaking a nonzero tolerance would silently relax the gate
+    // for every later check on this thread).
+    struct ViolationToleranceGuard {
+        float prev;
+        explicit ViolationToleranceGuard(float v)
+            : prev(SdfCostEvaluator::getHardViolationTolerance()) {
+            SdfCostEvaluator::setHardViolationTolerance(v);
+        }
+        ~ViolationToleranceGuard() {
+            SdfCostEvaluator::setHardViolationTolerance(prev);
+        }
+    };
+
+    // The gate's own probe set — single source of truth for anything that needs
+    // to reason about where the arm can touch a branch.
+    const std::vector<PenProbe>& getPenProbes() const { return pen_probes_; }
+    float getUniEnvelope() const { return uni_env_; }
 
     // ---- Depth steering (proposal-layer companion to the gate, see the note in types.h) ----
     //
@@ -235,7 +611,7 @@ public:
             if ((pp - pen_gate_exempt_center_).squaredNorm() < pen_gate_exempt_r2_)
                 continue;
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                 Eigen::Vector3f seg = cyl.p1 - cyl.p0;
                 float seg_sq = seg.squaredNorm();
@@ -290,7 +666,7 @@ public:
             if ((pp - pen_gate_exempt_center_).squaredNorm() < pen_gate_exempt_r2_)
                 continue;
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                 Eigen::Vector3f seg = cyl.p1 - cyl.p0;
                 float seg_sq = seg.squaredNorm();
@@ -371,7 +747,7 @@ public:
             if ((pp - pen_gate_exempt_center_).squaredNorm() < pen_gate_exempt_r2_)
                 continue;
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                 float G, slack, ax_b, h_in;
                 Eigen::Vector3f r_hat;
@@ -422,7 +798,7 @@ public:
             if ((pp - pen_gate_exempt_center_).squaredNorm() < pen_gate_exempt_r2_)
                 continue;
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                 float G, slack, ax_b, h_in;
                 Eigen::Vector3f r_hat;
@@ -473,7 +849,7 @@ public:
                 continue;
             Eigen::Vector3f dp = p2[i] - p1[i];
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                 float G, slack, ax_b, h_in;
                 Eigen::Vector3f r_hat;
@@ -815,7 +1191,7 @@ public:
     //           score_sb  = weight_sb · cos_sb
     //   max_score = max over all (sphere s, branch b) pairs
     //
-    // Rigid cylinders (exclude_from_aniso = true, e.g., trunk) are skipped
+    // Rigid cylinders (cls != SOFT, e.g., trunk) are skipped
     // entirely — anisotropy is a property of semi-rigid foliage.
     //
     // Sphere selection (D change): panda_hand (1st link from EE) and
@@ -912,7 +1288,7 @@ public:
             // Uses cached axis_unit (Optimization B) — no normalize() inside.
             nearby.clear();
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;  // degenerate
                 float d = distToCylinder(p_curr, cyl) - rs.radius;
                 if (d > envelope) continue;
@@ -969,7 +1345,7 @@ public:
     // trace(M) = sum_i w_i (since trace(a a^T) = |a|^2 = 1), so
     // M / trace(M) is a weighted mean of cos^2 terms, bounded in [0, 1].
     //
-    // The trunk and other rigid obstacles (exclude_from_aniso) contribute
+    // The trunk and other rigid obstacles (cls != SOFT) contribute
     // nothing, consistent with every other anisotropy mechanism.
     // Cost: O(N_cyl) with no allocation; a few μs for N ~ 12.
     // ==================================================================
@@ -980,7 +1356,7 @@ public:
         Eigen::Matrix3f M = Eigen::Matrix3f::Zero();
         float w_sum = 0.0f;
         for (const auto& cyl : cylinders_) {
-            if (cyl.exclude_from_aniso) continue;               // trunk etc.
+            if (cyl.cls != CylClass::SOFT) continue;               // trunk etc.
             if (cyl.axis_unit.squaredNorm() < 0.25f) continue;  // degenerate
             float d = distToCylinder(p, cyl) - body_radius;
             if (d >= envelope) continue;
@@ -1121,7 +1497,7 @@ public:
             float acc = 0.0f;
             bool  any = false;
             for (const auto& cyl : cylinders_) {
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                 float d = distToCylinder(p_curr, cyl) - rs.radius;
                 if (d >= envelope) continue;
@@ -1199,7 +1575,7 @@ public:
             nearby.clear();
             for (size_t i = 0; i < cylinders_.size(); ++i) {
                 const auto& cyl = cylinders_[i];
-                if (cyl.exclude_from_aniso) continue;
+                if (cyl.cls != CylClass::SOFT) continue;
                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                 float d = distToCylinder(p_curr, cyl) - rs.radius;
                 if (d > envelope) continue;
@@ -1298,7 +1674,7 @@ public:
                         float dist = (p - (cyl.p0 + u * seg)).norm();
                         float pen = (cyl.radius + robot_r) - dist;
                         if (pen <= 0.0f) continue;
-                        if (cyl.exclude_from_aniso) { m = -1.0f; break; }  // rigid: impassable
+                        if (cyl.cls != CylClass::SOFT) { m = -1.0f; break; }  // rigid: impassable
                         float t_arc = cyl.t0 + u * (cyl.t1 - cyl.t0);
                         float allow = penAllowAt(t_arc);
                         if (pen > allow) { m = -1.0f; break; }             // gate forbidden core
@@ -1424,7 +1800,6 @@ private:
     std::vector<char> er_sphere_mask_;
 
     // ---- Soft-branch penetration gate state ----
-    struct PenProbe { int fid; Eigen::Vector3f off; float r; };
     bool                  pen_gate_enabled_    = false;
     float                 pen_gate_allow_root_ = 0.015f;  // allow at the root, m
     float                 pen_gate_allow_tip_  = 0.050f;  // allow(t=1), m
@@ -1434,6 +1809,8 @@ private:
     float                 pen_gate_axis_clear_ = 0.01f;   // radius of the hard forbidden core around the axis (m)
     std::vector<PenProbe> pen_probes_;
     int                   pen_gate_hand_fid_   = -1;      // descent steering uses hand probes only
+    // Start-in-violation relaxation, HARD_BRANCH only. Per-thread (see setHardViolationTolerance).
+    inline static thread_local float hard_violation_tol_ = 0.0f;
     // Depth-steering telemetry (same convention as the er_ counters: races allowed under parallelism, telemetry only)
     mutable unsigned long long pen_steer_calls_ = 0;
     mutable unsigned long long pen_steer_bends_ = 0;
@@ -1503,7 +1880,7 @@ private:
     //   - degenerate case (p0 == p1, e.g. the overhead sphere registered as a cylinder) returns 0
     //   - returns 0 when cylinders_ is empty
     //
-    // Rigid cylinders (exclude_from_aniso = true, i.e. the trunk) are skipped: anisotropy is a property
+    // Rigid cylinders (cls != SOFT, i.e. the trunk) are skipped: anisotropy is a property
     // of compliant foliage, and "push aside radially" is meaningless for a rigid trunk. Every method
     // (edge refuse / steering) already skipped the trunk; skipping here keeps Option A's
     // axial drag and the two anisotropy metrics consistent with them — otherwise the trunk's vertical
@@ -1514,7 +1891,7 @@ private:
         int best_idx = -1;
         float best_dist = std::numeric_limits<float>::max();
         for (size_t i = 0; i < cylinders_.size(); ++i) {
-            if (cylinders_[i].exclude_from_aniso) continue;   // rigid obstacles such as the trunk
+            if (cylinders_[i].cls != CylClass::SOFT) continue;   // rigid obstacles such as the trunk
             float d = distToCylinder(p, cylinders_[i]);
             if (d < best_dist) {
                 best_dist = d;

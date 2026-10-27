@@ -500,6 +500,23 @@ int main(int argc, char* argv[]) {
     bool  pen_steer_enabled  = false;   // --pen-steer: depth steering (proposal-layer tangential projection, implies --pen-gate)
     bool  uni_refuse_enabled = false;   // --uni-refuse: unified branch-interaction rule (implies --pen-gate; supersedes --edge-refuse* / --pen-steer)
     bool  nav_field_enabled  = false;   // --nav-field: geodesic attraction field (multi-source flood from the spherical cap; far-field detour + near-field random cap point + geodesic descent gate)
+    bool  harden_deepest     = false;   // --harden-deepest: per run, reclassify the deepest-contacted soft segment as HARD_BRANCH and replan (planner-side half of the Isaac stiffness experiment); writes repair_results.csv
+    std::string harden_mode  = "insert"; // --harden-mode insert|split|reclassify: how the measured contact is written back into the scene. insert = new hard capsule at the contact (default); split = harden a window of the contacted segment; reclassify = harden the whole segment (the first implementation; inherits the scene's 12-45 cm segmentation)
+    float harden_radius_m    = 0.02f;   // --harden-radius M: radius of the inserted capsule (insert mode). Below ~2 cm buys little: the gate probes are 6-7 cm, so the forbidden region is ~7 cm larger than the capsule regardless
+    float harden_halflen_m   = 0.02f;   // --harden-halflen M: half-length of the inserted capsule along the contacted branch axis (insert mode)
+    float harden_window_m    = 0.05f;   // --harden-window M: half-width of the hardened window (split mode)
+    float harden_allow_mm    = 0.0f;    // --harden-allow-mm F: permitted penetration on the hardened piece (mm). 0 = none; a 5x-stiffer branch is not infinitely stiff, so >0 is the more faithful model
+    float tree6_merge_deg    = 8.0f;    // --tree6-merge-deg D: bend-angle threshold for merging tree6 nodes in --tree6-simple. Lower = fewer merges = more cylinders = smaller axis error vs the detailed geometry. DEFAULT CHANGED 30 -> 8 on 2026-10-20 for a geometric-containment reason, not a performance one: a merged straight cylinder misses the real curved branch by up to the sagitta, and the model only contains the real branch when (axis deviation + real radius) <= modelled radius (15 mm here). Measured max deviation: 30 deg = 41.6 mm (FAILS for any branch -- the scene had holes the planner could route through), 12 deg = 13.3 mm (holds by only 1.7 mm), 8 deg = 3.8 mm (holds for branches up to 11 mm radius). Attribution needs the same budget: accuracy is 100% below ~2 cm of per-branch axis error and 56% at 5 cm. Cost is near zero -- per-check cost rose 2.4% from 30 to 12, and measured approach p50 is 195/258/225 ms at 30/12/8 deg (within run-to-run noise); 50/50 and cuts=0 at all three. Pass 30 explicitly to reproduce historical results
+    bool  harden_dump        = false;   // --harden-dump: for each successful injection, write repair_XX_{episode.csv,scene.json,phases.json} for playback in viz_repair_episode.py
+    bool  repair_connector   = false;   // --repair-connector: instead of replanning to a fresh grasp, reconnect to the longest still-valid suffix of the path under repair (GraspRrt repair mode), then splice
+    float repair_connect_rad = 0.0f;    // --repair-connect-rad R: C-space connect radius (rad); 0 = 2x extend_step_size
+    bool  start_in_violation_always = false; // --start-in-violation-always: root the repair tree at the STALL pose even when a valid retreat IS available, instead of only as a fallback. Tests whether a forward escape (4-5 waypoints toward the goal) beats a backward retreat (8-16 waypoints undoing progress) on the cases where both are possible
+    bool  start_in_violation = false;   // --start-in-violation: when the retreat emulation finds NO gate-valid pose anywhere on the executed path (first_invalid_wp == 0, 19-39% of injections), root the repair tree at the STALL pose itself and let it grow out under a graded violation budget (GraspRrt::setStartInViolation). The justification is physical, not numerical: the capsule's forbidden region is a budget created one cycle earlier at a place the arm occupies and reached safely, so refusing to start there is the model overruling reality. Only the INSERTED capsule may be violated -- soft allow(t) never is
+    bool  harden_probe_scope = false;   // --harden-probe-scope: TESTED AND REJECTED (2026-10-18), kept as an ablation only. The inserted obstacle constrains only the contacting probe instead of all 9. Gained just +4 points of repair success (60.4 -> 64.6%) and let OTHER links drive 26 mm into a capsule with a 20 mm allowance -- which is physically wrong, since the capsule stands for rigid branch material and rigid material blocks every link, not only the one that discovered it. Default OFF; do not enable.
+    float harden_allow_adapt = -1.0f;   // --harden-allow-adaptive D: set allow_override from the MEASURED stall penetration minus D mm, instead of the fixed --harden-allow-mm. A fixed allowance demands a retreat of (p_stall - allow), which varies 0-29 mm across injections and is sometimes unachievable for a proximal link; the adaptive rule makes every pose before the stall valid by construction, so a retreat always exists. <0 = disabled
+    bool  harden_on_axis     = false;   // --harden-on-axis: centre the inserted capsule on the contacted branch's AXIS rather than on the contact point. A stiffness error means "this piece of branch is rigid", and the branch material is at the axis; placing the capsule on the surface models "there is an unmodelled object here", which is the right choice only when the contact is far from every modelled cylinder
+    bool  harden_nav_rebuild = false;   // --harden-nav-rebuild: rebuild the nav field after the reclassification (tests whether the stale-field design default costs us the replan tail)
+    bool  harden_vortex      = false;   // --harden-vortex: give the reclassified segment vortex circulation too (off by default: the vortex is orthogonal to the branch axis and cannot produce a past-the-tip detour)
     float pen_gate_root_mm   = 15.0f;   // --pen-gate-root-mm F: allow(t=0), permitted penetration at the branch root (mm)
     float pen_gate_tip_mm    = 75.0f;   // --pen-gate-tip-mm F:  allow(t=1), permitted penetration at the branch tip (mm)
     float pen_gate_ramp_t0   = 0.0f;    // --pen-gate-ramp-t0 F: ramp start (width of the root plateau, arc-length fraction). 0 = linear from the root (restored per user request 2026-08-10; method-a used 0.25 = ramp over the outer 3/4, kept for ablation)
@@ -665,6 +682,46 @@ int main(int argc, char* argv[]) {
             ff_far = std::max(0.06f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--shortcut") {
             shortcut_enabled = true;
+        } else if (a == "--harden-deepest") {
+            harden_deepest = true;
+        } else if (a == "--harden-vortex") {
+            harden_vortex = true;
+        } else if (a == "--tree6-merge-deg" && i + 1 < argc) {
+            tree6_merge_deg = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--harden-dump") {
+            harden_dump = true;
+        } else if (a == "--repair-connector") {
+            repair_connector = true;
+        } else if (a == "--repair-connect-rad" && i + 1 < argc) {
+            repair_connect_rad = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--harden-probe-scope") {
+            harden_probe_scope = true;
+        } else if (a == "--start-in-violation") {
+            start_in_violation = true;
+        } else if (a == "--start-in-violation-always") {
+            start_in_violation = true;
+            start_in_violation_always = true;
+        } else if (a == "--harden-allow-adaptive" && i + 1 < argc) {
+            harden_allow_adapt = static_cast<float>(std::atof(argv[++i]));
+        } else if (a == "--harden-on-axis") {
+            harden_on_axis = true;
+        } else if (a == "--harden-nav-rebuild") {
+            harden_nav_rebuild = true;
+        } else if (a == "--harden-mode" && i + 1 < argc) {
+            harden_mode = argv[++i];
+            if (harden_mode != "insert" && harden_mode != "split" &&
+                harden_mode != "reclassify") {
+                std::cerr << "ERROR: --harden-mode must be insert|split|reclassify\n";
+                return 1;
+            }
+        } else if (a == "--harden-radius" && i + 1 < argc) {
+            harden_radius_m = std::max(1e-3f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--harden-halflen" && i + 1 < argc) {
+            harden_halflen_m = std::max(0.01f, static_cast<float>(std::atof(argv[++i])));
+        } else if (a == "--harden-window" && i + 1 < argc) {
+            harden_window_m = static_cast<float>(std::atof(argv[++i]));
+        } else if (a == "--harden-allow-mm" && i + 1 < argc) {
+            harden_allow_mm = std::max(0.0f, static_cast<float>(std::atof(argv[++i])));
         } else if (a == "--er-links" && i + 1 < argc) {
             er_links = argv[++i];
         } else if (a == "--goal-fade" && i + 1 < argc) {
@@ -1077,8 +1134,12 @@ int main(int argc, char* argv[]) {
         for (int b = 0; b < 23; ++b) {
             bool is_apple_branch = (b == APPLE_BRANCH_IDX);
 
-            // Simplified variant (--tree6-simple): merge nodes by a 30 deg bend angle (same
-            // algorithm as visualize_tree6_simple.py), uniform radius 0.03.
+            // Simplified variant (--tree6-simple): merge nodes by a bend-angle threshold
+            // (same algorithm as visualize_tree6_simple.py), uniform radius 0.03.
+            // The threshold trades model fidelity against per-check cost: merging a long
+            // run of segments into one straight cylinder displaces the axis by the
+            // sagitta, which grows with the SQUARE of the merged length, and that axis
+            // error is what limits torque-based contact attribution.
             std::vector<Vector3f> poly;
             if (tree6_simple) {
                 poly.push_back(TREE6_BRANCH_NODES[b][0]);
@@ -1088,7 +1149,7 @@ int main(int argc, char* argv[]) {
                     if (d0.norm() < 1e-9f || d1.norm() < 1e-9f) continue;
                     float c = std::max(-1.0f, std::min(1.0f,
                         d0.normalized().dot(d1.normalized())));
-                    if (std::acos(c) * 180.0f / static_cast<float>(M_PI) >= 30.0f)
+                    if (std::acos(c) * 180.0f / static_cast<float>(M_PI) >= tree6_merge_deg)
                         poly.push_back(TREE6_BRANCH_NODES[b][i]);
                 }
                 poly.push_back(TREE6_BRANCH_NODES[b][5]);
@@ -1119,6 +1180,8 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+        if (tree6_simple)
+            std::cout << "[Setup] tree6-simple merge threshold: " << tree6_merge_deg << " deg\n";
         std::cout << "[Setup] --tree6" << (tree6_simple ? "-simple" : "")
                   << ": 8 trunk segs (hard+SDF), "
                   << n_rigid << " rigid apple-branch segs (hard+SDF), "
@@ -1433,7 +1496,13 @@ int main(int argc, char* argv[]) {
                 const auto& c = cyls[i];
                 sf << "    {\"p0\": " << vec3(c.p0) << ", \"p1\": " << vec3(c.p1)
                    << ", \"radius\": " << c.radius
-                   << ", \"class\": \"" << (c.exclude_from_aniso ? "hard" : "soft")
+                   // "class" keeps its two historical values: viz_cut_scene.py and
+                   // check_trunk_all.py both test class=='hard'. "subclass" is additive
+                   // and distinguishes a run-time-reclassified branch from the trunk.
+                   << ", \"class\": \"" << (c.cls == CylClass::SOFT ? "soft" : "hard")
+                   << "\", \"subclass\": \""
+                   << (c.cls == CylClass::TRUNK ? "trunk"
+                       : c.cls == CylClass::HARD_BRANCH ? "hard_branch" : "soft")
                    << "\", \"t0\": " << c.t0 << ", \"t1\": " << c.t1
                    << "}" << (i + 1 < cyls.size() ? "," : "") << "\n";
             }
@@ -1460,6 +1529,22 @@ int main(int argc, char* argv[]) {
     std::mt19937 rng(std::random_device{}());
 
     std::vector<RunResult> all_results;
+
+    // --harden-deepest output. One row per run; lengths in meters.
+    std::ofstream repair_csv;
+    if (harden_deepest) {
+        repair_csv.open(out_dir + "/repair_results.csv");
+        repair_csv << "run,target_cyl,target_t_arc,target_pen_m,"
+                      "orig_segments_invalid,orig_segments_total,"
+                      "contact_wp,retreat_wp,retreat_steps,"
+                      "replan_ok,replan_ms,replan_waypoints,"
+                      "pen_on_hardened_m,branches_deeper,nav_rebuild_ms,hard_len_m,seg_len_m,"
+                      "suffix_base,joined_idx,connector_wp,reused_wp,winner_is_connector,"
+                      "contact_probe,first_invalid_wp,allow_used_m,"
+                      "start_viol_mm,viol_nodes,escape_wp,"
+                      "retreat_len_rad,replan_len_rad\n";
+        repair_csv.flush();
+    }
 
     // ---- 11. Run loop ----
     for (int run = 0; run < num_runs; run++) {
@@ -1851,7 +1936,7 @@ int main(int argc, char* argv[]) {
                             if ((pp - scene.apple_pos).norm() < 0.12f)
                                 continue;   // terminal grasp contacts are not counted
                             for (const auto& cyl : cyls2) {
-                                if (cyl.exclude_from_aniso) continue;
+                                if (cyl.cls != CylClass::SOFT) continue;
                                 if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
                                 Vector3f seg = cyl.p1 - cyl.p0;
                                 float seg_sq = seg.squaredNorm();
@@ -1879,6 +1964,544 @@ int main(int argc, char* argv[]) {
                     }
                     result.mean_soft_pen = (soft_pen_cnt > 0)
                         ? static_cast<float>(soft_pen_sum / soft_pen_cnt) : 0.0f;
+                }
+            }
+
+            // ================================================================
+            // --harden-deepest: planner-side half of the Isaac stiffness experiment.
+            //
+            // Emulates "one branch turns out to be unyielding" WITHOUT touching
+            // geometry, which is exactly the Isaac protocol (stiffen a hinge, same
+            // tree, same path). Sequence per run:
+            //   1. find the deepest soft contact along the executed path
+            //   2. reclassify that one segment as HARD_BRANCH (allow = 0)
+            //   3. assert the original path is now invalid — the edit must bite
+            //   4. replan from the same start against the edited scene
+            //   5. verify the new path never touches that segment, and that no
+            //      OTHER branch got a deeper contact in exchange
+            //   6. revert, so the next run starts from the nominal scene
+            //
+            // The branch index comes out of the path, never from a CLI argument:
+            // feeding in the answer would make step 5 vacuous.
+            // ================================================================
+            if (harden_deepest && success && solution.size() > 1) {
+                const auto& cyls_h = cost_evaluator->getCylinders();
+
+                // Per-cylinder max probe penetration over a path, sampled at DCD
+                // granularity so a contact occurring between waypoints is not missed.
+                // Covers every class, so the hardened segment is measurable too.
+                auto profilePath = [&](const std::vector<Config>& path) {
+                    // Re-read the vector each call: a split changes its size.
+                    const auto& cyls_p = cost_evaluator->getCylinders();
+                    std::vector<float> prof(cyls_p.size(), 0.0f);
+                    const int SUB = 8;
+                    const auto& probes_h = cost_evaluator->getPenProbes();
+                    for (size_t i = 0; i + 1 < path.size(); ++i) {
+                        for (int s = 0; s <= SUB; ++s) {
+                            Config q = path[i]
+                                     + (path[i + 1] - path[i]) * (float(s) / SUB);
+                            robot->setJointValues(q);
+                            for (const auto& pr : probes_h) {
+                                Matrix4f pose = robot->getFramePoseById(pr.fid);
+                                Vector3f pp = pose.block<3,1>(0,3)
+                                            + pose.block<3,3>(0,0) * pr.off;
+                                if ((pp - scene.apple_pos).norm() < 0.12f) continue;
+                                for (size_t c = 0; c < cyls_p.size(); ++c) {
+                                    const auto& cyl = cyls_p[c];
+                                    if (cyl.cls == CylClass::TRUNK) continue;
+                                    if (cyl.axis_unit.squaredNorm() < 0.25f) continue;
+                                    Vector3f seg = cyl.p1 - cyl.p0;
+                                    float seg_sq = seg.squaredNorm();
+                                    float u = (seg_sq > 1e-9f)
+                                        ? std::max(0.0f, std::min(1.0f,
+                                              (pp - cyl.p0).dot(seg) / seg_sq))
+                                        : 0.0f;
+                                    float dist = (pp - (cyl.p0 + u * seg)).norm();
+                                    float pen = (cyl.radius + pr.r) - dist;
+                                    if (pen > prof[c]) prof[c] = pen;
+                                }
+                            }
+                        }
+                    }
+                    return prof;
+                };
+
+                // ---- 1. deepest soft contact on the nominal path ----
+                std::vector<float> prof_old = profilePath(solution);
+                int    target_cyl = -1;
+                float  target_pen = 0.0f;
+                for (size_t c = 0; c < cyls_h.size(); ++c) {
+                    if (cyls_h[c].cls != CylClass::SOFT) continue;
+                    if (prof_old[c] > target_pen) { target_pen = prof_old[c]; target_cyl = (int)c; }
+                }
+
+                // Waypoint where that contact is deepest = where the real system
+                // would stall, and the arc-length position of that contact, which is
+                // where the hardened window gets centred.
+                int      contact_wp = 0;
+                int      contact_probe = -1;
+                float    target_u = 0.5f;
+                float    seg_len_m = 0.0f;
+                Vector3f contact_pt   = Vector3f::Zero();
+                Vector3f contact_axis = Vector3f::UnitZ();
+                if (target_cyl >= 0) {
+                    float best = -1.0f;
+                    const auto& probes_c = cost_evaluator->getPenProbes();
+                    const auto& cyl = cyls_h[target_cyl];
+                    Vector3f seg = cyl.p1 - cyl.p0;
+                    float seg_sq = seg.squaredNorm();
+                    seg_len_m    = seg.norm();
+                    contact_axis = cyl.axis_unit;
+                    for (size_t i = 0; i < solution.size(); ++i) {
+                        robot->setJointValues(solution[i]);
+                        for (const auto& pr : probes_c) {
+                            Matrix4f pose = robot->getFramePoseById(pr.fid);
+                            Vector3f pp = pose.block<3,1>(0,3)
+                                        + pose.block<3,3>(0,0) * pr.off;
+                            float u = (seg_sq > 1e-9f)
+                                ? std::max(0.0f, std::min(1.0f,
+                                      (pp - cyl.p0).dot(seg) / seg_sq))
+                                : 0.0f;
+                            Vector3f axis_pt = cyl.p0 + u * seg;
+                            Vector3f rad = pp - axis_pt;
+                            float rn  = rad.norm();
+                            float pen = (cyl.radius + pr.r) - rn;
+                            if (pen > best) {
+                                best = pen;
+                                contact_wp = (int)i;
+                                contact_probe = (int)(&pr - &probes_c[0]);
+                                target_u = u;
+                                contact_pt = (harden_on_axis || rn <= 1e-6f)
+                                    ? axis_pt                       // rigid branch material
+                                    : Vector3f(axis_pt + rad / rn * cyl.radius);
+                            }
+                        }
+                    }
+                }
+
+                if (target_cyl < 0) {
+                    std::cout << "  [harden] no en-route soft contact on this path — skipped\n";
+                    repair_csv << result.run_idx << ",-1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
+                    repair_csv.flush();
+                } else {
+                    float t_arc_h = 0.5f * (cyls_h[target_cyl].t0 + cyls_h[target_cyl].t1);
+                    std::cout << "  [harden] deepest soft contact: cyl " << target_cyl
+                              << "  pen " << target_pen * 1000.0f << " mm"
+                              << "  t_arc~" << t_arc_h << "\n";
+
+                    // ---- 2. write the measured contact back into the scene ----
+                    // Snapshot first: insert and split both change the cylinder COUNT,
+                    // so a flag-level revert is not sufficient.
+                    auto cyl_snapshot = cost_evaluator->snapshotCylinders();
+                    const float allow_m = harden_allow_mm * 0.001f;
+                    int hard_idx = -1;
+                    if (harden_mode == "insert") {
+                        // A new hard capsule at the contact. The soft branch stays soft
+                        // everywhere, so soft interaction elsewhere on it is preserved.
+                        hard_idx = cost_evaluator->addContactObstacle(
+                            contact_pt, contact_axis, harden_halflen_m,
+                            harden_radius_m, allow_m, harden_vortex,
+                            harden_probe_scope ? contact_probe : -1);
+                    } else if (harden_mode == "split") {
+                        hard_idx = cost_evaluator->splitAndHarden(
+                            target_cyl, target_u, harden_window_m,
+                            allow_m, harden_vortex);
+                    } else {
+                        cost_evaluator->makeCylinderHard(target_cyl, allow_m, harden_vortex);
+                        hard_idx = target_cyl;
+                    }
+                    // Any cylinder index is stale after insert/split; re-read the vector.
+                    float hard_len = 0.0f, hard_r = 0.0f;
+                    if (hard_idx >= 0) {
+                        const auto& ce = cost_evaluator->getCylinders();
+                        hard_len = (ce[hard_idx].p1 - ce[hard_idx].p0).norm();
+                        hard_r   = ce[hard_idx].radius;
+                    }
+                    float allow_used = allow_m;
+                    if (harden_allow_adapt >= 0.0f && hard_idx >= 0) {
+                        // Measure how deep the arm actually is in the capsule AT THE STALL
+                        // POSE, then permit exactly that minus a margin. Every pose earlier
+                        // on the approach was shallower, so it stays valid and a retreat is
+                        // guaranteed to exist -- which a fixed allowance cannot promise.
+                        robot->setJointValues(solution[(size_t)contact_wp]);
+                        const auto& cc = cost_evaluator->getCylinders()[hard_idx];
+                        Vector3f cseg = cc.p1 - cc.p0;
+                        float csq = cseg.squaredNorm();
+                        float p_stall = 0.0f;
+                        for (const auto& pr : cost_evaluator->getPenProbes()) {
+                            Matrix4f po = robot->getFramePoseById(pr.fid);
+                            Vector3f pp = po.block<3,1>(0,3) + po.block<3,3>(0,0) * pr.off;
+                            float u = (csq > 1e-9f)
+                                ? std::max(0.0f, std::min(1.0f, (pp - cc.p0).dot(cseg) / csq))
+                                : 0.0f;
+                            float d = (pp - (cc.p0 + u * cseg)).norm();
+                            p_stall = std::max(p_stall, (cc.radius + pr.r) - d);
+                        }
+                        allow_used = std::max(0.0f, p_stall - harden_allow_adapt * 0.001f);
+                        cost_evaluator->setCylinderAllow(hard_idx, allow_used);
+                        std::cout << "  [harden] adaptive allow: p_stall "
+                                  << p_stall * 1000.0f << " mm - " << harden_allow_adapt
+                                  << " mm -> " << allow_used * 1000.0f << " mm\n";
+                    }
+                    std::cout << "  [harden] mode=" << harden_mode
+                              << "  piece " << hard_idx
+                              << "  len " << hard_len * 100.0f << " cm"
+                              << "  r " << hard_r * 100.0f << " cm"
+                              << "  allow " << harden_allow_mm << " mm"
+                              << "  (contacted segment " << seg_len_m * 100.0f << " cm)\n";
+
+                    // Optional: rebuild the geodesic nav field against the edited scene.
+                    // The design default is NOT to — a few cm of new geometry should not
+                    // change which corridor is globally cheapest, and the rebuild is a
+                    // serial Dijkstra over the whole grid. This flag exists to test that
+                    // assumption: if the hardened segment sits in the routed corridor,
+                    // the stale field keeps pulling the planner into a blocked route.
+                    float nav_rebuild_ms = 0.0f;
+                    if (harden_nav_rebuild && nav_field_enabled) {
+                        GraspRrtConfig nav_cfg;
+                        auto tn0 = std::chrono::high_resolution_clock::now();
+                        cost_evaluator->buildNavField(
+                            scene.apple_pos,
+                            nav_cfg.shell_attractor_target_radius
+                                + nav_cfg.shell_attractor_offset,
+                            nav_cfg.shell_attractor_cap_height,
+                            /*robot_r=*/0.06f);
+                        auto tn1 = std::chrono::high_resolution_clock::now();
+                        nav_rebuild_ms =
+                            std::chrono::duration<float, std::milli>(tn1 - tn0).count();
+                    }
+
+                    // ---- 3. the original path must now be invalid ----
+                    int n_invalid = 0;
+                    for (size_t i = 0; i + 1 < solution.size(); ++i)
+                        if (!cspace->isPathValid(solution[i], solution[i + 1])) ++n_invalid;
+                    // Earliest invalid waypoint. 0 means the forbidden region reaches the
+                    // start of the path, which is exactly the no-valid-retreat condition.
+                    int first_invalid = -1;
+                    for (size_t i = 0; i < solution.size(); ++i)
+                        if (!cspace->isConfigValid(solution[i])) { first_invalid = (int)i; break; }
+                    std::cout << "  [harden] original path: " << n_invalid << "/"
+                              << (solution.size() - 1) << " segments now invalid\n";
+
+                    // ---- 4a. emulate the retreat ----
+                    // The real loop never replans from the original start; it retreats
+                    // along the EXECUTED path until the pose is valid under the scene it
+                    // is about to create, then plans from there. That distinction is not
+                    // cosmetic: a pose that was gate-valid at allow(t) = 15-75 mm can be
+                    // invalid at allow = 0, because the probe spheres carry the physical
+                    // link radii. Walking back one waypoint at a time measures how deep
+                    // the retreat has to go — a number the controller needs.
+                    int retreat_wp = -1;
+                    for (int i = contact_wp; i >= 0; --i) {
+                        if (cspace->isConfigValid(solution[static_cast<size_t>(i)])) {
+                            retreat_wp = i;
+                            break;
+                        }
+                    }
+                    int retreat_steps = (retreat_wp >= 0)
+                                      ? (contact_wp - retreat_wp) : -1;
+                    Config replan_start = (retreat_wp >= 0)
+                                        ? solution[static_cast<size_t>(retreat_wp)]
+                                        : start_config;
+                    // No gate-valid pose anywhere on the executed path. Rather than call this
+                    // a failure, start AT the stall pose and let the tree descend out of the
+                    // violation. Applied only as a fallback so every previously-succeeding
+                    // injection behaves bit-identically and the measured delta is attributable.
+                    // --start-in-violation-always additionally takes this branch when a
+                    // retreat WAS available, so the forward escape can be compared against
+                    // the backward retreat on the same injections.
+                    bool rooted_in_violation = false;
+                    if (start_in_violation &&
+                        (retreat_wp < 0 || start_in_violation_always)) {
+                        replan_start  = solution[static_cast<size_t>(contact_wp)];
+                        retreat_wp    = contact_wp;   // zero retreat: the escape IS the replan
+                        retreat_steps = 0;
+                        rooted_in_violation = true;
+                    }
+                    // Motion cost of the repair, in C-space arc length (rad). Waypoint
+                    // COUNTS are not comparable between the two arms: the retreat replays
+                    // original waypoints (dense, spaced at sampling_size_paths) while the
+                    // repaired path is post-shortcut (sparse). Arc length is.
+                    float retreat_len = 0.0f;
+                    for (int i = contact_wp; i > retreat_wp && i > 0; --i)
+                        retreat_len += cspace->calcDist(solution[(size_t)i],
+                                                        solution[(size_t)i - 1]);
+                    std::cout << "  [harden] contact at wp " << contact_wp
+                              << ", retreat to wp " << retreat_wp
+                              << " (" << retreat_steps << " steps back, "
+                              << retreat_len << " rad)"
+                              << (rooted_in_violation ? "  [rooted in violation]" : "")
+                              << "\n";
+
+                    // ---- 4b. longest still-valid SUFFIX of the path under repair ----
+                    // Walk backward from the end: wp[k] is a usable rejoin point only
+                    // if wp[k..end] all validate against the edited scene. A failure in
+                    // the middle makes everything before it unusable, so the goal set is
+                    // a suffix rather than a filtered list.
+                    std::vector<Config> repair_goals;
+                    int suffix_base = -1;
+                    if (repair_connector && retreat_wp >= 0) {
+                        int m = (int)solution.size() - 1;
+                        for (int k = (int)solution.size() - 2; k >= 0; --k) {
+                            if (!cspace->isConfigValid(solution[k]) ||
+                                !cspace->isPathValid(solution[k], solution[k + 1])) break;
+                            m = k;
+                        }
+                        // Rejoin points must be ahead of the retreat pose.
+                        if (m <= retreat_wp) m = retreat_wp + 1;
+                        if (m < (int)solution.size()) {
+                            suffix_base = m;
+                            repair_goals.assign(solution.begin() + m, solution.end());
+                        }
+                        std::cout << "  [harden] goal set: " << repair_goals.size()
+                                  << " waypoints, rejoin from wp " << suffix_base
+                                  << " (retreat was wp " << retreat_wp << ")\n";
+                    }
+
+                    // ---- 4c. replan from the retreat pose, edited scene ----
+                    const int KH = std::max(1, or_parallel_K);
+                    std::vector<std::unique_ptr<GraspRrt>> hp(KH);
+                    // Mixed race: the first n_conn instances aim at the surviving suffix
+                    // (reuse the old path), the rest aim at a fresh grasp (today's
+                    // behaviour). One shared stop flag, first solution wins.
+                    //
+                    // Gated on goal-set size: OR-parallel exists to cut the RNG long
+                    // tail, so spending arms on a connector that has nothing to connect
+                    // to would weaken the p90 for no return. With a suffix shorter than
+                    // 3 waypoints the connector is chasing a point target in 7-D.
+                    const bool use_conn = repair_connector &&
+                                          static_cast<int>(repair_goals.size()) >= 3;
+                    const int  n_conn   = use_conn ? KH / 2 : 0;
+                    if (repair_connector) {
+                        std::cout << "  [harden] race: " << n_conn << " connector + "
+                                  << (KH - n_conn) << " unrestricted arms\n";
+                    }
+                    bool hstart_ok = (retreat_wp >= 0);
+                    for (int k = 0; hstart_ok && k < KH; ++k) {
+                        hp[k] = std::make_unique<GraspRrt>(cspace, robot, eef,
+                                                           target, quality, config);
+                        hp[k]->setVerbose(false);
+                        hp[k]->setHardObstacle(scene.overhead.center, 0.15f);
+                        hp[k]->setGoalBiasProb(method_a_enabled ? 0.15f : 0.0f);
+                        hp[k]->setNumThreads(1);
+                        hp[k]->setShortcutThreads(num_threads);
+                        if (k < n_conn) {
+                            float cr = (repair_connect_rad > 0.0f)
+                                     ? repair_connect_rad
+                                     : 2.0f * config.extend_step_size;
+                            hp[k]->setRepairGoals(repair_goals, cr);
+                        }
+                        if (rooted_in_violation) hp[k]->setStartInViolation(true);
+                        if (!hp[k]->setStart(replan_start)) hstart_ok = false;
+                    }
+
+                    bool  hsucc = false;
+                    float hms   = 0.0f;
+                    int   joined_idx = -1, connector_wp = 0, reused_wp = 0;
+                    int   winner_is_conn = 0;
+                    float start_viol_m = 0.0f;
+                    int   viol_nodes = 0;
+                    // Waypoints of the repaired path still inside the capsule, i.e. how long
+                    // the escape takes. The replacement for retreat_steps when rooted in
+                    // violation: it is the same quantity (how far the arm has to move before
+                    // it is back inside the model's budget) measured on the forward path.
+                    int   escape_wp = 0;
+                    std::vector<Config> hsol;
+                    if (hstart_ok) {
+                        std::atomic<bool> hstop{false};
+                        std::atomic<int>  hwin{-1};
+                        for (int k = 0; k < KH; ++k) hp[k]->setExternalStopFlag(&hstop);
+                        auto th0 = std::chrono::high_resolution_clock::now();
+                        #ifdef _OPENMP
+                        #pragma omp parallel for num_threads(KH) schedule(static)
+                        #endif
+                        for (int k = 0; k < KH; ++k) {
+                            if (hp[k]->plan(/*quiet=*/true)) {
+                                int exp_ = -1;
+                                if (hwin.compare_exchange_strong(exp_, k))
+                                    hstop.store(true, std::memory_order_relaxed);
+                            }
+                        }
+                        auto th1 = std::chrono::high_resolution_clock::now();
+                        hms = std::chrono::duration<float, std::milli>(th1 - th0).count();
+                        int w = hwin.load();
+                        if (w >= 0) {
+                            hsucc = true;
+                            start_viol_m = hp[w]->getStartViolation();
+                            viol_nodes   = hp[w]->getViolatingNodeCount();
+                            hsol = hp[w]->getSolution();
+                            if (shortcut_enabled && hsol.size() > 2)
+                                hsol = hp[w]->shortcutSolutionPath(hsol);
+                            // Splice: [connector] + [original waypoints from the rejoin
+                            // point on]. Only the connector is shortcut; the suffix was
+                            // already smoothed when the original path was planned.
+                            winner_is_conn = hp[w]->isRepairMode() ? 1 : 0;
+                            joined_idx = hp[w]->getRepairJoinedIndex();
+                            if (joined_idx >= 0 && suffix_base >= 0) {
+                                size_t from = (size_t)suffix_base + (size_t)joined_idx;
+                                connector_wp = (int)hsol.size();
+                                hsol.insert(hsol.end(), solution.begin() + from,
+                                            solution.end());
+                                reused_wp = (int)(solution.size() - from);
+                            }
+                        }
+                    }
+
+                    // ---- 5. verify ----
+                    // Compare against the ORIGINAL path's SUFFIX from the retreat pose
+                    // onward: the new path covers that stretch, so comparing it against
+                    // the whole original path would credit it for contacts it never had
+                    // the chance to make.
+                    float pen_on_target = 0.0f;
+                    int   n_deeper = 0;
+                    if (hsucc) {
+                        std::vector<Config> old_suffix(
+                            solution.begin() + std::max(0, retreat_wp), solution.end());
+                        std::vector<float> prof_suffix = profilePath(old_suffix);
+                        // When the tree was rooted in violation the path legitimately BEGINS
+                        // inside the capsule, so profiling it whole would report the start
+                        // violation as a guarantee breach. Skip the escape prefix (the
+                        // waypoints still in violation); its depth is reported separately in
+                        // start_viol_mm, and the escape is monotone so the prefix is one run.
+                        std::vector<Config> hmeas = hsol;
+                        if (rooted_in_violation) {
+                            size_t e = 0;
+                            while (e < hsol.size() &&
+                                   cost_evaluator->penViolation(hsol[e]) > 0.0f) ++e;
+                            escape_wp = (int)e;
+                            hmeas.assign(hsol.begin() + (long)e, hsol.end());
+                        }
+                        std::vector<float> prof_new = profilePath(hmeas);
+                        pen_on_target = (hard_idx >= 0 && hard_idx < (int)prof_new.size())
+                                      ? prof_new[hard_idx] : 0.0f;
+                        for (size_t c = 0; c < prof_new.size() && c < prof_suffix.size(); ++c) {
+                            if ((int)c == hard_idx) continue;
+                            // "traded one stall for another": a branch that now gets a
+                            // materially deeper contact than it did before (>5 mm).
+                            if (prof_new[c] > prof_suffix[c] + 0.005f) ++n_deeper;
+                        }
+                    }
+
+                    float replan_len = 0.0f;
+                    for (size_t i = 1; i < hsol.size(); ++i)
+                        replan_len += cspace->calcDist(hsol[i - 1], hsol[i]);
+
+                    std::cout << "  [harden] replan " << (hsucc ? "OK" : "FAILED")
+                              << "  " << hms << " ms"
+                              << "  wp " << hsol.size()
+                              << "  pen_on_hardened " << pen_on_target * 1000.0f << " mm"
+                              << "  branches_deeper " << n_deeper
+                              << "  winner=" << (winner_is_conn ? "connector" : "replan")
+                              << "  connector/reused " << connector_wp << "/" << reused_wp;
+                    if (rooted_in_violation)
+                        std::cout << "  start_viol " << start_viol_m * 1000.0f << " mm"
+                                  << "  viol_nodes " << viol_nodes
+                                  << "  escape_wp " << escape_wp;
+                    std::cout << "\n";
+
+                    repair_csv << result.run_idx << "," << target_cyl << ","
+                               << t_arc_h << "," << target_pen << ","
+                               << n_invalid << "," << (solution.size() - 1) << ","
+                               << contact_wp << "," << retreat_wp << ","
+                               << retreat_steps << ","
+                               << (hsucc ? 1 : 0) << "," << hms << ","
+                               << hsol.size() << "," << pen_on_target << ","
+                               << n_deeper << "," << nav_rebuild_ms << ","
+                               << hard_len << "," << seg_len_m << ","
+                               << suffix_base << "," << joined_idx << ","
+                               << connector_wp << "," << reused_wp << ","
+                               << winner_is_conn << "," << contact_probe << ","
+                               << first_invalid << "," << allow_used << ","
+                               << start_viol_m * 1000.0f << "," << viol_nodes << ","
+                               << escape_wp << ","
+                               << retreat_len << "," << replan_len << "\n";
+                    repair_csv.flush();
+
+                    // ---- 5b. dump a playable episode ----
+                    // approach -> stall -> retreat (reverse along the executed path)
+                    // -> repaired path. hsol[0] == solution[retreat_wp], so it is
+                    // dropped to avoid a duplicated waypoint at the junction.
+                    if (harden_dump && hsucc && retreat_wp >= 0) {
+                        char fn[256];
+                        std::vector<Config> ep;
+                        for (int i = 0; i <= contact_wp; ++i) ep.push_back(solution[i]);
+                        const int approach_end = (int)ep.size() - 1;
+                        for (int i = contact_wp - 1; i >= retreat_wp; --i)
+                            ep.push_back(solution[i]);
+                        const int retreat_end = (int)ep.size() - 1;
+                        for (size_t i = 1; i < hsol.size(); ++i) ep.push_back(hsol[i]);
+
+                        std::snprintf(fn, sizeof(fn), "%s/repair_%02d_episode.csv",
+                                      out_dir.c_str(), result.run_idx);
+                        std::ofstream ef(fn);
+                        for (const auto& wp : ep) {
+                            for (int j = 0; j < wp.size(); ++j)
+                                ef << wp[j] << (j + 1 == wp.size() ? "" : ",");
+                            ef << "\n";
+                        }
+                        ef.close();
+
+                        // Scene AS EDITED, so the inserted capsule is drawn.
+                        std::snprintf(fn, sizeof(fn), "%s/repair_%02d_scene.json",
+                                      out_dir.c_str(), result.run_idx);
+                        std::ofstream sf2(fn);
+                        const auto& ced = cost_evaluator->getCylinders();
+                        sf2 << "{\n  \"apple\": {\"center\": ["
+                            << scene.apple_pos.x() << ", " << scene.apple_pos.y()
+                            << ", " << scene.apple_pos.z() << "], \"radius\": "
+                            << scene.apple_radius << "},\n  \"cylinders\": [\n";
+                        for (size_t c = 0; c < ced.size(); ++c) {
+                            const auto& cc = ced[c];
+                            sf2 << "    {\"p0\": [" << cc.p0.x() << ", " << cc.p0.y()
+                                << ", " << cc.p0.z() << "], \"p1\": [" << cc.p1.x()
+                                << ", " << cc.p1.y() << ", " << cc.p1.z()
+                                << "], \"radius\": " << cc.radius
+                                << ", \"class\": \""
+                                << (cc.cls == CylClass::SOFT ? "soft" : "hard")
+                                << "\", \"subclass\": \""
+                                << (cc.cls == CylClass::TRUNK ? "trunk"
+                                    : cc.cls == CylClass::HARD_BRANCH ? "hard_branch" : "soft")
+                                << "\", \"t0\": " << cc.t0 << ", \"t1\": " << cc.t1
+                                << "}" << (c + 1 < ced.size() ? "," : "") << "\n";
+                        }
+                        sf2 << "  ]\n}\n";
+                        sf2.close();
+
+                        std::snprintf(fn, sizeof(fn), "%s/repair_%02d_phases.json",
+                                      out_dir.c_str(), result.run_idx);
+                        std::ofstream pf(fn);
+                        pf << "{\n"
+                           << "  \"approach_end\": " << approach_end << ",\n"
+                           << "  \"retreat_end\": "  << retreat_end  << ",\n"
+                           << "  \"total\": "        << ep.size()    << ",\n"
+                           << "  \"contact_wp\": "   << contact_wp   << ",\n"
+                           << "  \"retreat_wp\": "   << retreat_wp   << ",\n"
+                           << "  \"retreat_steps\": "<< retreat_steps<< ",\n"
+                           << "  \"contact_point\": [" << contact_pt.x() << ", "
+                           << contact_pt.y() << ", " << contact_pt.z() << "],\n"
+                           << "  \"contact_pen_mm\": " << target_pen * 1000.0f << ",\n"
+                           << "  \"hard_idx\": "    << hard_idx << ",\n"
+                           << "  \"winner\": \""   << (winner_is_conn ? "connector" : "replan")
+                           << "\",\n  \"reused_wp\": " << reused_wp << "\n}\n";
+                        pf.close();
+                        std::cout << "  [harden] episode dumped: repair_"
+                                  << (result.run_idx < 10 ? "0" : "") << result.run_idx
+                                  << "_episode.csv (" << ep.size() << " waypoints)\n";
+                    }
+
+                    // ---- 6. revert ----
+                    cost_evaluator->restoreCylinders(cyl_snapshot);
+                    if (harden_nav_rebuild && nav_field_enabled) {
+                        // Restore the nominal field, or the next run inherits a field
+                        // built for a scene that no longer exists.
+                        GraspRrtConfig nav_cfg;
+                        cost_evaluator->buildNavField(
+                            scene.apple_pos,
+                            nav_cfg.shell_attractor_target_radius
+                                + nav_cfg.shell_attractor_offset,
+                            nav_cfg.shell_attractor_cap_height,
+                            /*robot_r=*/0.06f);
+                    }
                 }
             }
 

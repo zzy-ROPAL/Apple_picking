@@ -130,6 +130,56 @@ public:
     // Tune Method A (goal-biased sampling). Set p=0.0 to disable.
     void setGoalBiasProb(float p) { goal_bias_prob_ = p; }
 
+    // ---- Repair mode (sim-to-real path repair) ----
+    //
+    // Turns the planner from "grow to a new grasp" into "reconnect to the path we
+    // were already executing". Instead of a single goal, it accepts reaching ANY
+    // member of `goals`, which must be the longest still-valid SUFFIX of the path
+    // under repair — goals[k] is only usable because goals[k..end] has already been
+    // re-validated against the edited scene, so joining at k and running to the end
+    // is safe by construction.
+    //
+    // Preference is for the SMALLEST reachable k, which preserves the most of the
+    // original path. connect_radius is in C-space; a candidate within it is accepted
+    // only if the straight edge passes cspace_->isPathValid, so the splice inherits
+    // the penetration gate exactly like a planned edge.
+    //
+    // In repair mode the grasp-hypothesis strategy is skipped: every cycle goes into
+    // tree growth, because the goal is the suffix, not a new grasp. To keep the
+    // "unrestricted replan" behaviour on some instances of an OR-parallel race,
+    // simply do not call this on them.
+    void setRepairGoals(const std::vector<Config>& goals,
+                        float connect_radius,
+                        float goal_sample_prob = 0.3f);
+
+    // Index into the goal set that was reached, or -1. The caller splices
+    // [connector solution] + [original waypoints from this index onward].
+    int getRepairJoinedIndex() const { return repair_joined_; }
+    bool isRepairMode() const { return repair_mode_; }
+
+    // ---- Start-in-violation search ----
+    //
+    // Lets the tree be rooted at a pose that violates an INSERTED repair capsule (see
+    // SdfCostEvaluator::penViolation). Motivation: that capsule's forbidden region is a
+    // budget we created one cycle ago, at a place the arm physically occupies and reached
+    // safely; refusing to start there is the model overruling reality, and it is the whole
+    // of the no-valid-retreat failure class (first_invalid_wp == 0).
+    //
+    // Mechanics: every node carries v(q) = penViolation(q). A node with v = 0 extends under
+    // the ordinary gate. A node with v > 0 extends with the HARD_BRANCH allowance relaxed by
+    // exactly its own v, and the child is kept ONLY if v(child) < v(parent) — so the tree can
+    // sit in the violation but may only move out of it, and reverts to the ordinary gate the
+    // moment it reaches v = 0. Soft-branch allow(t) is never relaxed on any node.
+    //
+    // Naively relaxing just the root check does not work: one extension step cannot leave a
+    // 20-30 mm violation, so the second node fails the strict gate and the tree never grows.
+    // The grading is what makes it a search rather than a single hop.
+    void setStartInViolation(bool on) { start_in_violation_ = on; }
+    // v(root) in meters, 0 if the start was ordinarily valid. Telemetry for the harness.
+    float getStartViolation() const { return start_violation_; }
+    // Nodes whose violation was > 0 (i.e. how much of the tree lived inside the capsule).
+    int getViolatingNodeCount() const { return violating_nodes_; }
+
     // ---- Batch RRT (parallel extend, serial commit) ----
     //
     // Set how many threads each planning round uses for extension. 1 = serial (default).
@@ -176,6 +226,8 @@ private:
         float      vf_time_ms = 0.0f;
         float      collision_time_ms = 0.0f;
         int        col_check_count_delta = 0;
+        // v(new_config) under start-in-violation; 0 in ordinary operation.
+        float      violation = 0.0f;
     };
     ExtendCandidate extendVFRRTCompute(const Config& target);
 
@@ -365,7 +417,45 @@ private:
     int   closest_below_node_id_ = -1;
     float closest_below_dist2_   = std::numeric_limits<float>::max();
     float goal_bias_prob_        = 0.15f;   // 15% of cycles use goal-biased target
+
+    // ---- Repair mode state (see setRepairGoals) ----
+    bool                repair_mode_       = false;
+    std::vector<Config> repair_goals_;
+    float               repair_connect_r2_ = 0.0f;   // squared C-space connect radius
+    float               repair_goal_prob_  = 0.3f;   // fraction of cycles aimed at the suffix
+    int                 repair_joined_     = -1;
+
+    // After each successful extension, try to close onto the goal set. Sets
+    // goal_node_ / found_solution_ / repair_joined_ on success.
+    bool tryConnectRepairGoal();
+
+    // Sample a target near the early part of the goal set (a rejoin as close to the
+    // retreat pose as possible preserves the most of the original path).
+    Config sampleRepairGoalBiased();
     float goal_bias_jitter_      = 0.25f;   // joint-space jitter scale (rad)
+
+    // ---- Start-in-violation state (see setStartInViolation) ----
+    bool  start_in_violation_ = false;
+    float start_violation_    = 0.0f;
+    int   violating_nodes_    = 0;
+    // v per node, indexed by node id (ids are sequential from CSpaceTree::appendNode).
+    // Written only during the serial commit, read during the parallel extend compute, and
+    // the two phases never overlap — so a plain vector needs no synchronization.
+    std::vector<float> node_violation_;
+    float nodeViolation(int id) const {
+        return (id >= 0 && id < static_cast<int>(node_violation_.size()))
+             ? node_violation_[static_cast<size_t>(id)] : 0.0f;
+    }
+    void setNodeViolation(int id, float v) {
+        if (id < 0) return;
+        if (static_cast<size_t>(id) >= node_violation_.size())
+            node_violation_.resize(static_cast<size_t>(id) + 1, 0.0f);
+        node_violation_[static_cast<size_t>(id)] = v;
+        if (v > 0.0f) ++violating_nodes_;
+    }
+    // A child must beat its parent by at least this much (m) to count as progress out of the
+    // violation. Guards against an infinite chain of ~0 improvements.
+    static constexpr float kViolationDecrease = 1e-4f;   // 0.1 mm
 
     // Batch RRT
     int num_threads_ = 1;
